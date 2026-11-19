@@ -32,7 +32,7 @@ fn find_static_libs(root: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             find_static_libs(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("a") {
+        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("a" | "lib")) {
             out.push(path);
         }
     }
@@ -65,6 +65,21 @@ fn main() {
         .define("GGML_CUDA_GRAPHS", "OFF")
         .define("GGML_METAL", if use_metal { "ON" } else { "OFF" });
 
+    if use_cuda {
+        if let Ok(archs) = env::var("CMAKE_CUDA_ARCHITECTURES") {
+            cfg.define("CMAKE_CUDA_ARCHITECTURES", archs);
+        }
+        if let Ok(root) = env::var("CUDAToolkit_ROOT").or_else(|_| env::var("CUDA_PATH")) {
+            cfg.define("CUDAToolkit_ROOT", root);
+        }
+        if let Ok(compiler) = env::var("CMAKE_CUDA_COMPILER") {
+            cfg.define("CMAKE_CUDA_COMPILER", compiler);
+        }
+        if let Ok(host_cc) = env::var("CMAKE_CUDA_HOST_COMPILER") {
+            cfg.define("CMAKE_CUDA_HOST_COMPILER", host_cc);
+        }
+    }
+
     if env::var("CMAKE_GENERATOR").is_err() && which_ninja() {
         cfg.generator("Ninja");
     }
@@ -86,8 +101,20 @@ fn main() {
 
     if use_cuda {
         cc_build.define("LAYERSTREAM_USE_CUDA", None);
-        if let Ok(cuda_path) = env::var("CUDA_PATH").or_else(|_| env::var("CUDA_HOME")) {
+        if let Ok(cuda_path) = env::var("CUDA_PATH")
+            .or_else(|_| env::var("CUDAToolkit_ROOT"))
+            .or_else(|_| env::var("CUDA_HOME"))
+        {
             cc_build.include(Path::new(&cuda_path).join("include"));
+            for sub in ["lib", "lib64", "lib/stubs", "lib64/stubs"] {
+                let d = Path::new(&cuda_path).join(sub);
+                if d.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", d.display());
+                }
+            }
+        }
+        if Path::new("/run/opengl-driver/lib").is_dir() {
+            println!("cargo:rustc-link-search=native=/run/opengl-driver/lib");
         }
     }
     if use_vulkan {
@@ -128,11 +155,14 @@ fn main() {
         "ggml-base",
     ];
     for name in ordered_names {
-        let archive = format!("lib{name}.a");
-        if libs
-            .iter()
-            .any(|p| p.file_name().and_then(|f| f.to_str()) == Some(&archive))
-        {
+        let unix_archive = format!("lib{name}.a");
+        let win_archive = format!("{name}.lib");
+        if libs.iter().any(|p| {
+            matches!(
+                p.file_name().and_then(|f| f.to_str()),
+                Some(f) if f == unix_archive || f == win_archive
+            )
+        }) {
             println!("cargo:rustc-link-lib=static={name}");
         }
     }
@@ -160,6 +190,16 @@ fn main() {
             println!("cargo:rustc-link-lib=framework=Metal");
             println!("cargo:rustc-link-lib=framework=Foundation");
             println!("cargo:rustc-link-lib=framework=MetalKit");
+        }
+    } else if target_os == "windows" {
+        if use_vulkan {
+            println!("cargo:rustc-link-lib=vulkan-1");
+        }
+        if use_cuda {
+            println!("cargo:rustc-link-lib=cuda");
+            println!("cargo:rustc-link-lib=cudart");
+            println!("cargo:rustc-link-lib=cublas");
+            println!("cargo:rustc-link-lib=cublasLt");
         }
     }
 }

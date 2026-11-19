@@ -6,7 +6,10 @@
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -193,15 +196,44 @@ fn open_direct(path: &std::path::Path) -> Option<File> {
         .ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn open_direct(path: &std::path::Path) -> Option<File> {
+    use std::os::unix::io::AsRawFd;
+    let file = OpenOptions::new().read(true).open(path).ok()?;
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    if rc == 0 { Some(file) } else { None }
+}
+
+#[cfg(windows)]
+fn open_direct(path: &std::path::Path) -> Option<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_NO_BUFFERING)
+        .open(path)
+        .ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn open_direct(_path: &std::path::Path) -> Option<File> {
     None
+}
+
+#[cfg(unix)]
+fn file_read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn file_read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    file.seek_read(buf, offset)
 }
 
 fn pread_exact_or_eof(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<usize> {
     let mut total = 0usize;
     while !buf.is_empty() {
-        match file.read_at(buf, offset) {
+        match file_read_at(file, buf, offset) {
             Ok(0) => break,
             Ok(n) => {
                 total += n;
@@ -217,7 +249,7 @@ fn pread_exact_or_eof(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::
 
 fn pread_all(file: &File, mut buf: &mut [u8], mut offset: u64) -> Result<()> {
     while !buf.is_empty() {
-        match file.read_at(buf, offset) {
+        match file_read_at(file, buf, offset) {
             Ok(0) => bail!("unexpected EOF during pread at offset {offset}"),
             Ok(n) => {
                 offset += n as u64;

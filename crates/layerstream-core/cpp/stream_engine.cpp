@@ -22,6 +22,10 @@
 #include <cuda_runtime.h>
 #endif
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 namespace {
 
 static std::once_flag g_llama_init_once;
@@ -30,7 +34,11 @@ static void ensure_llama_initialized() {
     std::call_once(g_llama_init_once, []() {
         // Prevent ggml-cuda from capturing 80 separate per-layer CUDA graphs
         // when cb_eval slices the compute graph at layer boundaries.
+#ifdef _WIN32
+        _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
+#else
         setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+#endif
         llama_backend_init();
     });
 }
@@ -470,11 +478,26 @@ static bool select_target_buft(
 
 static uint8_t * alloc_aligned_4k(size_t size) {
     const size_t aligned = align_up(std::max<size_t>(size, 4096), 4096);
+#ifdef _WIN32
+    return static_cast<uint8_t *>(_aligned_malloc(aligned, 4096));
+#else
     void * ptr = nullptr;
     if (posix_memalign(&ptr, 4096, aligned) != 0) {
         return nullptr;
     }
     return static_cast<uint8_t *>(ptr);
+#endif
+}
+
+static void free_aligned_4k(uint8_t * ptr) {
+    if (!ptr) {
+        return;
+    }
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
 }
 
 ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_t err_cap) {
@@ -711,7 +734,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                     ggml_backend_tensor_set(tb.tensor, staging + tb.offset, 0, tb.nbytes);
                 }
             }
-            std::free(staging);
+            free_aligned_4k(staging);
             if (rc != 0) {
                 set_error(err_buf, err_cap, "failed to load resident tensors (discrete)");
                 ls_engine_free(eng);
@@ -842,7 +865,7 @@ void ls_engine_free(ls_engine * eng) {
             if (eng->pin_is_cuda_host) {
                 cudaFreeHost(eng->pin_buf[s]);
             } else {
-                std::free(eng->pin_buf[s]);
+                free_aligned_4k(eng->pin_buf[s]);
             }
             eng->pin_buf[s] = nullptr;
         }
@@ -854,7 +877,7 @@ void ls_engine_free(ls_engine * eng) {
 #else
     for (int s = 0; s < 2; ++s) {
         if (eng->pin_buf[s]) {
-            std::free(eng->pin_buf[s]);
+            free_aligned_4k(eng->pin_buf[s]);
             eng->pin_buf[s] = nullptr;
         }
     }
