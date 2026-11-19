@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu-vulkan
+            cargo_target: x86_64-unknown-linux-gnu
+            features: "--features vulkan"
+          - os: macos-15
+            target: aarch64-apple-darwin
+            features: "--features metal"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout pinned llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 0693dbfb915f33233818373b5f6969396658d02c
+          path: third_party/llama.cpp
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config protobuf-compiler libvulkan-dev glslc
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        env:
+          LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
+        run: |
+          cargo build --locked --release -p layerstream-plugin ${{ matrix.features }}
+
+      - name: Package Mesh-LLM plugin archive
+        run: |
+          stage="layerstream-plugin-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp target/release/layerstream-plugin "$stage/layerstream-plugin"
+          cp plugin.toml "$stage/plugin.toml"
+          cp README.md "$stage/README.md"
+          tar czf "${stage}.tar.gz" -C "$stage" .
+          sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: layerstream-plugin-${{ matrix.target }}
+          path: |
+            layerstream-plugin-*.tar.gz
+            layerstream-plugin-*.tar.gz.sha256
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
