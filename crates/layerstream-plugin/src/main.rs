@@ -57,6 +57,29 @@ enum Command {
         #[arg(long, env = "LAYERSTREAM_CACHE_DIR")]
         cache_dir: Option<std::path::PathBuf>,
     },
+    /// Query a Hugging Face GGUF repo and recommend the best quant for your probed GPU & NVMe budget.
+    Recommend {
+        /// Hugging Face repository (`org/repo`, `hf://org/repo@rev`, or URL).
+        repo: String,
+        /// Optional branch/tag/commit revision (defaults to `main`).
+        #[arg(long)]
+        revision: Option<String>,
+        /// Override free GPU/UMA memory in GiB (defaults to live GPU probe).
+        #[arg(long)]
+        free_ram_gb: Option<f64>,
+        /// Override sustained NVMe O_DIRECT bandwidth in MiB/s (defaults to live probe).
+        #[arg(long)]
+        nvme_mib_s: Option<f64>,
+        /// Assume no draft speculator (show conservative 1-token/sweep floor).
+        #[arg(long, default_value_t = false)]
+        no_draft: bool,
+        /// Cache directory used for live NVMe bandwidth probe.
+        #[arg(long, env = "LAYERSTREAM_CACHE_DIR")]
+        cache_dir: Option<std::path::PathBuf>,
+        /// Emit machine-readable JSON output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -74,6 +97,87 @@ fn main() -> Result<()> {
         let root = cache_dir.unwrap_or_else(hf::default_cache_dir);
         let local = hf::ensure_hf_downloaded(&spec, &root)?;
         println!("{}", local.display());
+        return Ok(());
+    }
+
+    if let Some(Command::Recommend {
+        repo,
+        revision,
+        free_ram_gb,
+        nvme_mib_s,
+        no_draft,
+        cache_dir,
+        json,
+    }) = cli.command
+    {
+        let (repo_id, rev) = hf::parse_repo_and_revision(&repo, revision.as_deref())?;
+        let free_vram_bytes = if let Some(gb) = free_ram_gb {
+            (gb.max(0.5) * 1024.0 * 1024.0 * 1024.0) as u64
+        } else if let Some((free, _total)) = layerstream_core::StreamEngine::probe_gpu_memory(true)
+        {
+            free
+        } else {
+            anyhow::bail!(
+                "no usable GPU found for live probe; pass --free-ram-gb <GiB> to evaluate target hardware"
+            );
+        };
+
+        let storage_bw = if let Some(bw) = nvme_mib_s {
+            bw.max(10.0)
+        } else {
+            let probe_dir = cache_dir.unwrap_or_else(hf::default_cache_dir);
+            let _ = std::fs::create_dir_all(&probe_dir);
+            probe_dir_storage_mib_per_s(&probe_dir).unwrap_or(1500.0)
+        };
+
+        let candidates = hf::list_hf_gguf_candidates(&repo_id, &rev)?;
+        if candidates.is_empty() {
+            anyhow::bail!("no GGUF files found in {repo_id}@{rev}");
+        }
+        let recs = hf::recommend_candidates(
+            &repo_id,
+            &rev,
+            &candidates,
+            free_vram_bytes,
+            storage_bw,
+            !no_draft,
+        );
+
+        if json {
+            println!("{}", serde_json::to_string_pretty(&recs)?);
+            return Ok(());
+        }
+
+        println!(
+            "Hardware profile: {:.1} GiB free GPU/UMA | {:.0} MiB/s NVMe | draft={}",
+            free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            storage_bw,
+            if no_draft { "no" } else { "yes" }
+        );
+        println!(
+            "{:<3} {:<11} {:>8} {:>6} {:<12} {:>6} {:>13}  FILE",
+            "", "QUANT", "SIZE", "SHARDS", "VERDICT", "PIN%", "EST TOK/S"
+        );
+        for r in &recs {
+            let mark = if r.recommended { "★" } else { " " };
+            let gib = r.candidate.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            println!(
+                "{:<3} {:<11} {:>6.2} G {:>6} {:<12} {:>5}% {:>5.2}-{:<6.2}  {}",
+                mark,
+                r.candidate.quant,
+                gib,
+                r.candidate.shard_count,
+                r.verdict,
+                r.pinned_pct,
+                r.est_tps_low,
+                r.est_tps_high,
+                r.candidate.primary_file
+            );
+        }
+        if let Some(best) = recs.iter().find(|r| r.recommended) {
+            println!("\nRecommended pull command:");
+            println!("  layerstream-plugin pull {}", best.hf_uri);
+        }
         return Ok(());
     }
 
@@ -116,7 +220,9 @@ fn main() -> Result<()> {
                     cli.plugin_args.into_server_config_with_deferred(true)?;
                 mesh_adapter::run_mesh_plugin(server_cfg, has_sources, deferred).await
             }
-            Some(Command::Pull { .. } | Command::Check { .. }) => unreachable!(),
+            Some(Command::Pull { .. } | Command::Check { .. } | Command::Recommend { .. }) => {
+                unreachable!()
+            }
         }
     });
 
@@ -124,4 +230,56 @@ fn main() -> Result<()> {
     // indefinitely on any still-unwinding blocking worker.
     rt.shutdown_timeout(Duration::from_secs(2));
     result
+}
+
+fn find_existing_probe_file(dir: &std::path::Path, depth: usize) -> Option<std::path::PathBuf> {
+    const MIN_PROBE_BYTES: u64 = 16 * 1024 * 1024;
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() && meta.len() >= MIN_PROBE_BYTES {
+                return Some(path);
+            }
+            if meta.is_dir()
+                && depth > 0
+                && let Some(found) = find_existing_probe_file(&path, depth - 1)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn probe_dir_storage_mib_per_s(dir: &std::path::Path) -> Option<f64> {
+    if let Some(existing) = find_existing_probe_file(dir, 2)
+        && let Ok((mib_s, _)) = layerstream_core::probe_storage_mib_per_s(&existing, true)
+        && mib_s >= 10.0
+    {
+        return Some(mib_s);
+    }
+
+    struct TempCleanup(std::path::PathBuf);
+    impl Drop for TempCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    let tmp_path = dir.join(format!(".layerstream-probe-{}.tmp", std::process::id()));
+    let _cleanup = TempCleanup(tmp_path.clone());
+    let mut f = std::fs::File::create(&tmp_path).ok()?;
+    let chunk = vec![0xA5u8; 1024 * 1024];
+    use std::io::Write;
+    for _ in 0..16 {
+        f.write_all(&chunk).ok()?;
+    }
+    f.sync_all().ok()?;
+    drop(f);
+
+    layerstream_core::probe_storage_mib_per_s(&tmp_path, true)
+        .ok()
+        .map(|(mib_s, _)| mib_s)
+        .filter(|&bw| bw >= 10.0)
 }

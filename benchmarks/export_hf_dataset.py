@@ -28,11 +28,36 @@ def extract_json_array(raw: str) -> list[dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-def normalize_record(rec: dict[str, Any], source_file: str, round_name: str) -> dict[str, Any]:
+DEFAULT_HARDWARE = "NVIDIA Jetson Orin Nano (8 GiB unified LPDDR5, CUDA sm_87, dm-crypt NVMe)"
+DEFAULT_HARDWARE_ID = "orin-nano-8gb-cuda"
+
+
+def load_dir_hardware(round_dir: Path) -> tuple[str, str]:
+    meta_path = round_dir / "hardware.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(meta, dict):
+                hw = meta.get("hardware") or DEFAULT_HARDWARE
+                hw_id = meta.get("hardware_id") or DEFAULT_HARDWARE_ID
+                return str(hw), str(hw_id)
+        except (OSError, json.JSONDecodeError):
+            pass
+    return DEFAULT_HARDWARE, DEFAULT_HARDWARE_ID
+
+
+def normalize_record(
+    rec: dict[str, Any],
+    source_file: str,
+    round_name: str,
+    default_hw: str = DEFAULT_HARDWARE,
+    default_hw_id: str = DEFAULT_HARDWARE_ID,
+) -> dict[str, Any]:
     return {
         "round": round_name,
         "source_file": source_file,
-        "hardware": "NVIDIA Jetson Orin Nano (8 GiB unified LPDDR5, CUDA sm_87, dm-crypt NVMe)",
+        "hardware": rec.get("hardware") or default_hw,
+        "hardware_id": rec.get("hardware_id") or default_hw_id,
         "engine": rec.get("engine"),
         "engine_version": rec.get("engine_version", "0.1.0"),
         "git_rev": rec.get("git_rev"),
@@ -116,7 +141,7 @@ def main() -> None:
 
     records: list[dict[str, Any]] = []
     for path in sorted(args.results_dir.rglob("*.json")):
-        if path.stat().st_size == 0:
+        if path.name == "hardware.json" or path.stat().st_size == 0:
             continue
         raw = path.read_text(encoding="utf-8", errors="replace")
         try:
@@ -125,8 +150,9 @@ def main() -> None:
             print(f"Skipping malformed JSON {path}: {exc}")
             continue
         round_name = path.parent.name
+        dir_hw, dir_hw_id = load_dir_hardware(path.parent)
         for item in items:
-            records.append(normalize_record(item, path.name, round_name))
+            records.append(normalize_record(item, path.name, round_name, dir_hw, dir_hw_id))
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     data_dir = args.out_dir / "data"

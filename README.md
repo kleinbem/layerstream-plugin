@@ -75,16 +75,19 @@ args = [
 ## Standalone CLI Mode (No Mesh-LLM Required)
 
 ```bash
-# 1. Preflight check (GPU, O_DIRECT, NVMe speed, draft tokenizer, estimated tok/s):
+# 1. Discover & pick the best GGUF quant on Hugging Face for your GPU + NVMe:
+layerstream-plugin recommend Qwen/Qwen2.5-14B-Instruct-GGUF
+
+# 2. Pull the recommended GGUF from Hugging Face (ETag + SHA-256 verified resume):
+layerstream-plugin pull hf://Qwen/Qwen2.5-14B-Instruct-GGUF:qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf
+
+# 3. Preflight check (GPU, O_DIRECT, NVMe speed, draft tokenizer, estimated tok/s):
 layerstream-plugin check \
   --model /models/Qwen2.5-14B-Instruct-Q4_K_M.gguf \
   --draft-model /models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
   --vram-budget-mb auto
 
-# 2. Optional: pre-pull a GGUF from Hugging Face (ETag + SHA-256 verified resume):
-layerstream-plugin pull hf://Qwen/Qwen2.5-14B-Instruct-GGUF:qwen2.5-14b-instruct-q4_k_m.gguf
-
-# 3. Serve an OpenAI-compatible HTTP API:
+# 4. Serve an OpenAI-compatible HTTP API:
 layerstream-plugin serve \
   --model /models/Qwen2.5-14B-Instruct-Q4_K_M.gguf \
   --draft-model /models/qwen2.5-0.5b-instruct-q4_k_m.gguf \

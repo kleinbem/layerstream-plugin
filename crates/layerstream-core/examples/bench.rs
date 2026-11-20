@@ -266,6 +266,8 @@ fn main() -> Result<()> {
     let mut keep_expert_cache = false;
     let mut workload_filter: Option<String> = None;
     let mut max_tokens_override: Option<usize> = None;
+    let mut hardware_label: Option<String> = None;
+    let mut hardware_id: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -281,6 +283,14 @@ fn main() -> Result<()> {
             "--mode" => {
                 i += 1;
                 mode = args[i].clone();
+            }
+            "--hardware" => {
+                i += 1;
+                hardware_label = Some(args[i].clone());
+            }
+            "--hardware-id" => {
+                i += 1;
+                hardware_id = Some(args[i].clone());
             }
             "--resident-layers" => {
                 i += 1;
@@ -582,6 +592,8 @@ fn main() -> Result<()> {
             "engine": "layerstream-plugin",
             "engine_version": env!("CARGO_PKG_VERSION"),
             "git_rev": git_rev,
+            "hardware": hardware_label,
+            "hardware_id": hardware_id,
             "mode": mode,
             "model": model_path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown"),
             "draft_model": draft_path.as_ref().and_then(|p| p.file_name()).and_then(|s| s.to_str()),

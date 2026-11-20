@@ -864,6 +864,8 @@ dependencies = [
  "layerstream-server",
  "libc",
  "mesh-llm-plugin",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",

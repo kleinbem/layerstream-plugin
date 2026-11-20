@@ -12,12 +12,14 @@
 //! - Authentication via `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, or `~/.cache/huggingface/token`.
 //! - All progress logs go strictly to stderr (preserving Mesh-LLM's stdout protobuf channel).
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const HF_PREFIX: &str = "hf://";
@@ -773,6 +775,371 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
     Ok(())
 }
 
+/// Parses a Hugging Face repository reference (`org/repo`, `org/repo@rev`,
+/// `hf://org/repo[@rev]`, or `https://huggingface.co/org/repo`) into `(repo_id, revision)`.
+pub fn parse_repo_and_revision(
+    input: &str,
+    rev_override: Option<&str>,
+) -> Result<(String, String)> {
+    let trimmed = input.trim();
+    let stripped = trimmed
+        .strip_prefix(HF_PREFIX)
+        .or_else(|| trimmed.strip_prefix("https://huggingface.co/"))
+        .or_else(|| trimmed.strip_prefix("http://huggingface.co/"))
+        .unwrap_or(trimmed)
+        .trim_matches('/');
+
+    let (body, at_rev) = match stripped.rsplit_once('@') {
+        Some((b, r)) if !r.is_empty() && !r.contains('/') => (b, Some(r.to_string())),
+        _ => (stripped, None),
+    };
+
+    let mut parts = body.split('/');
+    let org = parts.next().unwrap_or("");
+    let repo = parts.next().unwrap_or("");
+    if org.is_empty() || repo.is_empty() || org.contains("..") || repo.contains("..") {
+        bail!("invalid Hugging Face repo '{input}' (expected org/repo)");
+    }
+    let rev = rev_override
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .or(at_rev)
+        .unwrap_or_else(|| "main".to_string());
+    Ok((format!("{org}/{repo}"), rev))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HfTreeEntry {
+    #[serde(rename = "type")]
+    pub entry_type: Option<String>,
+    pub path: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub lfs: Option<HfLfsInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HfLfsInfo {
+    #[serde(default)]
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HfGgufCandidate {
+    pub primary_file: String,
+    pub quant: String,
+    pub total_bytes: u64,
+    pub shard_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuantRecommendation {
+    pub candidate: HfGgufCandidate,
+    pub hf_uri: String,
+    pub verdict: String,
+    pub pinned_pct: u8,
+    pub est_load_s: f64,
+    pub est_tps_low: f64,
+    pub est_tps_high: f64,
+    pub recommended: bool,
+    pub score: i32,
+}
+
+fn extract_quant_label(path: &str) -> String {
+    let fname = path.rsplit('/').next().unwrap_or(path);
+    let stem = fname.strip_suffix(".gguf").unwrap_or(fname);
+    // Strip trailing shard suffix `-00001-of-0000N` before scanning tokens.
+    let clean = strip_shard_suffix(stem).map(|(p, _, _)| p).unwrap_or(stem);
+    let upper = clean.to_ascii_uppercase();
+    // Match well-known GGUF quant identifiers from most specific to least specific.
+    const KNOWN: &[&str] = &[
+        "UD-IQ1_S",
+        "UD-IQ1_M",
+        "UD-IQ2_XXS",
+        "UD-IQ2_XS",
+        "UD-IQ2_M",
+        "UD-IQ3_XXS",
+        "UD-Q2_K_XL",
+        "UD-Q3_K_XL",
+        "UD-Q4_K_XL",
+        "UD-Q5_K_XL",
+        "UD-Q6_K_XL",
+        "UD-Q8_K_XL",
+        "IQ1_S",
+        "IQ1_M",
+        "IQ2_XXS",
+        "IQ2_XS",
+        "IQ2_S",
+        "IQ2_M",
+        "IQ3_XXS",
+        "IQ3_XS",
+        "IQ3_S",
+        "IQ3_M",
+        "IQ4_XS",
+        "IQ4_NL",
+        "Q2_K_XL",
+        "Q2_K_L",
+        "Q2_K_S",
+        "Q2_K",
+        "Q3_K_XL",
+        "Q3_K_L",
+        "Q3_K_M",
+        "Q3_K_S",
+        "Q4_K_XL",
+        "Q4_K_L",
+        "Q4_K_M",
+        "Q4_K_S",
+        "Q4_1",
+        "Q4_0",
+        "Q5_K_XL",
+        "Q5_K_L",
+        "Q5_K_M",
+        "Q5_K_S",
+        "Q5_1",
+        "Q5_0",
+        "Q6_K_XL",
+        "Q6_K_L",
+        "Q6_K",
+        "Q8_K_XL",
+        "Q8_0",
+        "MXFP4",
+        "BF16",
+        "FP16",
+        "F16",
+        "F32",
+    ];
+    for q in KNOWN {
+        if upper.contains(q) {
+            return (*q).to_string();
+        }
+    }
+    clean
+        .rsplit(['-', '_', '.'])
+        .next()
+        .unwrap_or("GGUF")
+        .to_ascii_uppercase()
+}
+
+fn strip_shard_suffix(stem: &str) -> Option<(&str, u32, u32)> {
+    let (prefix_and_idx, total_str) = stem.rsplit_once("-of-")?;
+    if total_str.len() != 5 {
+        return None;
+    }
+    let total: u32 = total_str.parse().ok()?;
+    if total <= 1 {
+        return None;
+    }
+    let (prefix, idx_str) = prefix_and_idx.rsplit_once('-')?;
+    if idx_str.len() != 5 {
+        return None;
+    }
+    let idx: u32 = idx_str.parse().ok()?;
+    Some((prefix, idx, total))
+}
+
+fn quant_quality_rank(quant: &str) -> i32 {
+    let (ud_bonus, base) = match quant.strip_prefix("UD-") {
+        Some(rest) => (3, rest),
+        None => (0, quant),
+    };
+    let rank = match base {
+        "Q4_K_M" | "Q4_K_XL" => 100,
+        "Q5_K_M" | "Q5_K_L" | "Q5_K_XL" => 98,
+        "IQ4_XS" | "IQ4_NL" | "Q4_K_S" | "Q4_K_L" => 95,
+        "Q6_K" | "Q6_K_L" | "Q6_K_XL" => 94,
+        "Q8_0" | "Q8_K_XL" => 92,
+        "Q5_K_S" | "Q5_0" | "Q5_1" | "Q4_0" | "Q4_1" => 88,
+        "Q3_K_M" | "Q3_K_L" | "Q3_K_XL" => 80,
+        "IQ3_M" | "IQ3_S" | "Q3_K_S" => 74,
+        "IQ3_XS" | "IQ3_XXS" => 66,
+        "Q2_K_XL" | "Q2_K_L" => 62,
+        "Q2_K" | "Q2_K_S" | "IQ2_M" => 58,
+        "BF16" | "FP16" | "F16" => 52, // huge footprint penalty on edge GPUs
+        _ => 50,
+    };
+    rank + ud_bonus
+}
+
+/// Groups Hugging Face tree entries into logical GGUF checkpoints, combining multi-part shards
+/// (`*-00001-of-0000N.gguf`) and filtering out `mmproj` vision projector files.
+pub fn group_gguf_tree_entries(entries: &[HfTreeEntry]) -> Vec<HfGgufCandidate> {
+    let mut grouped: BTreeMap<String, (String, u64, u32)> = BTreeMap::new();
+    for entry in entries {
+        if entry.entry_type.as_deref().is_some_and(|t| t != "file") {
+            continue;
+        }
+        let lower = entry.path.to_ascii_lowercase();
+        if !lower.ends_with(".gguf") || lower.contains("mmproj") {
+            continue;
+        }
+        let bytes = entry
+            .lfs
+            .as_ref()
+            .map(|l| l.size)
+            .filter(|&s| s > 0)
+            .unwrap_or(entry.size);
+        let (dir_prefix, fname) = match entry.path.rsplit_once('/') {
+            Some((d, f)) => (Some(d), f),
+            None => (None, entry.path.as_str()),
+        };
+        let stem = fname.strip_suffix(".gguf").unwrap_or(fname);
+        if let Some((prefix, idx, total)) = strip_shard_suffix(stem) {
+            let key = match dir_prefix {
+                Some(d) => format!("{d}/{prefix}"),
+                None => prefix.to_string(),
+            };
+            let shard1_name = format!("{prefix}-00001-of-{total:05}.gguf");
+            let primary = match dir_prefix {
+                Some(d) => format!("{d}/{shard1_name}"),
+                None => shard1_name,
+            };
+            let slot = grouped.entry(key).or_insert((primary, 0, total));
+            slot.1 = slot.1.saturating_add(bytes);
+            if idx == 1 {
+                slot.0 = entry.path.clone();
+            }
+        } else {
+            grouped.insert(entry.path.clone(), (entry.path.clone(), bytes, 1));
+        }
+    }
+
+    let mut out: Vec<HfGgufCandidate> = grouped
+        .into_values()
+        .map(|(primary_file, total_bytes, shard_count)| HfGgufCandidate {
+            quant: extract_quant_label(&primary_file),
+            primary_file,
+            total_bytes,
+            shard_count,
+        })
+        .collect();
+    out.sort_by_key(|c| c.total_bytes);
+    out
+}
+
+/// Fetches the recursive file tree of a Hugging Face repo and returns logical GGUF checkpoints.
+pub fn list_hf_gguf_candidates(repo_id: &str, revision: &str) -> Result<Vec<HfGgufCandidate>> {
+    let endpoint = std::env::var("HF_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HF_ENDPOINT.to_string());
+    let url = format!(
+        "{}/api/models/{}/tree/{}?recursive=true",
+        endpoint.trim_end_matches('/'),
+        repo_id,
+        revision
+    );
+
+    let agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_body(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+
+    let mut req = agent.get(&url).header("User-Agent", "layerstream-plugin");
+    if let Some(tok) = load_hf_token() {
+        req = req.header("Authorization", &format!("Bearer {tok}"));
+    }
+
+    let resp = req
+        .call()
+        .with_context(|| format!("query Hugging Face API {url}"))?;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        bail!("Hugging Face API returned HTTP {status} for {repo_id}@{revision} ({url})");
+    }
+    let body = resp
+        .into_body()
+        .read_to_string()
+        .context("read Hugging Face tree JSON")?;
+    let entries: Vec<HfTreeEntry> =
+        serde_json::from_str(&body).context("parse Hugging Face tree JSON")?;
+    Ok(group_gguf_tree_entries(&entries))
+}
+
+/// Evaluates and ranks GGUF candidates against probed (or user-specified) GPU/UMA memory
+/// and sustained NVMe `O_DIRECT` bandwidth.
+pub fn recommend_candidates(
+    repo_id: &str,
+    revision: &str,
+    candidates: &[HfGgufCandidate],
+    free_vram_bytes: u64,
+    nvme_mib_s: f64,
+    has_draft: bool,
+) -> Vec<QuantRecommendation> {
+    let free_gib = free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let nvme_gib_s = (nvme_mib_s / 1024.0).max(0.05);
+    let draft_reserve = if has_draft { 0.65 } else { 0.0 };
+    let headroom = (free_gib * 0.14).max(1.0);
+
+    let mut recs: Vec<QuantRecommendation> = candidates
+        .iter()
+        .map(|cand| {
+            let model_gib = cand.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            let kv_and_slots = (model_gib * 0.08).clamp(0.8, 2.2);
+            let usable = (free_gib - headroom - kv_and_slots - draft_reserve).max(0.0);
+            let fits_resident = model_gib > 0.0 && model_gib <= usable;
+            let pinned_frac = if fits_resident {
+                1.0
+            } else if model_gib > 0.0 {
+                (usable / model_gib).clamp(0.0, 0.85)
+            } else {
+                0.0
+            };
+            let streamed_gib = (model_gib * (1.0 - pinned_frac)).max(0.0);
+            let est_load_s = model_gib.min(usable + 0.8) / nvme_gib_s;
+
+            let (verdict, est_tps_low, est_tps_high, fit_bonus) = if fits_resident {
+                ("RESIDENT".to_string(), 15.0, 50.0, 200)
+            } else if nvme_mib_s < 150.0 {
+                ("TOO_SLOW_DISK".to_string(), 0.01, 0.05, -200)
+            } else {
+                let sweep_s = ((streamed_gib / nvme_gib_s) * 1.15).max(0.15);
+                let mult_lo = if has_draft { 2.4 } else { 1.0 };
+                let mult_hi = if has_draft { 5.2 } else { 1.0 };
+                let lo = mult_lo / sweep_s;
+                let hi = mult_hi / sweep_s;
+                if lo >= 1.0 {
+                    ("GOOD".to_string(), lo, hi, 140)
+                } else if hi >= 0.5 {
+                    ("SLOW".to_string(), lo, hi, 60)
+                } else {
+                    ("VERY_SLOW".to_string(), lo, hi, -40)
+                }
+            };
+
+            let hf_uri = if revision == "main" {
+                format!("hf://{repo_id}:{}", cand.primary_file)
+            } else {
+                format!("hf://{repo_id}:{}@{revision}", cand.primary_file)
+            };
+
+            let score = fit_bonus + quant_quality_rank(&cand.quant);
+            QuantRecommendation {
+                candidate: cand.clone(),
+                hf_uri,
+                verdict,
+                pinned_pct: (pinned_frac * 100.0).round() as u8,
+                est_load_s: (est_load_s * 10.0).round() / 10.0,
+                est_tps_low: (est_tps_low * 100.0).round() / 100.0,
+                est_tps_high: (est_tps_high * 100.0).round() / 100.0,
+                recommended: false,
+                score,
+            }
+        })
+        .collect();
+
+    if let Some((best_idx, _)) = recs
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, r)| (r.score, r.candidate.total_bytes))
+    {
+        recs[best_idx].recommended = true;
+    }
+    recs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,5 +1389,84 @@ mod tests {
         assert!(err.is_err(), "stalled download must time out");
         let _ = fs::remove_dir_all(&tmp);
         let _ = server.join();
+    }
+
+    #[test]
+    fn parses_repo_and_revision_forms() {
+        assert_eq!(
+            parse_repo_and_revision("Qwen/Qwen2.5-14B-Instruct-GGUF", None).unwrap(),
+            ("Qwen/Qwen2.5-14B-Instruct-GGUF".into(), "main".into())
+        );
+        assert_eq!(
+            parse_repo_and_revision("hf://bartowski/Llama-3-GGUF@v2", None).unwrap(),
+            ("bartowski/Llama-3-GGUF".into(), "v2".into())
+        );
+        assert_eq!(
+            parse_repo_and_revision("https://huggingface.co/unsloth/Qwen3-GGUF/", Some("rev1"))
+                .unwrap(),
+            ("unsloth/Qwen3-GGUF".into(), "rev1".into())
+        );
+        assert!(parse_repo_and_revision("invalid-no-slash", None).is_err());
+    }
+
+    #[test]
+    fn groups_shards_skips_mmproj_and_ranks_quants() {
+        let gib = 1024u64 * 1024 * 1024;
+        let entries = vec![
+            HfTreeEntry {
+                entry_type: Some("file".into()),
+                path: "mmproj-model-f16.gguf".into(),
+                size: gib,
+                lfs: None,
+            },
+            HfTreeEntry {
+                entry_type: Some("file".into()),
+                path: "model-q4_k_m-00001-of-00003.gguf".into(),
+                size: 0,
+                lfs: Some(HfLfsInfo { size: 3 * gib }),
+            },
+            HfTreeEntry {
+                entry_type: Some("file".into()),
+                path: "model-q4_k_m-00002-of-00003.gguf".into(),
+                size: 0,
+                lfs: Some(HfLfsInfo { size: 3 * gib }),
+            },
+            HfTreeEntry {
+                entry_type: Some("file".into()),
+                path: "model-q4_k_m-00003-of-00003.gguf".into(),
+                size: 0,
+                lfs: Some(HfLfsInfo { size: 2 * gib }),
+            },
+            HfTreeEntry {
+                entry_type: Some("file".into()),
+                path: "model-q8_0.gguf".into(),
+                size: 16 * gib,
+                lfs: None,
+            },
+        ];
+
+        let cands = group_gguf_tree_entries(&entries);
+        assert_eq!(cands.len(), 2, "mmproj skipped and 3 shards grouped");
+        assert_eq!(cands[0].quant, "Q4_K_M");
+        assert_eq!(cands[0].shard_count, 3);
+        assert_eq!(cands[0].total_bytes, 8 * gib);
+        assert_eq!(cands[0].primary_file, "model-q4_k_m-00001-of-00003.gguf");
+
+        // On an 8 GB Jetson (5.2 GiB free, 2800 MiB/s), 8 GiB Q4_K_M should beat 16 GiB Q8_0.
+        let recs = recommend_candidates(
+            "Qwen/Qwen2.5-14B-Instruct-GGUF",
+            "main",
+            &cands,
+            (5.2 * gib as f64) as u64,
+            2800.0,
+            true,
+        );
+        let best = recs.iter().find(|r| r.recommended).unwrap();
+        assert_eq!(best.candidate.quant, "Q4_K_M");
+        assert_eq!(best.verdict, "GOOD");
+        assert_eq!(
+            best.hf_uri,
+            "hf://Qwen/Qwen2.5-14B-Instruct-GGUF:model-q4_k_m-00001-of-00003.gguf"
+        );
     }
 }

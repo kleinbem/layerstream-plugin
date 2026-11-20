@@ -562,6 +562,10 @@
         <p class="desc">Loaded directly from <code>kleinbem/layerstream-orin-nano-benchmarks</code> (Parquet / JSON). Use keyboard or horizontal scroll to inspect all telemetry columns.</p>
         <div class="controls">
           <div class="ctrl">
+            <label for="raw-hardware">Hardware</label>
+            <select id="raw-hardware"><option value="all">All Hardware</option></select>
+          </div>
+          <div class="ctrl">
             <label for="raw-round">Round</label>
             <select id="raw-round"><option value="all">All Rounds</option></select>
           </div>
@@ -859,16 +863,19 @@
           sel.appendChild(opt);
         });
       };
+      fill("raw-hardware", ALL_ROWS.map(r => r.hardware_id || r.hardware));
       fill("raw-round", ALL_ROWS.map(r => r.round));
       fill("raw-engine", ALL_ROWS.map(r => r.engine));
       fill("raw-workload", ALL_ROWS.map(r => r.workload));
     }
 
     function renderRawTable() {
+      const hf = document.getElementById("raw-hardware").value;
       const rf = document.getElementById("raw-round").value;
       const ef = document.getElementById("raw-engine").value;
       const wf = document.getElementById("raw-workload").value;
       const filtered = ALL_ROWS.filter(r =>
+        (hf === "all" || (r.hardware_id || r.hardware) === hf) &&
         (rf === "all" || r.round === rf) &&
         (ef === "all" || r.engine === ef) &&
         (wf === "all" || r.workload === wf)
@@ -906,7 +913,7 @@
     }
 
     ["cmp-model", "cmp-workload", "cmp-metric"].forEach(id => document.getElementById(id).addEventListener("change", renderComparison));
-    ["raw-round", "raw-engine", "raw-workload"].forEach(id => document.getElementById(id).addEventListener("change", renderRawTable));
+    ["raw-hardware", "raw-round", "raw-engine", "raw-workload"].forEach(id => document.getElementById(id).addEventListener("change", renderRawTable));
 
     async function init() {
       updateEstimator();
