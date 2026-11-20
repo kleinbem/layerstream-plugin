@@ -58,7 +58,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build pkg-config protobuf-compiler libvulkan-dev glslc
+          sudo apt-get install -y cmake ninja-build pkg-config protobuf-compiler libvulkan-dev glslc spirv-headers
 
       - name: Install macOS build dependencies
         if: runner.os == 'macOS'
