@@ -16,8 +16,45 @@ pub type LsLoadTensorsCb = unsafe extern "C" fn(
     dst_cap: usize,
 ) -> c_int;
 
-pub type LsPrefetchStartCb = LsLoadTensorsCb;
-pub type LsPrefetchWaitCb = unsafe extern "C" fn(user_data: *mut c_void, layer_idx: i32) -> c_int;
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LsSpanSlice {
+    pub src_offset: u64,
+    pub dst_offset: u64,
+    pub len: u64,
+    pub tensor_idx: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LsTensorSliceReq {
+    pub tensor_name: *const c_char,
+    pub src_offset_in_tensor: u64,
+    pub dst_offset: u64,
+    pub len: u64,
+    pub tensor_idx: u32,
+}
+
+pub type LsLoadSlicesCb = unsafe extern "C" fn(
+    user_data: *mut c_void,
+    reqs: *const LsTensorSliceReq,
+    req_count: usize,
+    dst_ptr: *mut u8,
+    dst_cap: usize,
+) -> c_int;
+
+pub type LsLoadLayerDirectCb = unsafe extern "C" fn(
+    user_data: *mut c_void,
+    layer_idx: i32,
+    tensor_names: *const *const c_char,
+    tensor_offsets: *const u64,
+    tensor_sizes: *const u64,
+    tensor_count: usize,
+    pin_buf: *mut u8,
+    pin_cap: usize,
+    out_slices: *mut LsSpanSlice,
+    max_slices: usize,
+) -> c_int;
 
 #[repr(C)]
 pub struct LsEngineConfig {
@@ -27,13 +64,18 @@ pub struct LsEngineConfig {
     pub n_threads: u32,
     pub resident_layers: i32,
     pub vram_budget_bytes: u64,
+    pub vram_budget_auto: bool,
     pub kv_cache_type: i32,
     pub use_gpu: bool,
     pub full_resident_reference: bool,
+    pub cpu_embeddings: bool,
+    pub cpu_head: bool,
+    pub stream_head: bool,
+    pub moe_active_streaming: bool,
     pub io_user_data: *mut c_void,
     pub load_tensors_cb: Option<LsLoadTensorsCb>,
-    pub prefetch_start_cb: Option<LsPrefetchStartCb>,
-    pub prefetch_wait_cb: Option<LsPrefetchWaitCb>,
+    pub load_layer_direct_cb: Option<LsLoadLayerDirectCb>,
+    pub load_slices_cb: Option<LsLoadSlicesCb>,
 }
 
 #[repr(C)]
@@ -43,9 +85,17 @@ pub struct LsEngineStats {
     pub resident_layers: u32,
     pub streamed_layers: u32,
     pub resident_bytes: u64,
+    pub cpu_resident_bytes: u64,
     pub slot_bytes: u64,
+    pub expert_slot_bytes: u64,
     pub total_layer_loads: u64,
+    pub moe_layers: u32,
+    pub moe_experts_loaded: u64,
+    pub moe_experts_total: u64,
+    pub head_streamed: bool,
+    pub moe_active_streaming: bool,
     pub is_uma_zero_copy: bool,
+    pub is_unified_memory: bool,
     pub using_gpu: bool,
     pub can_speculate: bool,
 }
@@ -62,7 +112,6 @@ pub struct LsSampleParams {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: i32,
-    pub repeat_penalty: f32,
     pub seed: u32,
 }
 
@@ -72,11 +121,12 @@ impl Default for LsSampleParams {
             temperature: 0.0,
             top_p: 0.95,
             top_k: 40,
-            repeat_penalty: 1.0,
             seed: 42,
         }
     }
 }
+
+pub type LsCancelCheckCb = unsafe extern "C" fn(user_data: *const c_void) -> bool;
 
 unsafe extern "C" {
     pub fn ls_engine_create(
@@ -88,6 +138,40 @@ unsafe extern "C" {
     pub fn ls_engine_free(eng: *mut LsEngine);
 
     pub fn ls_engine_get_stats(eng: *const LsEngine, out: *mut LsEngineStats);
+
+    pub fn ls_engine_vocab_size(eng: *const LsEngine) -> i32;
+
+    pub fn ls_engine_n_ctx(eng: *const LsEngine) -> u32;
+
+    pub fn ls_engine_set_cancel(eng: *mut LsEngine, cancel: bool);
+
+    pub fn ls_engine_set_cancel_cb(
+        eng: *mut LsEngine,
+        cb: Option<LsCancelCheckCb>,
+        user_data: *const c_void,
+    );
+
+    pub fn ls_probe_gpu_memory(
+        use_gpu: bool,
+        out_free_bytes: *mut u64,
+        out_total_bytes: *mut u64,
+    ) -> bool;
+
+    pub fn ls_sample_from_logits(
+        logits: *const f32,
+        n_vocab: i32,
+        sample_params: *const LsSampleParams,
+    ) -> i32;
+
+    pub fn ls_verify_sample_from_logits(
+        logits_per_pos: *const *const f32,
+        n_vocab: i32,
+        draft_tokens: *const i32,
+        k: i32,
+        sample_params: *const LsSampleParams,
+        out_accepted_count: *mut i32,
+        out_next_token: *mut i32,
+    );
 
     pub fn ls_engine_apply_chat_template(
         eng: *const LsEngine,
@@ -148,6 +232,18 @@ unsafe extern "C" {
         n_tokens: i32,
         pos_start: i32,
         out_argmax_tokens: *mut i32,
+        err_buf: *mut c_char,
+        err_cap: usize,
+    ) -> c_int;
+
+    pub fn ls_engine_eval_verify_sample(
+        eng: *mut LsEngine,
+        tokens: *const i32,
+        n_tokens: i32,
+        pos_start: i32,
+        sample_params: *const LsSampleParams,
+        out_accepted_count: *mut i32,
+        out_next_token: *mut i32,
         err_buf: *mut c_char,
         err_cap: usize,
     ) -> c_int;

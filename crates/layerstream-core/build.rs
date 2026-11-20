@@ -15,31 +15,66 @@ fn resolve_llama_cpp_dir() -> PathBuf {
         return local_vendor;
     }
 
-    // Convenient local sibling checkout during development.
-    let dev_checkout = PathBuf::from("/home/martin/Develop/github.com/ggml-org/llama.cpp");
-    if dev_checkout.join("CMakeLists.txt").is_file() {
-        return dev_checkout;
-    }
-
-    panic!("Could not locate llama.cpp source tree. Set LLAMA_CPP_DIR or enter `nix develop`.");
+    panic!(
+        "Could not locate pinned llama.cpp source tree. \
+         Set LLAMA_CPP_DIR, checkout third_party/llama.cpp, or enter `nix develop`."
+    );
 }
 
-fn find_static_libs(root: &Path, out: &mut Vec<PathBuf>) {
+fn find_libs_with_filter(root: &Path, out: &mut Vec<PathBuf>, pred: &dyn Fn(&Path) -> bool) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            find_static_libs(&path, out);
-        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("a" | "lib")) {
+            find_libs_with_filter(&path, out, pred);
+        } else if pred(&path) {
             out.push(path);
+        }
+    }
+}
+
+fn is_static_lib(path: &Path) -> bool {
+    matches!(path.extension().and_then(|e| e.to_str()), Some("a" | "lib"))
+}
+
+fn is_shared_lib(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.ends_with(".so")
+        || name.contains(".so.")
+        || name.ends_with(".dylib")
+        || name.ends_with(".dll")
+}
+
+fn stage_shared_libs(shared_libs: &[PathBuf], stage_dir: &Path) {
+    let _ = std::fs::create_dir_all(stage_dir);
+    for src in shared_libs {
+        let Some(fname) = src.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(fname.starts_with("libggml")
+            || fname.starts_with("libllama")
+            || fname.starts_with("ggml")
+            || fname.starts_with("llama"))
+        {
+            continue;
+        }
+        let dst = stage_dir.join(fname);
+        // Copy dereferenced contents if symlink, or regular file, so archives stay self-contained.
+        if let Ok(meta) = std::fs::metadata(src)
+            && meta.is_file()
+        {
+            let _ = std::fs::copy(src, &dst);
         }
     }
 }
 
 fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_DIR");
+    println!("cargo:rerun-if-env-changed=LAYERSTREAM_BACKEND_STAGE_DIR");
     println!("cargo:rerun-if-changed=cpp/stream_engine.h");
     println!("cargo:rerun-if-changed=cpp/stream_engine.cpp");
 
@@ -47,23 +82,41 @@ fn main() {
     let use_vulkan = env::var("CARGO_FEATURE_VULKAN").is_ok();
     let use_cuda = env::var("CARGO_FEATURE_CUDA").is_ok();
     let use_metal = env::var("CARGO_FEATURE_METAL").is_ok();
+    let dynamic_backends = env::var("CARGO_FEATURE_DYNAMIC_BACKENDS").is_ok();
 
     let mut cfg = cmake::Config::new(&llama_dir);
     cfg.profile("Release")
-        .build_target("llama")
-        .define("BUILD_SHARED_LIBS", "OFF")
+        .define(
+            "BUILD_SHARED_LIBS",
+            if dynamic_backends { "ON" } else { "OFF" },
+        )
+        .define(
+            "GGML_BACKEND_DL",
+            if dynamic_backends { "ON" } else { "OFF" },
+        )
+        .define("GGML_CPU_ALL_VARIANTS", "OFF")
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_SERVER", "OFF")
         .define("LLAMA_BUILD_COMMON", "OFF")
+        .define("LLAMA_BUILD_APP", "OFF")
         .define("LLAMA_CURL", "OFF")
         .define("GGML_NATIVE", "OFF")
         .define("GGML_OPENMP", "OFF")
         .define("GGML_VULKAN", if use_vulkan { "ON" } else { "OFF" })
         .define("GGML_CUDA", if use_cuda { "ON" } else { "OFF" })
         .define("GGML_CUDA_GRAPHS", "OFF")
-        .define("GGML_METAL", if use_metal { "ON" } else { "OFF" });
+        .define("GGML_METAL", if use_metal { "ON" } else { "OFF" })
+        .define(
+            "GGML_METAL_EMBED_LIBRARY",
+            if use_metal { "ON" } else { "OFF" },
+        )
+        .define("GGML_METAL_NDEBUG", "ON");
+
+    if !dynamic_backends {
+        cfg.build_target("llama");
+    }
 
     if use_cuda {
         if let Ok(archs) = env::var("CMAKE_CUDA_ARCHITECTURES") {
@@ -99,22 +152,41 @@ fn main() {
         .include(llama_dir.join("ggml/src"))
         .warnings(false);
 
-    if use_cuda {
+    if dynamic_backends {
+        cc_build.define("LAYERSTREAM_DYNAMIC_BACKENDS", None);
+    }
+
+    if use_cuda && !dynamic_backends {
         cc_build.define("LAYERSTREAM_USE_CUDA", None);
+        let has_nixos_driver = Path::new("/run/opengl-driver/lib/libcuda.so.1").exists();
+        if Path::new("/run/opengl-driver/lib").is_dir() {
+            println!("cargo:rustc-link-search=native=/run/opengl-driver/lib");
+            println!("cargo:rustc-link-arg-tests=-Wl,-rpath,/run/opengl-driver/lib");
+            println!("cargo:rustc-link-arg-examples=-Wl,-rpath,/run/opengl-driver/lib");
+        }
         if let Ok(cuda_path) = env::var("CUDA_PATH")
             .or_else(|_| env::var("CUDAToolkit_ROOT"))
             .or_else(|_| env::var("CUDA_HOME"))
         {
             cc_build.include(Path::new(&cuda_path).join("include"));
-            for sub in ["lib", "lib64", "lib/stubs", "lib64/stubs"] {
+            for sub in ["lib", "lib64"] {
                 let d = Path::new(&cuda_path).join(sub);
                 if d.is_dir() {
                     println!("cargo:rustc-link-search=native={}", d.display());
                 }
             }
-        }
-        if Path::new("/run/opengl-driver/lib").is_dir() {
-            println!("cargo:rustc-link-search=native=/run/opengl-driver/lib");
+            // Only fall back to CUDA link-time stubs when no real host driver library
+            // is present (e.g., pure sandbox / cross-build). Putting Nix store stub dirs
+            // in -L causes ld-wrapper to record them in DT_RUNPATH, overriding the host
+            // libcuda.so.1 at runtime when spawned outside `nix develop .#cuda`!
+            if !has_nixos_driver {
+                for sub in ["lib/stubs", "lib64/stubs"] {
+                    let d = Path::new(&cuda_path).join(sub);
+                    if d.is_dir() {
+                        println!("cargo:rustc-link-search=native={}", d.display());
+                    }
+                }
+            }
         }
     }
     if use_vulkan {
@@ -126,13 +198,82 @@ fn main() {
 
     cc_build.compile("layerstream_cpp");
 
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    if dynamic_backends {
+        let mut shared_libs = Vec::new();
+        for subdir in ["lib", "lib64", "bin", "build"] {
+            let dir = dst.join(subdir);
+            if dir.is_dir() {
+                find_libs_with_filter(&dir, &mut shared_libs, &is_shared_lib);
+            }
+        }
+        let mut link_dirs = std::collections::BTreeSet::new();
+        for lib in &shared_libs {
+            if let Some(parent) = lib.parent() {
+                link_dirs.insert(parent.to_path_buf());
+            }
+        }
+        if target_os == "windows" {
+            let mut import_libs = Vec::new();
+            for subdir in ["lib", "lib64", "build"] {
+                let dir = dst.join(subdir);
+                if dir.is_dir() {
+                    find_libs_with_filter(&dir, &mut import_libs, &is_static_lib);
+                }
+            }
+            for lib in &import_libs {
+                if let Some(parent) = lib.parent() {
+                    link_dirs.insert(parent.to_path_buf());
+                }
+            }
+        }
+        for dir in &link_dirs {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+
+        // Stage sibling dynamic backend plugins (`libggml-*.so`, `libllama.so`, etc.)
+        // right next to Cargo's output binaries so `$ORIGIN` / `@loader_path` finds them.
+        if let Ok(out_dir) = env::var("OUT_DIR") {
+            let out_path = PathBuf::from(out_dir);
+            if let Some(profile_dir) = out_path.ancestors().nth(3) {
+                stage_shared_libs(&shared_libs, profile_dir);
+                stage_shared_libs(&shared_libs, &profile_dir.join("deps"));
+                stage_shared_libs(&shared_libs, &profile_dir.join("examples"));
+            }
+        }
+        if let Ok(custom_stage) = env::var("LAYERSTREAM_BACKEND_STAGE_DIR")
+            && !custom_stage.trim().is_empty()
+        {
+            stage_shared_libs(&shared_libs, Path::new(&custom_stage));
+        }
+
+        for name in ["llama", "ggml", "ggml-base"] {
+            println!("cargo:rustc-link-lib=dylib={name}");
+        }
+
+        if target_os == "linux" {
+            println!("cargo:rustc-link-arg-tests=-Wl,-rpath,$ORIGIN");
+            println!("cargo:rustc-link-arg-examples=-Wl,-rpath,$ORIGIN");
+            println!("cargo:rustc-link-lib=stdc++");
+            println!("cargo:rustc-link-lib=m");
+            println!("cargo:rustc-link-lib=pthread");
+            println!("cargo:rustc-link-lib=dl");
+        } else if target_os == "macos" {
+            println!("cargo:rustc-link-arg-tests=-Wl,-rpath,@loader_path");
+            println!("cargo:rustc-link-arg-examples=-Wl,-rpath,@loader_path");
+            println!("cargo:rustc-link-lib=c++");
+        }
+        return;
+    }
+
     // Link static archives built by llama.cpp in dependency order.
     let mut lib_dirs = std::collections::BTreeSet::new();
     let mut libs = Vec::new();
     for subdir in ["lib", "lib64", "build"] {
         let dir = dst.join(subdir);
         if dir.is_dir() {
-            find_static_libs(&dir, &mut libs);
+            find_libs_with_filter(&dir, &mut libs, &is_static_lib);
         }
     }
     for lib in &libs {
@@ -168,7 +309,6 @@ fn main() {
     }
 
     // Link platform & backend runtime libraries.
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "linux" {
         println!("cargo:rustc-link-lib=stdc++");
         println!("cargo:rustc-link-lib=m");

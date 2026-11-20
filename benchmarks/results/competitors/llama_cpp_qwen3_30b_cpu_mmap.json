@@ -1,0 +1,32 @@
+[
+  {
+    "engine": "llama.cpp",
+    "mode": "llama_cpp_qwen3_30b_cpu_mmap",
+    "status": "error_rc_1",
+    "model": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "ngl": 0,
+    "kv_cache_type": "q8_0",
+    "extra_args": [
+      "-no-cnv"
+    ],
+    "workload": "open_ended",
+    "load_time_s": null,
+    "ttft_s": null,
+    "decode_time_s": 66.223,
+    "total_time_s": 66.223,
+    "prompt_tokens": null,
+    "completion_tokens": 0,
+    "decode_tok_per_s": 0.0,
+    "total_tok_per_s": 0.0,
+    "peak_rss_mib": 6044.1,
+    "mem_avail_before_mib": 5115.9,
+    "mem_avail_min_mib": 17.1,
+    "page_cache_delta_mib": -62.8,
+    "swap_delta_mib": 12324.5,
+    "idle_watts": 7.92,
+    "avg_watts": 10.16,
+    "joules_per_tok": null,
+    "output_preview": "",
+    "stderr_tail": "ers\n1.03.203.115 E cmn  common_init_: failed to create context with model '/mnt/models/bench/Qwen3-30B-A3B-Q4_K_M.gguf'\n1.03.203.149 E cmn  common_init_: failed to create context with model '/mnt/models/bench/Qwen3-30B-A3B-Q4_K_M.gguf'\n1.03.203.459 E llama_completion: error: unable to create context"
+  }
+]

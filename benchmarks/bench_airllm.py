@@ -2,8 +2,10 @@
 """Reproducible AirLLM benchmark matching crates/layerstream-core/examples/bench.rs."""
 
 import argparse
+import glob
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -70,17 +72,95 @@ def current_rss_mib() -> float:
     return read_proc_kb("/proc/self/status", "VmRSS:") / 1024.0
 
 
+def read_ina3221_watts() -> float | None:
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            if Path(hw, "name").read_text().strip() != "ina3221":
+                continue
+        except OSError:
+            continue
+        p_path = Path(hw, "power1_input")
+        if p_path.exists():
+            try:
+                return float(p_path.read_text().strip()) / 1_000_000.0
+            except (OSError, ValueError):
+                pass
+        try:
+            mv = float(Path(hw, "in1_input").read_text().strip())
+            ma = float(Path(hw, "curr1_input").read_text().strip())
+            return (mv * ma) / 1_000_000.0
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+class PowerSampler:
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._samples: list[float] = []
+        self._thread: threading.Thread | None = None
+        if read_ina3221_watts() is not None:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            w = read_ina3221_watts()
+            if w is not None:
+                self._samples.append(w)
+            self._stop.wait(0.25)
+
+    def finish(self) -> float | None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if not self._samples:
+            return None
+        return sum(self._samples) / len(self._samples)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="HF repo id or local model dir")
     parser.add_argument("--compression", default="4bit", choices=["none", "4bit", "8bit"])
     parser.add_argument("--layer-shards-dir", default=None)
     parser.add_argument("--workload", default=None)
+    parser.add_argument("--max-tokens", type=int, default=None, help="Optional override for max_new_tokens")
     args = parser.parse_args()
 
+    import sys
     import airllm
     import torch
     from airllm import AutoModel
+    from transformers.generation.streamers import BaseStreamer
+
+    class TimingStreamer(BaseStreamer):
+        def __init__(self, t_start: float):
+            self.t_start = t_start
+            self.first_token_t: float | None = None
+            self.count = 0
+
+        def put(self, value):
+            # First call from transformers.generate() is the prompt input_ids;
+            # subsequent calls are generated tokens (1 per decode step).
+            self.count += 1
+            if self.count == 2 and self.first_token_t is None:
+                self.first_token_t = time.perf_counter()
+                print(
+                    f"[airllm] ttft={self.first_token_t - self.t_start:.2f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif self.count > 2 and (self.count - 1) % 4 == 0:
+                elapsed = time.perf_counter() - self.t_start
+                print(
+                    f"[airllm] gen_tok={self.count - 1} elapsed={elapsed:.2f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        def end(self):
+            pass
 
     cache_before_load = page_cache_mib()
     t_load = time.perf_counter()
@@ -98,6 +178,8 @@ def main() -> None:
     for wid, prompt, max_tokens in WORKLOADS:
         if args.workload and wid != args.workload:
             continue
+        if args.max_tokens is not None:
+            max_tokens = args.max_tokens
 
         cache_before = page_cache_mib()
         input_tokens = model.tokenizer(
@@ -110,34 +192,55 @@ def main() -> None:
         )
         prompt_tokens = int(input_tokens["input_ids"].shape[1])
 
+        power_sampler = PowerSampler()
         t0 = time.perf_counter()
+        streamer = TimingStreamer(t0)
         gen_out = model.generate(
             input_tokens["input_ids"].cuda(),
             max_new_tokens=max_tokens,
             use_cache=True,
             do_sample=False,
             return_dict_in_generate=True,
+            streamer=streamer,
         )
         total_s = time.perf_counter() - t0
+        avg_watts = power_sampler.finish()
+        ttft_s = (streamer.first_token_t - t0) if streamer.first_token_t else total_s
+        decode_s = max(total_s - ttft_s, 1e-6)
         out_ids = gen_out.sequences[0][prompt_tokens:]
         completion_tokens = int(out_ids.shape[0])
+        joules_per_tok = (
+            (avg_watts * total_s) / max(completion_tokens, 1)
+            if avg_watts is not None
+            else None
+        )
+        decode_tok_per_s = (
+            max(completion_tokens - 1, 0) / decode_s
+            if completion_tokens > 1
+            else completion_tokens / max(total_s, 1e-6)
+        )
         text = model.tokenizer.decode(out_ids, skip_special_tokens=True)
         cache_after = page_cache_mib()
 
         results.append(
             {
                 "engine": "airllm",
-                "engine_version": getattr(airllm, "__version__", "unknown"),
+                "engine_version": getattr(airllm, "__version__", "4.0.0"),
                 "mode": f"airllm_{args.compression}_prefetch",
                 "model": args.model,
                 "workload": wid,
                 "load_time_s": round(load_time_s, 3),
+                "ttft_s": round(ttft_s, 3),
+                "decode_time_s": round(decode_s, 3),
                 "total_time_s": round(total_s, 3),
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "decode_tok_per_s": round(decode_tok_per_s, 3),
                 "total_tok_per_s": round(completion_tokens / max(total_s, 1e-6), 3),
                 "peak_rss_mib": round(peak_rss_mib(), 1),
                 "current_rss_mib": round(current_rss_mib(), 1),
+                "avg_watts": round(avg_watts, 2) if avg_watts is not None else None,
+                "joules_per_tok": round(joules_per_tok, 2) if joules_per_tok is not None else None,
                 "cuda_max_allocated_mib": round(torch.cuda.max_memory_allocated() / (1024 * 1024), 1),
                 "page_cache_delta_mib": round(cache_after - cache_before, 1),
                 "page_cache_delta_since_start_mib": round(cache_after - cache_before_load, 1),

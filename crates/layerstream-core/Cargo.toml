@@ -10,6 +10,7 @@ default = []
 vulkan = []
 cuda = []
 metal = []
+dynamic-backends = []
 
 [dependencies]
 anyhow.workspace = true

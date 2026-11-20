@@ -14,6 +14,14 @@ const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
 pub const DIRECT_IO_ALIGN: u64 = 4096;
 const DEFAULT_MERGE_GAP_BYTES: u64 = 64 * 1024;
+const MAX_GGUF_TENSORS: usize = 1_000_000;
+const MAX_GGUF_KV_COUNT: usize = 1_000_000;
+const MAX_GGUF_STRING_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GGUF_TENSOR_DIMS: usize = 16;
+const MAX_GGUF_ARRAY_ELEMS: u64 = 16_000_000;
+/// Maximum vocabulary size padding tolerance between target and draft models of the same family
+/// (e.g., Qwen2.5-14B/32B pads 151,936 base tokens to 152,064 with 128 trailing `[PAD]` entries).
+pub const MAX_DRAFT_VOCAB_PAD_DELTA: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ModelMeta {
@@ -38,6 +46,7 @@ pub struct SpanSlice {
     pub dst_offset: usize,
     pub span_offset: usize,
     pub len: usize,
+    pub tensor_idx: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -80,7 +89,7 @@ impl GgufIndex {
             total_file_bytes += file_len;
 
             let mut reader = BufReader::new(file);
-            let parsed = parse_single_header(&mut reader, shard_idx)
+            let parsed = parse_single_header(&mut reader, shard_idx, file_len, false)
                 .with_context(|| format!("failed to parse GGUF header {}", shard_path.display()))?;
 
             if shard_idx == 0 {
@@ -129,34 +138,53 @@ impl GgufIndex {
         &self,
         requests: &[(&str, usize, usize)],
     ) -> Result<Vec<CoalescedSpan>> {
+        let sub_reqs: Vec<(&str, u64, usize, usize, u32)> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, dst_offset, len))| (name, 0u64, dst_offset, len, i as u32))
+            .collect();
+        self.plan_coalesced_sub_slices(&sub_reqs)
+    }
+
+    /// Plans coalesced 4K-aligned file spans for arbitrary tensor byte sub-ranges:
+    /// `(tensor_name, src_offset_in_tensor, dst_offset, len, tensor_idx)`.
+    /// Adjacent or nearby slices (e.g. active MoE experts) within `DEFAULT_MERGE_GAP_BYTES`
+    /// are automatically merged into a single 4K-aligned span.
+    pub fn plan_coalesced_sub_slices(
+        &self,
+        requests: &[(&str, u64, usize, usize, u32)],
+    ) -> Result<Vec<CoalescedSpan>> {
         #[derive(Clone)]
         struct Item {
             shard_idx: usize,
             abs_offset: u64,
             len: usize,
             dst_offset: usize,
+            tensor_idx: u32,
         }
 
         let mut items = Vec::with_capacity(requests.len());
-        for &(name, dst_offset, len) in requests {
+        for &(name, src_off, dst_offset, len, tensor_idx) in requests {
             let loc = self
                 .tensors
                 .get(name)
                 .with_context(|| format!("tensor '{name}' missing from GGUF index"))?;
             let shard_size = self.shard_sizes[loc.shard_idx];
-            if loc.abs_offset + (len as u64) > shard_size {
+            let abs_offset = loc.abs_offset.saturating_add(src_off);
+            if abs_offset.saturating_add(len as u64) > shard_size {
                 bail!(
-                    "tensor '{name}' [{}, {}) exceeds shard size {}",
-                    loc.abs_offset,
-                    loc.abs_offset + (len as u64),
+                    "tensor slice '{name}' [{}, {}) exceeds shard size {}",
+                    abs_offset,
+                    abs_offset.saturating_add(len as u64),
                     shard_size
                 );
             }
             items.push(Item {
                 shard_idx: loc.shard_idx,
-                abs_offset: loc.abs_offset,
+                abs_offset,
                 len,
                 dst_offset,
+                tensor_idx,
             });
         }
 
@@ -167,7 +195,7 @@ impl GgufIndex {
         while i < items.len() {
             let shard_idx = items[i].shard_idx;
             let shard_size = self.shard_sizes[shard_idx];
-            let mut group_start = items[i].abs_offset;
+            let group_start = items[i].abs_offset;
             let mut group_end = items[i].abs_offset + items[i].len as u64;
             let mut j = i + 1;
 
@@ -194,6 +222,7 @@ impl GgufIndex {
                     dst_offset: item.dst_offset,
                     span_offset: (item.abs_offset - aligned_offset) as usize,
                     len: item.len,
+                    tensor_idx: item.tensor_idx,
                 });
             }
 
@@ -205,7 +234,6 @@ impl GgufIndex {
                 slices,
             });
 
-            let _ = &mut group_start;
             i = j;
         }
 
@@ -286,9 +314,75 @@ impl KvValue {
 struct ParsedHeader {
     kv: HashMap<String, KvValue>,
     tensors: Vec<TensorLocation>,
+    vocab_tokens: Option<Vec<String>>,
 }
 
-fn parse_single_header<R: Read + Seek>(r: &mut R, shard_idx: usize) -> Result<ParsedHeader> {
+/// Validates at startup (from GGUF metadata headers alone, 0 MB VRAM) that `draft_path`
+/// shares the exact same base vocabulary as `target_path`, allowing up to
+/// `MAX_DRAFT_VOCAB_PAD_DELTA` trailing padded tokens (e.g. Qwen2.5-14B/32B `152,064`
+/// vs `0.5B` `151,936`).
+pub fn check_gguf_draft_compatible(
+    target_path: impl AsRef<Path>,
+    draft_path: impl AsRef<Path>,
+) -> Result<()> {
+    let target_tokens = read_gguf_vocab_tokens(target_path.as_ref())?;
+    let draft_tokens = read_gguf_vocab_tokens(draft_path.as_ref())?;
+    check_vocab_lists_compatible(&target_tokens, &draft_tokens).map_err(|msg| anyhow::anyhow!(msg))
+}
+
+pub fn check_vocab_lists_compatible(
+    target_tokens: &[String],
+    draft_tokens: &[String],
+) -> std::result::Result<(), String> {
+    if target_tokens.is_empty() || draft_tokens.is_empty() {
+        return Err(format!(
+            "missing tokenizer vocabulary in GGUF header (target={}, draft={})",
+            target_tokens.len(),
+            draft_tokens.len()
+        ));
+    }
+    let delta = target_tokens.len().abs_diff(draft_tokens.len());
+    if delta > MAX_DRAFT_VOCAB_PAD_DELTA {
+        return Err(format!(
+            "vocabulary size mismatch (target={}, draft={}, delta={} > max pad tolerance {})",
+            target_tokens.len(),
+            draft_tokens.len(),
+            delta,
+            MAX_DRAFT_VOCAB_PAD_DELTA
+        ));
+    }
+    let shared = target_tokens.len().min(draft_tokens.len());
+    for i in 0..shared {
+        if target_tokens[i] != draft_tokens[i] {
+            return Err(format!(
+                "vocabulary token mismatch at id {i} (target={:?}, draft={:?})",
+                target_tokens[i], draft_tokens[i]
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_gguf_vocab_tokens(path: &Path) -> Result<Vec<String>> {
+    let shards = discover_shards(path)?;
+    let primary = &shards[0];
+    let file = File::open(primary)
+        .with_context(|| format!("failed to open GGUF for vocab check {}", primary.display()))?;
+    let file_len = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let parsed = parse_single_header(&mut reader, 0, file_len, true)
+        .with_context(|| format!("failed to parse GGUF header {}", primary.display()))?;
+    parsed
+        .vocab_tokens
+        .context("GGUF header missing tokenizer.ggml.tokens array")
+}
+
+fn parse_single_header<R: Read + Seek>(
+    r: &mut R,
+    shard_idx: usize,
+    file_len: u64,
+    capture_vocab: bool,
+) -> Result<ParsedHeader> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != GGUF_MAGIC {
@@ -300,15 +394,38 @@ fn parse_single_header<R: Read + Seek>(r: &mut R, shard_idx: usize) -> Result<Pa
         bail!("unsupported GGUF version: {version}");
     }
 
-    let tensor_count = read_u64(r)? as usize;
-    let kv_count = read_u64(r)? as usize;
+    let tensor_count_u64 = read_u64(r)?;
+    let kv_count_u64 = read_u64(r)?;
+    if tensor_count_u64 > MAX_GGUF_TENSORS as u64 {
+        bail!("GGUF tensor_count {tensor_count_u64} exceeds safety limit {MAX_GGUF_TENSORS}");
+    }
+    if kv_count_u64 > MAX_GGUF_KV_COUNT as u64 {
+        bail!("GGUF kv_count {kv_count_u64} exceeds safety limit {MAX_GGUF_KV_COUNT}");
+    }
+    let tensor_count = tensor_count_u64 as usize;
+    let kv_count = kv_count_u64 as usize;
 
     let mut kv = HashMap::with_capacity(kv_count.min(1024));
+    let mut vocab_tokens: Option<Vec<String>> = None;
     for _ in 0..kv_count {
-        let key = read_string(r)?;
+        let key = read_string(r, file_len)?;
         let val_type = read_u32(r)?;
-        let val = read_kv_value(r, val_type)?;
-        kv.insert(key, val);
+        if capture_vocab && key == "tokenizer.ggml.tokens" && val_type == 9 {
+            let elem_type = read_u32(r)?;
+            let len = read_u64(r)?;
+            if elem_type != 8 || len > MAX_GGUF_ARRAY_ELEMS {
+                bail!("unexpected tokenizer.ggml.tokens array type={elem_type} len={len}");
+            }
+            let mut toks = Vec::with_capacity((len as usize).min(262_144));
+            for _ in 0..len {
+                toks.push(read_string(r, file_len)?);
+            }
+            vocab_tokens = Some(toks);
+            kv.insert(key, KvValue::Other);
+        } else {
+            let val = read_kv_value(r, val_type, file_len)?;
+            kv.insert(key, val);
+        }
     }
 
     let alignment = kv
@@ -316,11 +433,26 @@ fn parse_single_header<R: Read + Seek>(r: &mut R, shard_idx: usize) -> Result<Pa
         .and_then(KvValue::as_u32)
         .map(u64::from)
         .unwrap_or(GGUF_DEFAULT_ALIGNMENT);
+    if alignment == 0 || !alignment.is_power_of_two() {
+        bail!("invalid GGUF general.alignment: {alignment} (must be non-zero power of two)");
+    }
 
-    let mut raw_tensors = Vec::with_capacity(tensor_count);
+    if capture_vocab {
+        return Ok(ParsedHeader {
+            kv,
+            tensors: Vec::new(),
+            vocab_tokens,
+        });
+    }
+
+    let mut raw_tensors = Vec::with_capacity(tensor_count.min(4096));
     for _ in 0..tensor_count {
-        let name = read_string(r)?;
-        let n_dims = read_u32(r)? as usize;
+        let name = read_string(r, file_len)?;
+        let n_dims_u32 = read_u32(r)?;
+        if n_dims_u32 as usize > MAX_GGUF_TENSOR_DIMS {
+            bail!("GGUF tensor '{name}' n_dims {n_dims_u32} exceeds limit {MAX_GGUF_TENSOR_DIMS}");
+        }
+        let n_dims = n_dims_u32 as usize;
         let mut dims = Vec::with_capacity(n_dims);
         for _ in 0..n_dims {
             dims.push(read_u64(r)?);
@@ -333,69 +465,82 @@ fn parse_single_header<R: Read + Seek>(r: &mut R, shard_idx: usize) -> Result<Pa
     let header_end = r.stream_position()?;
     let data_start = align_up(header_end, alignment);
 
-    let tensors = raw_tensors
-        .into_iter()
-        .map(|(name, dims, ggml_type, rel_offset)| TensorLocation {
+    let mut tensors = Vec::with_capacity(raw_tensors.len());
+    for (name, dims, ggml_type, rel_offset) in raw_tensors {
+        let abs_offset = data_start
+            .checked_add(rel_offset)
+            .context("GGUF tensor offset overflow")?;
+        tensors.push(TensorLocation {
             name,
             shard_idx,
-            abs_offset: data_start + rel_offset,
+            abs_offset,
             ggml_type,
             dims,
-        })
-        .collect();
+        });
+    }
 
-    Ok(ParsedHeader { kv, tensors })
+    Ok(ParsedHeader {
+        kv,
+        tensors,
+        vocab_tokens,
+    })
 }
 
-fn read_kv_value<R: Read + Seek>(r: &mut R, val_type: u32) -> Result<KvValue> {
+fn read_kv_value<R: Read + Seek>(r: &mut R, val_type: u32, file_len: u64) -> Result<KvValue> {
     match val_type {
         0 => {
-            skip_bytes(r, 1)?;
+            skip_bytes(r, 1, file_len)?;
             Ok(KvValue::Other)
         } // UINT8
         1 => {
-            skip_bytes(r, 1)?;
+            skip_bytes(r, 1, file_len)?;
             Ok(KvValue::Other)
         } // INT8
         2 => {
-            skip_bytes(r, 2)?;
+            skip_bytes(r, 2, file_len)?;
             Ok(KvValue::Other)
         } // UINT16
         3 => {
-            skip_bytes(r, 2)?;
+            skip_bytes(r, 2, file_len)?;
             Ok(KvValue::Other)
         } // INT16
         4 => Ok(KvValue::U32(read_u32(r)?)),        // UINT32
         5 => Ok(KvValue::I32(read_u32(r)? as i32)), // INT32
         6 => {
-            skip_bytes(r, 4)?;
+            skip_bytes(r, 4, file_len)?;
             Ok(KvValue::Other)
         } // FLOAT32
         7 => {
-            skip_bytes(r, 1)?;
+            skip_bytes(r, 1, file_len)?;
             Ok(KvValue::Other)
         } // BOOL
-        8 => Ok(KvValue::Str(read_string(r)?)),     // STRING
+        8 => Ok(KvValue::Str(read_string(r, file_len)?)), // STRING
         9 => {
             // ARRAY
             let elem_type = read_u32(r)?;
             let len = read_u64(r)?;
+            if len > MAX_GGUF_ARRAY_ELEMS {
+                bail!("GGUF array length {len} exceeds safety limit {MAX_GGUF_ARRAY_ELEMS}");
+            }
             if let Some(elem_size) = fixed_kv_type_size(elem_type) {
-                skip_bytes(r, len * elem_size)?;
+                let bytes = len
+                    .checked_mul(elem_size)
+                    .context("GGUF array byte size overflow")?;
+                skip_bytes(r, bytes, file_len)?;
             } else {
                 for _ in 0..len {
-                    let _ = read_kv_value(r, elem_type)?;
+                    let _ = read_kv_value(r, elem_type, file_len)?;
                 }
             }
             Ok(KvValue::Other)
         }
         10 => Ok(KvValue::U64(read_u64(r)?)), // UINT64
         11 => {
-            skip_bytes(r, 8)?;
+            skip_bytes(r, 8, file_len)?;
             Ok(KvValue::Other)
         } // INT64
         12 => {
-            skip_bytes(r, 8)?;
+            skip_bytes(r, 8, file_len)?;
             Ok(KvValue::Other)
         } // FLOAT64
         other => bail!("unknown GGUF KV type id: {other}"),
@@ -424,15 +569,27 @@ fn read_u64<R: Read>(r: &mut R) -> Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
-fn read_string<R: Read>(r: &mut R) -> Result<String> {
-    let len = read_u64(r)? as usize;
-    let mut buf = vec![0u8; len];
+fn read_string<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<String> {
+    let len_u64 = read_u64(r)?;
+    let pos = r.stream_position()?;
+    let remaining = file_len.saturating_sub(pos);
+    if len_u64 > MAX_GGUF_STRING_BYTES as u64 || len_u64 > remaining {
+        bail!(
+            "GGUF string length {len_u64} exceeds bounds (max={MAX_GGUF_STRING_BYTES}, remaining={remaining})"
+        );
+    }
+    let mut buf = vec![0u8; len_u64 as usize];
     r.read_exact(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn skip_bytes<R: Seek>(r: &mut R, n: u64) -> Result<()> {
-    r.seek(SeekFrom::Current(n as i64))?;
+fn skip_bytes<R: Seek>(r: &mut R, n: u64, file_len: u64) -> Result<()> {
+    let pos = r.stream_position()?;
+    let target = pos.checked_add(n).context("GGUF seek offset overflow")?;
+    if target > file_len {
+        bail!("GGUF skip past EOF ({target} > {file_len})");
+    }
+    r.seek(SeekFrom::Start(target))?;
     Ok(())
 }
 

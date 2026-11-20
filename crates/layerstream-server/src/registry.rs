@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use layerstream_core::{GgufIndex, ModelMeta};
+use layerstream_core::{GgufIndex, ModelMeta, check_gguf_draft_compatible};
 
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
@@ -73,13 +73,30 @@ impl ModelRegistry {
         let canonical = std::fs::canonicalize(path)
             .with_context(|| format!("resolve model path {}", path.display()))?;
         let index = GgufIndex::open(&canonical)?;
+        let canonical_draft = match draft_path {
+            Some(dp) => {
+                let cdp = std::fs::canonicalize(&dp)
+                    .with_context(|| format!("resolve draft model path {}", dp.display()))?;
+                // Fail closed at startup (0 MB VRAM) if the draft model's tokenizer vocabulary
+                // does not match the target model (allowing <=256 padded trailing entries).
+                check_gguf_draft_compatible(&canonical, &cdp).with_context(|| {
+                    format!(
+                        "incompatible --draft-model {} for target {}",
+                        cdp.display(),
+                        canonical.display()
+                    )
+                })?;
+                Some(cdp)
+            }
+            None => None,
+        };
         let id = explicit_id.unwrap_or_else(|| derive_model_id(&canonical));
         self.models.insert(
             id.clone(),
             ModelEntry {
                 id,
                 path: canonical,
-                draft_path,
+                draft_path: canonical_draft,
                 meta: index.meta,
             },
         );
