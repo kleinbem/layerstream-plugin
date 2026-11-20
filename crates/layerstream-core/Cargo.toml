@@ -1,0 +1,29 @@
+[package]
+name = "layerstream-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-patch llama.cpp ping-pong GPU layer streaming core with O_DIRECT GGUF reader"
+
+[features]
+default = []
+vulkan = []
+cuda = []
+metal = []
+dynamic-backends = []
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"
