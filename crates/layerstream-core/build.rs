@@ -86,6 +86,12 @@ fn stage_shared_libs(shared_libs: &[PathBuf], stage_dir: &Path) {
 fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_DIR");
     println!("cargo:rerun-if-env-changed=LAYERSTREAM_BACKEND_STAGE_DIR");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=CUDAToolkit_ROOT");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
+    println!("cargo:rerun-if-env-changed=CMAKE_CUDA_COMPILER");
+    println!("cargo:rerun-if-env-changed=CMAKE_CUDA_HOST_COMPILER");
     println!("cargo:rerun-if-changed=cpp/stream_engine.h");
     println!("cargo:rerun-if-changed=cpp/stream_engine.cpp");
 

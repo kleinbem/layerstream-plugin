@@ -29,6 +29,9 @@
 #ifdef _WIN32
 #include <malloc.h>
 #ifdef LAYERSTREAM_DYNAMIC_BACKENDS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 #else
@@ -88,12 +91,6 @@ static void ensure_llama_initialized() {
         _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
 #else
         setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
-#if defined(LAYERSTREAM_USE_CUDA) && defined(__aarch64__)
-        // Work around silent cublasSgemm no-op on Jetson aarch64 (L4T R39 + cuBLAS 12.6)
-        // for F32 MoE router GEMMs (e.g., Qwen3-30B-A3B [2048,128] x [2048,N]).
-        // BF16 routes via cublasGemmEx with full F32 exponent range on Ampere+ (sm_87).
-        setenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE", "bf16", 0);
-#endif
 #endif
 #ifdef LAYERSTREAM_DYNAMIC_BACKENDS
         if (const char * custom_dir = std::getenv("LAYERSTREAM_BACKEND_DIR");
@@ -423,7 +420,7 @@ struct ls_engine {
                     std::memory_order_relaxed
                 );
             }
-            ls_span_slice direct_slices[128];
+            ls_span_slice direct_slices[128] = {};
             int n_direct = 0;
             if (load_layer_direct_cb != nullptr) {
                 n_direct = load_layer_direct_cb(
@@ -469,6 +466,12 @@ struct ls_engine {
 #ifdef LAYERSTREAM_USE_CUDA
             if (copy_stream != nullptr) {
                 auto * gpu_dst = static_cast<uint8_t *>(ggml_backend_buffer_get_base(slot_buf[slot]));
+                bool submitted_h2d = false;
+                auto fence_on_err = [&]() {
+                    if (submitted_h2d) {
+                        (void)cudaStreamSynchronize(copy_stream);
+                    }
+                };
                 if (n_direct > 0) {
                     for (int i = 0; i < n_direct; ++i) {
                         cudaError_t ce = cudaMemcpyAsync(
@@ -479,8 +482,10 @@ struct ls_engine {
                             copy_stream
                         );
                         if (ce != cudaSuccess) {
+                            fence_on_err();
                             return -10;
                         }
+                        submitted_h2d = true;
                     }
                 } else {
                     cudaError_t ce = cudaMemcpyAsync(
@@ -493,6 +498,7 @@ struct ls_engine {
                     if (ce != cudaSuccess) {
                         return -10;
                     }
+                    submitted_h2d = true;
                 }
                 // Zero any quantized row padding tails between heterogeneous layers reusing slot_buf.
                 for (const auto & tb : plan.tensors) {
@@ -503,12 +509,14 @@ struct ls_engine {
                                 static_cast<size_t>(tb.alloc_size - tb.nbytes),
                                 copy_stream
                             ) != cudaSuccess) {
+                            fence_on_err();
                             return -10;
                         }
                     }
                 }
                 cudaError_t ce = cudaEventRecord(slot_event[slot], copy_stream);
                 if (ce != cudaSuccess) {
+                    fence_on_err();
                     return -11;
                 }
                 last_h2d_slot = slot;
@@ -609,6 +617,12 @@ struct ls_engine {
 #ifdef LAYERSTREAM_USE_CUDA
             if (copy_stream != nullptr) {
                 auto * gpu_dst = static_cast<uint8_t *>(ggml_backend_buffer_get_base(expert_slot_buf));
+                bool submitted_h2d = false;
+                auto fence_on_err = [&]() {
+                    if (submitted_h2d) {
+                        (void)cudaStreamSynchronize(copy_stream);
+                    }
+                };
                 if (n_direct > 0) {
                     for (int i = 0; i < n_direct; ++i) {
                         if (cudaMemcpyAsync(
@@ -618,8 +632,10 @@ struct ls_engine {
                                 cudaMemcpyHostToDevice,
                                 copy_stream
                             ) != cudaSuccess) {
+                            fence_on_err();
                             return -22;
                         }
+                        submitted_h2d = true;
                     }
                 } else {
                     if (cudaMemcpyAsync(
@@ -631,6 +647,7 @@ struct ls_engine {
                         ) != cudaSuccess) {
                         return -22;
                     }
+                    submitted_h2d = true;
                 }
                 for (const auto & tb : plan.tensors) {
                     if (tb.alloc_size > tb.nbytes) {
@@ -640,6 +657,7 @@ struct ls_engine {
                                 static_cast<size_t>(tb.alloc_size - tb.nbytes),
                                 copy_stream
                             ) != cudaSuccess) {
+                            fence_on_err();
                             return -22;
                         }
                     }
@@ -675,6 +693,7 @@ struct ls_engine {
 #ifdef LAYERSTREAM_USE_CUDA
         if (copy_stream != nullptr) {
             auto * gpu_dst = static_cast<uint8_t *>(ggml_backend_buffer_get_base(expert_slot_buf));
+            bool submitted_h2d = false;
             for (size_t i = 0; i < reqs.size(); ++i) {
                 if (cudaMemcpyAsync(
                         gpu_dst + reqs[i].dst_offset,
@@ -683,8 +702,12 @@ struct ls_engine {
                         cudaMemcpyHostToDevice,
                         copy_stream
                     ) != cudaSuccess) {
+                    if (submitted_h2d) {
+                        (void)cudaStreamSynchronize(copy_stream);
+                    }
                     return -25;
                 }
+                submitted_h2d = true;
             }
             if (cudaStreamSynchronize(copy_stream) != cudaSuccess) {
                 return -26;
@@ -777,20 +800,10 @@ struct ls_engine {
         work.reqs = &reqs;
         work.packed_reqs = &packed_reqs;
 
-        // If on non-CUDA discrete GPU (Vulkan), invalidate any un-uploaded dense `pin_buf`
-        // slot before the worker overwrites `pin_buf` for this MoE load.
-        if (uses_deferred_eval_h2d()) {
-            std::lock_guard<std::mutex> slk(slot_mu);
-            for (int s = 0; s < 2; ++s) {
-                if (slot_needs_h2d[s]) {
-                    slot_loaded_layer[s] = -1;
-                    slot_needs_h2d[s] = false;
-                }
-            }
-        }
-
         // Submit priority job to the single owner `worker_thread` so `pin_buf`,
         // `LayerIoPool`, and CUDA `copy_stream`/`last_h2d_slot` are never touched concurrently.
+        // Deferred dense-slot invalidation (Vulkan) happens inside `worker_loop` right when
+        // the worker claims this MoE request, after any preceding dense read has published.
         const bool deferred_h2d = uses_deferred_eval_h2d();
         {
             std::unique_lock<std::mutex> wlk(worker_mu);
@@ -909,6 +922,17 @@ struct ls_engine {
             }
 
             if (moe_req != nullptr) {
+                // Any preceding dense prefetch on this worker has already finished and published;
+                // invalidate deferred (un-uploaded) Vulkan dense slots before overwriting `pin_buf`.
+                if (uses_deferred_eval_h2d()) {
+                    std::lock_guard<std::mutex> slk(slot_mu);
+                    for (int s = 0; s < 2; ++s) {
+                        if (slot_needs_h2d[s]) {
+                            slot_loaded_layer[s] = -1;
+                            slot_needs_h2d[s] = false;
+                        }
+                    }
+                }
                 moe_req->rc = execute_moe_work_on_worker(*moe_req);
                 std::unique_lock<std::mutex> lk(worker_mu);
                 moe_io_done = true;
@@ -984,6 +1008,7 @@ struct ls_engine {
             const int other = 1 - slot;
             bool woke = false;
             {
+                std::lock_guard<std::mutex> wlk(worker_mu);
                 std::lock_guard<std::mutex> slk(slot_mu);
                 if (slot_loaded_layer[slot] != layer_idx && slot_needs_h2d[other]) {
                     slot_loaded_layer[other] = -1;
@@ -1038,6 +1063,7 @@ struct ls_engine {
                 }
             }
             {
+                std::lock_guard<std::mutex> wlk(worker_mu);
                 std::lock_guard<std::mutex> slk(slot_mu);
                 slot_needs_h2d[slot] = false;
             }
@@ -1751,18 +1777,20 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     // 3. Decide hybrid partial-residency split R = resident_layers in [0..n_layers].
     uint32_t R = 0;
     uint64_t effective_budget = cfg->vram_budget_auto ? 0 : cfg->vram_budget_bytes;
+    bool probed_safe_cap_valid = false;
     uint64_t probed_safe_cap = 0;
     if (eng->using_gpu) {
         uint64_t free_vram = 0;
         uint64_t total_vram = 0;
         const bool probed = ls_probe_gpu_memory(eng->using_gpu, &free_vram, &total_vram);
-        if (probed && free_vram > 0) {
+        if (probed && total_vram > 0) {
             const uint64_t headroom = eng->is_unified_memory
                 ? std::max<uint64_t>(1024ULL * 1024 * 1024, total_vram / 7)
                 : std::max<uint64_t>(512ULL * 1024 * 1024, total_vram / 10);
             const uint64_t safe_cap = (free_vram > headroom)
                 ? std::min<uint64_t>(free_vram - headroom, (free_vram * 85ULL) / 100ULL)
                 : 0;
+            probed_safe_cap_valid = true;
             probed_safe_cap = safe_cap;
 
             if (cfg->resident_layers < 0) {
@@ -1779,7 +1807,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                         static_cast<unsigned long long>(total_vram / (1024 * 1024)),
                         eng->is_unified_memory ? "true" : "false"
                     );
-                } else if (effective_budget > 0 && safe_cap > 0 && effective_budget > safe_cap) {
+                } else if (effective_budget > safe_cap) {
                     std::fprintf(
                         stderr,
                         "[layerstream-guard] requested --vram-budget-mb (%llu MiB) exceeds safe free GPU memory "
@@ -1829,7 +1857,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
 
     if (cfg->resident_layers >= 0) {
         R = std::min<uint32_t>(static_cast<uint32_t>(cfg->resident_layers), eng->n_layers);
-        if (probed_safe_cap > 0 && R > 0) {
+        if (probed_safe_cap_valid && R > 0) {
             // Clamp explicit resident_layers if it would exceed safe GPU memory capacity.
             uint64_t max_allowed = probed_safe_cap;
             uint64_t total_all_layers = 0;
@@ -2199,6 +2227,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                 ls_engine_free(eng);
                 return nullptr;
             }
+            std::memset(eng->pin_buf, 0, pin_bytes);
             eng->pin_cap = pin_bytes;
             for (int s = 0; s < 2; ++s) {
                 if (cudaEventCreateWithFlags(&eng->slot_event[s], cudaEventDisableTiming) != cudaSuccess) {
@@ -2217,6 +2246,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                 ls_engine_free(eng);
                 return nullptr;
             }
+            std::memset(eng->pin_buf, 0, pin_bytes);
         }
     }
 
@@ -2568,13 +2598,16 @@ static void build_target_distribution(
     if (n_vocab <= 0) {
         return;
     }
-    const float temp = std::max(sp->temperature, 1e-5f);
-    const int32_t top_k = (sp->top_k > 0 && sp->top_k < n_vocab) ? sp->top_k : 0;
+    const float temp = (sp && std::isfinite(sp->temperature) && sp->temperature > 0.0f)
+        ? std::max(sp->temperature, 1e-5f)
+        : 1.0f;
+    const int32_t top_k = (sp && sp->top_k > 0 && sp->top_k < n_vocab) ? sp->top_k : 0;
 
     if (top_k > 0) {
         out.resize(static_cast<size_t>(n_vocab));
         for (int32_t i = 0; i < n_vocab; ++i) {
-            out[static_cast<size_t>(i)] = ProbEntry{i, logits[i]};
+            const float v = std::isfinite(logits[i]) ? logits[i] : -1e30f;
+            out[static_cast<size_t>(i)] = ProbEntry{i, v};
         }
         std::nth_element(
             out.begin(),
@@ -2584,20 +2617,29 @@ static void build_target_distribution(
         );
         out.resize(static_cast<size_t>(top_k));
     } else {
-        float max_l = logits[0];
-        for (int32_t i = 1; i < n_vocab; ++i) {
-            if (logits[i] > max_l) {
-                max_l = logits[i];
-            }
-        }
-        // Tokens more than 18*temp below max have exp(-18) < 1.5e-8 probability.
-        const float cutoff = max_l - 18.0f * temp;
-        out.reserve(256);
+        bool found_finite = false;
+        float max_l = 0.0f;
         for (int32_t i = 0; i < n_vocab; ++i) {
-            if (logits[i] >= cutoff) {
-                out.push_back(ProbEntry{i, logits[i]});
+            if (std::isfinite(logits[i]) && (!found_finite || logits[i] > max_l)) {
+                max_l = logits[i];
+                found_finite = true;
             }
         }
+        if (found_finite) {
+            // Tokens more than 18*temp below max have exp(-18) < 1.5e-8 probability.
+            const float cutoff = max_l - 18.0f * temp;
+            out.reserve(256);
+            for (int32_t i = 0; i < n_vocab; ++i) {
+                if (std::isfinite(logits[i]) && logits[i] >= cutoff) {
+                    out.push_back(ProbEntry{i, logits[i]});
+                }
+            }
+        }
+    }
+
+    if (out.empty()) {
+        out.push_back(ProbEntry{0, 1.0f});
+        return;
     }
 
     std::sort(
@@ -2607,13 +2649,20 @@ static void build_target_distribution(
     );
 
     const float max_l = out[0].val;
+    if (!std::isfinite(max_l)) {
+        out.resize(1);
+        out[0].val = 1.0f;
+        return;
+    }
     double sum = 0.0;
     for (auto & e : out) {
-        const double p = std::exp(static_cast<double>(e.val - max_l) / static_cast<double>(temp));
+        const double p = std::isfinite(e.val)
+            ? std::exp(static_cast<double>(e.val - max_l) / static_cast<double>(temp))
+            : 0.0;
         e.val = static_cast<float>(p);
         sum += p;
     }
-    if (sum <= 0.0) {
+    if (!std::isfinite(sum) || sum <= 0.0) {
         out.resize(1);
         out[0].val = 1.0f;
         return;

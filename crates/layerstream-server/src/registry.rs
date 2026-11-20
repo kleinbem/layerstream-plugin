@@ -90,7 +90,16 @@ impl ModelRegistry {
             }
             None => None,
         };
+        let is_explicit = explicit_id.is_some();
         let id = explicit_id.unwrap_or_else(|| derive_model_id(&canonical));
+        if !is_explicit && self.models.contains_key(&id) {
+            tracing::warn!(
+                model_id = %id,
+                skipped_path = %canonical.display(),
+                "directory discovery skipped model ID already registered explicitly"
+            );
+            return Ok(());
+        }
         self.models.insert(
             id.clone(),
             ModelEntry {

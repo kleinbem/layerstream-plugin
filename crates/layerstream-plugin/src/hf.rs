@@ -42,10 +42,11 @@ impl HfSpec {
             _ => (rest, "main".to_string()),
         };
 
+        let mut revision = revision;
         let (repo_id, filename) = if let Some((repo, file)) = body.split_once(':') {
             (repo.trim_matches('/'), file.trim_start_matches('/'))
         } else {
-            // Support `hf://org/repo/filename.gguf` (and `hf://org/repo/resolve/main/file.gguf`).
+            // Support `hf://org/repo/filename.gguf` (and `hf://org/repo/resolve/<rev>/file.gguf`).
             let mut parts = body.splitn(3, '/');
             let org = parts.next().unwrap_or("");
             let repo = parts.next().unwrap_or("");
@@ -55,10 +56,14 @@ impl HfSpec {
             }
             let repo_slice = &body[..org.len() + 1 + repo.len()];
             let clean_file = if let Some(after_resolve) = tail.strip_prefix("resolve/") {
-                after_resolve
-                    .split_once('/')
-                    .map(|(_, f)| f)
-                    .unwrap_or(tail)
+                if let Some((rev_part, f)) = after_resolve.split_once('/') {
+                    if !rev_part.is_empty() && revision == "main" {
+                        revision = rev_part.to_string();
+                    }
+                    f
+                } else {
+                    tail
+                }
             } else {
                 tail
             };
@@ -68,7 +73,14 @@ impl HfSpec {
         if !repo_id.contains('/') || repo_id.starts_with('/') || repo_id.ends_with('/') {
             bail!("invalid Hugging Face repo id '{repo_id}' in '{uri}' (expected org/repo)");
         }
-        if filename.is_empty() || filename.contains("..") {
+        if filename.is_empty()
+            || filename.contains("..")
+            || filename.contains('\\')
+            || filename.contains(':')
+            || filename
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
             bail!("invalid Hugging Face filename '{filename}' in '{uri}'");
         }
 
@@ -596,22 +608,33 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
         }
     }
 
-    let final_etag = extract_etag(resp.headers()).or(resp_etag);
-    let final_sha256 = extract_expected_sha256(resp.headers()).or(expected_sha256);
-    write_part_meta(
-        &meta_path,
-        &PartMeta {
-            etag: final_etag,
-            sha256: final_sha256.clone(),
-        },
-    );
+    let final_etag = if resuming {
+        extract_etag(resp.headers()).or(resp_etag)
+    } else {
+        extract_etag(resp.headers())
+    };
+    let final_sha256 = if resuming {
+        extract_expected_sha256(resp.headers()).or(expected_sha256)
+    } else {
+        extract_expected_sha256(resp.headers())
+    };
 
     let content_len = resp
         .headers()
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
-    let total_expected = content_len.map(|cl| if resuming { existing_len + cl } else { cl });
+    let range_total = if resuming {
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|cr| cr.rsplit_once('/'))
+            .and_then(|(_, tot)| tot.trim().parse::<u64>().ok())
+    } else {
+        None
+    };
+    let total_expected =
+        range_total.or_else(|| content_len.map(|cl| if resuming { existing_len + cl } else { cl }));
 
     let (mut file, mut hasher): (File, Option<Sha256>) = if resuming {
         tracing::info!(
@@ -632,16 +655,32 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
         (f, h)
     } else {
         existing_len = 0;
-        tracing::info!(
-            uri = %format!("hf://{}:{}", spec.repo_id, spec.filename),
-            dest = %dest.display(),
-            "downloading Hugging Face GGUF"
-        );
+        let _ = fs::remove_file(&meta_path);
         let f =
             File::create(&part_path).with_context(|| format!("create {}", part_path.display()))?;
-        let h = final_sha256.as_ref().map(|_| Sha256::new());
-        (f, h)
+        write_part_meta(
+            &meta_path,
+            &PartMeta {
+                etag: final_etag.clone(),
+                sha256: final_sha256.clone(),
+            },
+        );
+        tracing::info!(
+            uri = %format!("hf://{}:{}", spec.repo_id, spec.filename),
+            total_mib = total_expected.map(|b| b / (1024 * 1024)),
+            "downloading Hugging Face GGUF"
+        );
+        (f, final_sha256.as_ref().map(|_| Sha256::new()))
     };
+    if resuming {
+        write_part_meta(
+            &meta_path,
+            &PartMeta {
+                etag: final_etag,
+                sha256: final_sha256.clone(),
+            },
+        );
+    }
 
     let mut reader = resp.into_body().into_reader();
     let mut buf = vec![0u8; 1024 * 1024];

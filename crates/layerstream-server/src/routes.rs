@@ -138,14 +138,17 @@ impl AppState {
     }
 
     fn register_active_cancel(&self, flag: Arc<AtomicBool>) -> ActiveCancelGuard {
-        if self.shutdown.load(Ordering::SeqCst) {
-            flag.store(true, Ordering::SeqCst);
-        }
         if let Ok(mut guard) = self.active_cancel.lock() {
-            *guard = Some(flag);
+            if self.shutdown.load(Ordering::SeqCst) {
+                flag.store(true, Ordering::SeqCst);
+            }
+            *guard = Some(flag.clone());
+        } else if self.shutdown.load(Ordering::SeqCst) {
+            flag.store(true, Ordering::SeqCst);
         }
         ActiveCancelGuard {
             slot: self.active_cancel.clone(),
+            flag,
         }
     }
 
@@ -268,11 +271,14 @@ impl AppState {
 
 struct ActiveCancelGuard {
     slot: Arc<StdMutex<Option<Arc<AtomicBool>>>>,
+    flag: Arc<AtomicBool>,
 }
 
 impl Drop for ActiveCancelGuard {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.slot.lock() {
+        if let Ok(mut guard) = self.slot.lock()
+            && guard.as_ref().is_some_and(|f| Arc::ptr_eq(f, &self.flag))
+        {
             *guard = None;
         }
     }
@@ -359,6 +365,8 @@ struct ChatCompletionRequest {
     #[serde(default)]
     tools: Option<Vec<Value>>,
     #[serde(default)]
+    tool_choice: Option<Value>,
+    #[serde(default)]
     stream: bool,
     #[serde(default)]
     max_tokens: Option<usize>,
@@ -420,7 +428,12 @@ impl IncomingMessage {
                     if !text.is_empty() {
                         text.push('\n');
                     }
-                    let payload = json!({"name": name, "arguments": args_val});
+                    let mut payload = json!({"name": name, "arguments": args_val});
+                    if let Some(call_id) = call.get("id").and_then(Value::as_str)
+                        && !call_id.is_empty()
+                    {
+                        payload["id"] = json!(call_id);
+                    }
                     text.push_str(&format!("<tool_call>{payload}</tool_call>"));
                 }
             }
@@ -582,6 +595,20 @@ async fn chat_completions(
         Err(resp) => return *resp,
     };
 
+    let allow_tool_calls = match &req.tool_choice {
+        None => true,
+        Some(Value::String(s)) if s == "auto" => true,
+        Some(Value::String(s)) if s == "none" => false,
+        Some(other) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unsupported tool_choice {other}; only \"auto\" and \"none\" are supported"
+                ),
+            );
+        }
+    };
+
     // Acquire queue admission permit SYNCHRONOUSLY before returning 200 OK SSE headers so
     // queue saturation always returns HTTP 503 Service Unavailable (never 200 OK + [DONE]).
     let permit = match state.residency.try_acquire_admission() {
@@ -595,7 +622,8 @@ async fn chat_completions(
         .map(IncomingMessage::to_chat_message)
         .collect();
 
-    if let Some(tools) = &req.tools
+    if allow_tool_calls
+        && let Some(tools) = &req.tools
         && !tools.is_empty()
     {
         let tool_prompt = format_tools_system_prompt(tools);
@@ -644,8 +672,15 @@ async fn chat_completions(
         let state_bg = state.clone();
 
         tokio::spawn(async move {
-            let mut lease = state_bg.residency.lock_with_permit(permit).await;
-            if cancel_worker.load(Ordering::Relaxed) || state_bg.shutdown.load(Ordering::Relaxed) {
+            let mut lease = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                lease = state_bg.residency.lock_with_permit(permit) => lease,
+            };
+            if cancel_worker.load(Ordering::Relaxed)
+                || state_bg.shutdown.load(Ordering::Relaxed)
+                || tx.is_closed()
+            {
                 return;
             }
             let _active_guard = state_bg.register_active_cancel(cancel_worker.clone());
@@ -712,8 +747,17 @@ async fn chat_completions(
                         if cancel_worker.load(Ordering::Relaxed) {
                             return false;
                         }
-                        let deltas = tag_parser.push(piece);
-                        emit_stream_deltas(deltas, &req_id_bg, created, &model_bg, &tx_stream)
+                        if allow_tool_calls {
+                            let deltas = tag_parser.push(piece);
+                            emit_stream_deltas(deltas, &req_id_bg, created, &model_bg, &tx_stream)
+                        } else {
+                            let deltas: Vec<_> = tag_parser
+                                .push(piece)
+                                .into_iter()
+                                .filter(|d| !matches!(d, StreamDelta::ToolCall { .. }))
+                                .collect();
+                            emit_stream_deltas(deltas, &req_id_bg, created, &model_bg, &tx_stream)
+                        }
                     },
                 );
 
@@ -722,11 +766,19 @@ async fn chat_completions(
                         if summary.finish_reason == "cancelled" {
                             false
                         } else {
-                            let flushed = tag_parser.flush();
+                            let flushed: Vec<_> = if allow_tool_calls {
+                                tag_parser.flush()
+                            } else {
+                                tag_parser
+                                    .flush()
+                                    .into_iter()
+                                    .filter(|d| !matches!(d, StreamDelta::ToolCall { .. }))
+                                    .collect()
+                            };
                             let _ = emit_stream_deltas(
                                 flushed, &req_id_bg, created, &model_bg, &tx_stream,
                             );
-                            let finish_reason = if tag_parser.has_tool_calls() {
+                            let finish_reason = if allow_tool_calls && tag_parser.has_tool_calls() {
                                 "tool_calls".to_string()
                             } else {
                                 summary.finish_reason
@@ -821,15 +873,23 @@ async fn chat_completions(
 
     match result {
         Ok(Ok((raw_output, summary))) => {
+            if summary.finish_reason == "cancelled" {
+                return api_error(StatusCode::SERVICE_UNAVAILABLE, "request cancelled");
+            }
             let parsed = parse_assistant_output(&raw_output);
-            let finish_reason = if !parsed.tool_calls.is_empty() {
+            let tool_calls = if allow_tool_calls {
+                parsed.tool_calls
+            } else {
+                Vec::new()
+            };
+            let finish_reason = if !tool_calls.is_empty() {
                 "tool_calls".to_string()
             } else {
                 summary.finish_reason
             };
             let mut msg = json!({
                 "role": "assistant",
-                "content": if parsed.content.is_empty() && !parsed.tool_calls.is_empty() {
+                "content": if parsed.content.is_empty() && !tool_calls.is_empty() {
                     Value::Null
                 } else {
                     json!(parsed.content)
@@ -838,8 +898,8 @@ async fn chat_completions(
             if let Some(rc) = parsed.reasoning_content {
                 msg["reasoning_content"] = json!(rc);
             }
-            if !parsed.tool_calls.is_empty() {
-                msg["tool_calls"] = json!(parsed.tool_calls);
+            if !tool_calls.is_empty() {
+                msg["tool_calls"] = json!(tool_calls);
             }
 
             Json(json!({
@@ -916,8 +976,15 @@ async fn text_completions(
         let prompt = req.prompt;
 
         tokio::spawn(async move {
-            let mut lease = state_bg.residency.lock_with_permit(permit).await;
-            if cancel_worker.load(Ordering::Relaxed) || state_bg.shutdown.load(Ordering::Relaxed) {
+            let mut lease = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                lease = state_bg.residency.lock_with_permit(permit) => lease,
+            };
+            if cancel_worker.load(Ordering::Relaxed)
+                || state_bg.shutdown.load(Ordering::Relaxed)
+                || tx.is_closed()
+            {
                 return;
             }
             let _active_guard = state_bg.register_active_cancel(cancel_worker.clone());
@@ -1048,23 +1115,28 @@ async fn text_completions(
     .await;
 
     match result {
-        Ok(Ok((text, summary))) => Json(json!({
-            "id": req_id,
-            "object": "text_completion",
-            "created": created,
-            "model": model_id,
-            "choices": [{
-                "text": text,
-                "index": 0,
-                "finish_reason": summary.finish_reason,
-            }],
-            "usage": {
-                "prompt_tokens": summary.prompt_tokens,
-                "completion_tokens": summary.completion_tokens,
-                "total_tokens": summary.prompt_tokens + summary.completion_tokens,
+        Ok(Ok((text, summary))) => {
+            if summary.finish_reason == "cancelled" {
+                return api_error(StatusCode::SERVICE_UNAVAILABLE, "request cancelled");
             }
-        }))
-        .into_response(),
+            Json(json!({
+                "id": req_id,
+                "object": "text_completion",
+                "created": created,
+                "model": model_id,
+                "choices": [{
+                    "text": text,
+                    "index": 0,
+                    "finish_reason": summary.finish_reason,
+                }],
+                "usage": {
+                    "prompt_tokens": summary.prompt_tokens,
+                    "completion_tokens": summary.completion_tokens,
+                    "total_tokens": summary.prompt_tokens + summary.completion_tokens,
+                }
+            }))
+            .into_response()
+        }
         Ok(Err(err)) if err.downcast_ref::<PromptTooLongError>().is_some() => {
             api_error(StatusCode::BAD_REQUEST, format!("{err:#}"))
         }

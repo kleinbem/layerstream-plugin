@@ -9,7 +9,7 @@
 //! - Uses `O_DIRECT` on Linux, `F_NOCACHE` on macOS, and `FILE_FLAG_NO_BUFFERING` on
 //!   Windows to avoid polluting the host OS page cache.
 
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
@@ -56,7 +56,7 @@ impl AlignedBuf {
         ) as usize;
         let layout = Layout::from_size_align(len, DIRECT_IO_ALIGN as usize)
             .context("invalid AlignedBuf layout")?;
-        let raw = unsafe { alloc(layout) };
+        let raw = unsafe { alloc_zeroed(layout) };
         let Some(ptr) = NonNull::new(raw) else {
             bail!("failed to allocate {len}-byte 4K-aligned IO buffer");
         };
@@ -666,6 +666,34 @@ impl LayerIoPool {
     ) -> Result<()> {
         if requests.is_empty() {
             return Ok(());
+        }
+
+        // Validate all destination ranges in the full request are in-bounds and
+        // mutually disjoint before cache hits or reads write to `dst`.
+        let mut req_ranges: Vec<(usize, usize)> = Vec::with_capacity(requests.len());
+        for &(_, _, dst_off, len, _) in requests {
+            let end = dst_off
+                .checked_add(len)
+                .context("slice dst_offset overflow")?;
+            if end > dst.len() {
+                bail!(
+                    "slice dst range [{dst_off}..{end}) exceeds dst_cap {}",
+                    dst.len()
+                );
+            }
+            req_ranges.push((dst_off, end));
+        }
+        req_ranges.sort_unstable_by_key(|r| r.0);
+        for w in req_ranges.windows(2) {
+            if w[0].1 > w[1].0 {
+                bail!(
+                    "overlapping slice destination ranges [{}..{}) and [{}..{})",
+                    w[0].0,
+                    w[0].1,
+                    w[1].0,
+                    w[1].1
+                );
+            }
         }
 
         // 1. Check bounded hot-expert RAM LRU cache first.

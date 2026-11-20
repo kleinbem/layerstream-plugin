@@ -139,7 +139,7 @@ impl<E: Send + 'static> Residency<E> {
     /// Drops the evicted engine on a blocking worker thread when inside a Tokio runtime so
     /// `worker_thread.join()` and multi-GiB GPU frees never stall async I/O workers.
     pub fn evict_idle(&self, now: Instant) -> bool {
-        let Ok(mut guard) = self.slot.try_lock() else {
+        let Ok(mut guard) = self.slot.clone().try_lock_owned() else {
             return false;
         };
         if guard.is_none() || self.activity.in_flight.load(Ordering::SeqCst) != 0 {
@@ -152,11 +152,14 @@ impl<E: Send + 'static> Residency<E> {
             return false;
         }
         if let Some(evicted) = guard.take() {
-            drop(guard);
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn_blocking(move || drop(evicted));
+                handle.spawn_blocking(move || {
+                    drop(evicted);
+                    drop(guard);
+                });
             } else {
                 drop(evicted);
+                drop(guard);
             }
             return true;
         }

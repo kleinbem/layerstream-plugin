@@ -30,7 +30,13 @@
           f (
             import nixpkgs {
               inherit system;
-              config.allowUnfree = true;
+              config =
+                {
+                  allowUnfree = true;
+                }
+                // lib.optionalAttrs (system == "aarch64-linux") {
+                  cudaCapabilities = [ "8.7" ];
+                };
             }
           )
         );
@@ -63,7 +69,7 @@
               vulkan-loader
               shaderc
             ];
-          cudaPkgs = pkgs.cudaPackages_12_6;
+          cudaPkgs = pkgs.cudaPackages;
           cudaMerged =
             if isLinux then
               pkgs.symlinkJoin {
@@ -74,7 +80,7 @@
                   (lib.getLib cudaPkgs.cuda_cudart)
                   (lib.getDev cudaPkgs.libcublas)
                   (lib.getLib cudaPkgs.libcublas)
-                  cudaPkgs.cuda_cccl
+                  cudaPkgs.cccl
                 ];
               }
             else
@@ -95,7 +101,7 @@
               cudaPkgs.cuda_nvcc
               cudaPkgs.cuda_cudart
               cudaPkgs.libcublas
-              cudaPkgs.cuda_cccl
+              cudaPkgs.cccl
             ];
 
             LLAMA_CPP_DIR = "${llama-cpp-src}";

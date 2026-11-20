@@ -100,9 +100,9 @@ Full normalized dataset (**130 records** across 4 engines): [benchmarks.json](..
 
 ## 3. Hardware & Upstream Findings Uncovered During Testing
 
-1. **Jetson L4T R39 + `cuBLAS 12.6.4.1` `cublasSgemm` Silent No-Op on MoE Router GEMMs:**
-   - On `Qwen3-30B-A3B`, `cublasSgemm` (`F32`) silently returned `CUBLAS_STATUS_SUCCESS` without writing `ffn_moe_logits-0` (`[2048, 128] × [2048, N]`), leaving stale scratch memory in router logits and corrupting output (`", . . . ."`).
-   - **Workaround in `stream_engine.cpp`:** On `#if defined(LAYERSTREAM_USE_CUDA) && defined(__aarch64__)`, `layerstream-plugin` defaults `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` (unless explicitly overridden), routing through `cublasGemmEx` with full `F32` dynamic range and restoring bit-exact layer-0 router top-K selection and coherent `<think>` reasoning.
+1. **Jetson L4T R39 (CUDA 13 driver) vs. Mismatched `cuBLAS 12.6` Toolkit:**
+   - During early testing with `cudaPackages_12_6` against `orin-nano`'s JetPack 7 / L4T R39 (CUDA 13) host driver, `cublasSgemm` (`F32`) silently returned `CUBLAS_STATUS_SUCCESS` without writing `ffn_moe_logits-0` (`[2048, 128] × [2048, N]`) on `Qwen3-30B-A3B`.
+   - **Root fix in `flake.nix` (no runtime workaround needed):** Switching `flake.nix` from `pkgs.cudaPackages_12_6` to nixpkgs' default `pkgs.cudaPackages` (`CUDA 13.4` / `libcublas 13.8.2.12`, matching the JetPack 7 driver) resolved the `cublasSgemm` fault natively with standard `F32` router GEMMs, allowing us to remove our temporary `bf16` env workaround completely.
 2. **Jetson `orin-nano` `nvme1` PCIe MSI-X IRQ Loss Under Random `O_DIRECT` Bursts:**
    - Sequential full-layer `O_DIRECT` reads (`156–275 MiB`) sustain `2.8–2.96 GiB/s` cleanly with zero timeouts. Heavy bursts of tiny random `O_DIRECT` slices (e.g., 128-expert `Qwen3-30B-A3B`) occasionally hit 30-second Tegra NVMe completion-polling timeouts in `dmesg`. Lowering our sequential full-layer crossover from `>=75%` to `>25%` of active experts cut `Qwen3-30B-A3B` TTFT **4.3×** (`59.2 s → 13.8 s`) and total time **6.4×** (`560 s → 88 s`).
 3. **Key Negative & Trade-Off Ablations (Rounds 2–6):**

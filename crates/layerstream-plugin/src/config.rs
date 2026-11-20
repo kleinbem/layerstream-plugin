@@ -136,7 +136,13 @@ impl EngineArgs {
         defer_uncached_hf: bool,
     ) -> Result<(ServerConfig, Option<DeferredPullPlan>)> {
         let use_gpu = !self.no_gpu;
-        if use_gpu && StreamEngine::probe_gpu_memory(true).is_none() {
+        let has_sources = self.has_model_sources();
+        // In Mesh-LLM plugin mode with zero configured model sources, skip GPU probing so
+        // `mesh_adapter` can complete the handshake and return `PluginError::startup_disabled`.
+        if (!defer_uncached_hf || has_sources)
+            && use_gpu
+            && StreamEngine::probe_gpu_memory(true).is_none()
+        {
             bail!(
                 "no usable GPU device found (CUDA/Vulkan/Metal); verify GPU drivers \
                  (on NixOS CUDA ensure /run/opengl-driver/lib is reachable) or rebuild with \
@@ -178,25 +184,17 @@ impl EngineArgs {
             };
 
         let needs_defer = defer_uncached_hf && self.has_uncached_hf();
+        let plan = DeferredPullPlan {
+            models: self.models,
+            models_dir: self.models_dir,
+            draft_model: self.draft_model,
+            cache_root,
+            use_gpu,
+            allow_slow: self.allow_slow,
+        };
         let (registry, deferred) = if needs_defer {
-            let plan = DeferredPullPlan {
-                models: self.models,
-                models_dir: self.models_dir,
-                draft_model: self.draft_model,
-                cache_root,
-                use_gpu,
-                allow_slow: self.allow_slow,
-            };
             (ModelRegistry::default(), Some(plan))
         } else {
-            let plan = DeferredPullPlan {
-                models: self.models,
-                models_dir: self.models_dir,
-                draft_model: self.draft_model,
-                cache_root,
-                use_gpu,
-                allow_slow: self.allow_slow,
-            };
             (plan.execute()?, None)
         };
 

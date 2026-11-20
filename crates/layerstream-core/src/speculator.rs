@@ -127,6 +127,13 @@ impl DraftModelProposer {
             }
         }
 
+        let draft_vocab = self.draft.vocab_size();
+        if draft_vocab > 0 && history.iter().any(|&t| t < 0 || t >= draft_vocab) {
+            // Target history contains a token ID outside the smaller padded draft vocabulary;
+            // fall back cleanly to target-only generation without failing the request.
+            return Ok(Vec::new());
+        }
+
         let draft_n_ctx = self.draft.n_ctx() as usize;
         if draft_n_ctx > 0 && history.len() >= draft_n_ctx {
             return Ok(Vec::new());
@@ -137,8 +144,16 @@ impl DraftModelProposer {
         if self.synced_len < history.len() {
             let delta = &history[self.synced_len..];
             for chunk in delta.chunks(self.draft_batch) {
-                next_draft = self.draft.eval_greedy(chunk, self.draft_pos)?;
-                self.draft_pos += chunk.len() as i32;
+                match self.draft.eval_greedy(chunk, self.draft_pos) {
+                    Ok(tok) => {
+                        next_draft = tok;
+                        self.draft_pos += chunk.len() as i32;
+                    }
+                    Err(e) => {
+                        self.reset();
+                        return Err(e);
+                    }
+                }
             }
             self.synced_len = history.len();
         } else {
@@ -163,8 +178,16 @@ impl DraftModelProposer {
             if draft_n_ctx > 0 && (self.draft_pos as usize) >= draft_n_ctx {
                 break;
             }
-            next_draft = self.draft.eval_greedy(&[next_draft], self.draft_pos)?;
-            self.draft_pos += 1;
+            match self.draft.eval_greedy(&[next_draft], self.draft_pos) {
+                Ok(tok) => {
+                    next_draft = tok;
+                    self.draft_pos += 1;
+                }
+                Err(e) => {
+                    self.reset();
+                    return Err(e);
+                }
+            }
         }
 
         // Trim speculative draft tokens back out so next call syncs strictly from committed history.

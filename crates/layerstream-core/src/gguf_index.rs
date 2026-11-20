@@ -487,6 +487,20 @@ fn parse_single_header<R: Read + Seek>(
 }
 
 fn read_kv_value<R: Read + Seek>(r: &mut R, val_type: u32, file_len: u64) -> Result<KvValue> {
+    read_kv_value_depth(r, val_type, file_len, 0)
+}
+
+const MAX_GGUF_ARRAY_DEPTH: u32 = 16;
+
+fn read_kv_value_depth<R: Read + Seek>(
+    r: &mut R,
+    val_type: u32,
+    file_len: u64,
+    depth: u32,
+) -> Result<KvValue> {
+    if depth > MAX_GGUF_ARRAY_DEPTH {
+        bail!("GGUF metadata array nesting depth exceeds limit {MAX_GGUF_ARRAY_DEPTH}");
+    }
     match val_type {
         0 => {
             skip_bytes(r, 1, file_len)?;
@@ -529,7 +543,7 @@ fn read_kv_value<R: Read + Seek>(r: &mut R, val_type: u32, file_len: u64) -> Res
                 skip_bytes(r, bytes, file_len)?;
             } else {
                 for _ in 0..len {
-                    let _ = read_kv_value(r, elem_type, file_len)?;
+                    let _ = read_kv_value_depth(r, elem_type, file_len, depth + 1)?;
                 }
             }
             Ok(KvValue::Other)

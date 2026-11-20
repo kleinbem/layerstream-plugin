@@ -147,6 +147,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
             artifacts/*.tar.gz \
             artifacts/*.tar.gz.sha256 \
             artifacts/*.zip \
