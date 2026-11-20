@@ -49,6 +49,17 @@ fn is_shared_lib(path: &Path) -> bool {
         || name.ends_with(".dll")
 }
 
+fn resolve_profile_dir(out_path: &Path) -> Option<&Path> {
+    // Handles both legacy `target/<profile>/build/<pkg>-<hash>/out` and
+    // newer Cargo `target/<profile>/build/<pkg>/<hash>/out` layouts.
+    for anc in out_path.ancestors() {
+        if anc.file_name().and_then(|n| n.to_str()) == Some("build") {
+            return anc.parent();
+        }
+    }
+    out_path.ancestors().nth(3)
+}
+
 fn stage_shared_libs(shared_libs: &[PathBuf], stage_dir: &Path) {
     let _ = std::fs::create_dir_all(stage_dir);
     for src in shared_libs {
@@ -236,7 +247,7 @@ fn main() {
         // right next to Cargo's output binaries so `$ORIGIN` / `@loader_path` finds them.
         if let Ok(out_dir) = env::var("OUT_DIR") {
             let out_path = PathBuf::from(out_dir);
-            if let Some(profile_dir) = out_path.ancestors().nth(3) {
+            if let Some(profile_dir) = resolve_profile_dir(&out_path) {
                 stage_shared_libs(&shared_libs, profile_dir);
                 stage_shared_libs(&shared_libs, &profile_dir.join("deps"));
                 stage_shared_libs(&shared_libs, &profile_dir.join("examples"));

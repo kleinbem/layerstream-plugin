@@ -120,4 +120,4 @@ cargo build --release -p layerstream-plugin --features cuda
 ## Documentation & Reproducibility
 
 * [docs/DETAILS.md](docs/DETAILS.md) — Zero-patch architecture, full `orin-nano` 4-engine benchmark tables, tuning ablations, honest limitations, Jetson platform findings, and future opportunities (including `mesh-llm` and Next-Concept Modeling).
-* [benchmarks/hf-dataset/](benchmarks/hf-dataset/) — Ready-to-publish Hugging Face dataset (**130 normalized runs** in `train-00000-of-00001.parquet`, `benchmarks.json`, `benchmarks.jsonl`, plus Dataset Card `README.md`).
+* [Hugging Face Benchmark Dataset](https://huggingface.co/datasets/kleinbem/layerstream-orin-nano-benchmarks) ([local bundle](benchmarks/hf-dataset/)) — Published **130-run** normalized dataset (`train-00000-of-00001.parquet`, `benchmarks.json`, `benchmarks.jsonl`, plus Dataset Card).
