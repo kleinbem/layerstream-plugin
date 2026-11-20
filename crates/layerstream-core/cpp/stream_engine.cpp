@@ -720,25 +720,61 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                 return nullptr;
             }
         } else {
-            uint8_t * staging = alloc_aligned_4k(eng->resident_bytes);
+            // Stream resident tensors in bounded chunks (<= max single tensor) so loading
+            // multi-GiB hybrid resident layers never doubles peak host RAM or triggers swap!
+            uint64_t max_res_tensor = 4096;
+            for (const auto & tb : eng->resident_plan.tensors) {
+                max_res_tensor = std::max(max_res_tensor, tb.nbytes);
+            }
+            const size_t chunk_cap = align_up(
+                std::max<size_t>(static_cast<size_t>(max_res_tensor), 64ULL * 1024 * 1024),
+                4096
+            );
+            uint8_t * staging = alloc_aligned_4k(chunk_cap);
             if (!staging) {
                 set_error(err_buf, err_cap, "failed to allocate resident staging buffer");
                 ls_engine_free(eng);
                 return nullptr;
             }
-            int rc = eng->load_tensors_cb(
-                eng->io_user_data,
-                -1,
-                eng->resident_plan.name_ptrs.data(),
-                eng->resident_plan.offsets.data(),
-                eng->resident_plan.sizes.data(),
-                eng->resident_plan.tensors.size(),
-                staging,
-                eng->resident_bytes
-            );
-            if (rc == 0) {
-                for (const auto & tb : eng->resident_plan.tensors) {
-                    ggml_backend_tensor_set(tb.tensor, staging + tb.offset, 0, tb.nbytes);
+
+            int rc = 0;
+            size_t idx = 0;
+            const auto & all_res = eng->resident_plan.tensors;
+            while (idx < all_res.size() && rc == 0) {
+                std::vector<const char *> c_names;
+                std::vector<uint64_t> c_offs;
+                std::vector<uint64_t> c_sizes;
+                std::vector<size_t> c_indices;
+                size_t used = 0;
+
+                while (idx < all_res.size()) {
+                    const size_t sz = static_cast<size_t>(all_res[idx].nbytes);
+                    if (!c_indices.empty() && used + sz > chunk_cap) {
+                        break;
+                    }
+                    c_names.push_back(all_res[idx].name.c_str());
+                    c_offs.push_back(static_cast<uint64_t>(used));
+                    c_sizes.push_back(all_res[idx].nbytes);
+                    c_indices.push_back(idx);
+                    used += sz;
+                    ++idx;
+                }
+
+                rc = eng->load_tensors_cb(
+                    eng->io_user_data,
+                    -1,
+                    c_names.data(),
+                    c_offs.data(),
+                    c_sizes.data(),
+                    c_names.size(),
+                    staging,
+                    chunk_cap
+                );
+                if (rc == 0) {
+                    for (size_t k = 0; k < c_indices.size(); ++k) {
+                        const auto & tb = all_res[c_indices[k]];
+                        ggml_backend_tensor_set(tb.tensor, staging + c_offs[k], 0, tb.nbytes);
+                    }
                 }
             }
             free_aligned_4k(staging);
