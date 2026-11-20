@@ -1,10 +1,16 @@
-//! Coalesced 4K-aligned O_DIRECT pread reader for GGUF layer streaming.
+//! High-throughput coalesced 4K-aligned O_DIRECT pread reader for GGUF layer streaming.
 //!
-//! Keeps host Linux page cache clean when sweeping models larger than RAM, and
-//! falls back automatically to buffered pread on filesystems (e.g. tmpfs) where
-//! O_DIRECT is unsupported.
+//! Optimizations:
+//! - Caches planned `CoalescedSpan`s per `layer_idx` after sweep 1 (zero CStr/HashMap
+//!   overhead in the hot decode loop).
+//! - Splits large layer spans (>= 16 MiB) across `io_threads` (default 4) parallel
+//!   4K-aligned `pread` calls using `std::thread::scope`, driving NVMe queue depth > 1
+//!   and parallelizing dm-crypt/LUKS decryption across CPU cores.
+//! - Uses `O_DIRECT` on Linux, `F_NOCACHE` on macOS, and `FILE_FLAG_NO_BUFFERING` on
+//!   Windows to avoid polluting the host OS page cache.
 
 use std::alloc::{Layout, alloc, dealloc};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -18,7 +24,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::gguf_index::{CoalescedSpan, DIRECT_IO_ALIGN, GgufIndex, align_up};
 
-/// Page-aligned (4096-byte) owned byte buffer suitable for Linux `O_DIRECT`.
+const PARALLEL_READ_MIN_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_IO_THREADS: usize = 4;
+
+/// Page-aligned (4096-byte) owned byte buffer suitable for Linux `O_DIRECT` / Windows unbuffered I/O.
 pub struct AlignedBuf {
     ptr: NonNull<u8>,
     len: usize,
@@ -79,7 +88,9 @@ pub struct LayerIoPool {
     index: GgufIndex,
     shards: Vec<ShardHandle>,
     direct_io_active: bool,
+    io_threads: usize,
     scratch: Mutex<AlignedBuf>,
+    span_cache: Mutex<HashMap<i32, Vec<CoalescedSpan>>>,
     bytes_read: AtomicU64,
     span_reads: AtomicU64,
 }
@@ -103,11 +114,17 @@ impl LayerIoPool {
             shards.push(ShardHandle { direct, buffered });
         }
 
+        let io_threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, DEFAULT_IO_THREADS))
+            .unwrap_or(DEFAULT_IO_THREADS);
+
         Ok(Self {
             index,
             shards,
             direct_io_active: all_direct,
+            io_threads,
             scratch: Mutex::new(AlignedBuf::new(4 * 1024 * 1024)?),
+            span_cache: Mutex::new(HashMap::new()),
             bytes_read: AtomicU64::new(0),
             span_reads: AtomicU64::new(0),
         })
@@ -125,23 +142,63 @@ impl LayerIoPool {
         }
     }
 
-    /// Reads all requested `(name, dst_offset, len)` tensors into `dst` using
-    /// coalesced 4K-aligned O_DIRECT pread calls.
+    /// Loads a cached layer plan if already computed, avoiding CStr/HashMap work on sweeps 2..N.
+    pub fn load_cached_layer_into(&self, layer_idx: i32, dst: &mut [u8]) -> Result<bool> {
+        if layer_idx < 0 {
+            return Ok(false);
+        }
+        let cached = {
+            let guard = self
+                .span_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("span_cache mutex poisoned"))?;
+            guard.get(&layer_idx).cloned()
+        };
+        let Some(spans) = cached else {
+            return Ok(false);
+        };
+
+        let mut scratch = self
+            .scratch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("IO scratch mutex poisoned"))?;
+        for span in &spans {
+            self.read_span_into(span, &mut scratch, dst)?;
+        }
+        Ok(true)
+    }
+
+    /// Plans, caches (for `layer_idx >= 0`), and loads all requested `(name, dst_offset, len)` tensors.
+    pub fn load_layer_tensors_into(
+        &self,
+        layer_idx: i32,
+        requests: &[(&str, usize, usize)],
+        dst: &mut [u8],
+    ) -> Result<()> {
+        let spans = self.index.plan_coalesced_spans(requests)?;
+        if layer_idx >= 0
+            && let Ok(mut cache) = self.span_cache.lock()
+        {
+            cache.insert(layer_idx, spans.clone());
+        }
+
+        let mut scratch = self
+            .scratch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("IO scratch mutex poisoned"))?;
+        for span in &spans {
+            self.read_span_into(span, &mut scratch, dst)?;
+        }
+        Ok(())
+    }
+
+    /// Reads all requested `(name, dst_offset, len)` tensors into `dst` without caching.
     pub fn load_tensors_into(
         &self,
         requests: &[(&str, usize, usize)],
         dst: &mut [u8],
     ) -> Result<()> {
-        let spans = self.index.plan_coalesced_spans(requests)?;
-        let mut scratch = self
-            .scratch
-            .lock()
-            .map_err(|_| anyhow::anyhow!("IO scratch mutex poisoned"))?;
-
-        for span in &spans {
-            self.read_span_into(span, &mut scratch, dst)?;
-        }
-        Ok(())
+        self.load_layer_tensors_into(-1, requests, dst)
     }
 
     fn read_span_into(
@@ -152,19 +209,16 @@ impl LayerIoPool {
     ) -> Result<()> {
         scratch.ensure_capacity(span.aligned_len)?;
         let handle = &self.shards[span.shard_idx];
-
         let read_buf = scratch.as_mut_slice(span.aligned_len);
-        let mut used_direct = false;
 
+        let mut used_direct = false;
         if let Some(direct_file) = &handle.direct {
-            match pread_exact_or_eof(direct_file, read_buf, span.aligned_offset) {
-                Ok(n) if n >= span.valid_len => {
-                    used_direct = true;
-                }
-                _ => {
-                    // Fallback cleanly to buffered pread if a tail/FS rejects O_DIRECT.
-                }
-            }
+            used_direct = self.read_parallel_or_single(
+                direct_file,
+                read_buf,
+                span.aligned_offset,
+                span.valid_len,
+            );
         }
 
         if !used_direct {
@@ -183,6 +237,44 @@ impl LayerIoPool {
         }
 
         Ok(())
+    }
+
+    /// Drives NVMe queue depth and parallel dm-crypt decryption by splitting large
+    /// 4K-aligned direct-IO spans across `io_threads` concurrent `pread` calls.
+    fn read_parallel_or_single(
+        &self,
+        file: &File,
+        buf: &mut [u8],
+        base_offset: u64,
+        valid_len: usize,
+    ) -> bool {
+        if self.io_threads <= 1 || valid_len < PARALLEL_READ_MIN_BYTES {
+            return matches!(pread_exact_or_eof(file, buf, base_offset), Ok(n) if n >= valid_len);
+        }
+
+        let chunk_raw = buf.len().div_ceil(self.io_threads);
+        let chunk_size = align_up(chunk_raw as u64, DIRECT_IO_ALIGN) as usize;
+        if chunk_size == 0 || chunk_size >= buf.len() {
+            return matches!(pread_exact_or_eof(file, buf, base_offset), Ok(n) if n >= valid_len);
+        }
+
+        let ok = std::sync::atomic::AtomicBool::new(true);
+        std::thread::scope(|s| {
+            for (idx, chunk) in buf.chunks_mut(chunk_size).enumerate() {
+                let rel_off = idx * chunk_size;
+                let file_off = base_offset + rel_off as u64;
+                let expected = valid_len.saturating_sub(rel_off).min(chunk.len());
+                if expected == 0 {
+                    continue;
+                }
+                let ok_ref = &ok;
+                s.spawn(move || match pread_exact_or_eof(file, chunk, file_off) {
+                    Ok(n) if n >= expected => {}
+                    _ => ok_ref.store(false, Ordering::Relaxed),
+                });
+            }
+        });
+        ok.load(Ordering::Relaxed)
     }
 }
 

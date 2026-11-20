@@ -14,6 +14,14 @@ use crate::gguf_index::GgufIndex;
 use crate::io_reader::{IoStats, LayerIoPool};
 use crate::speculator::{DraftModelProposer, NgramProposer, SpeculationStats};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KvCacheType {
+    #[default]
+    F16 = 0,
+    Q8_0 = 1,
+    Q4_0 = 2,
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub model_path: PathBuf,
@@ -22,6 +30,7 @@ pub struct EngineConfig {
     pub n_threads: u32,
     pub resident_layers: Option<u32>,
     pub vram_budget_bytes: u64,
+    pub kv_cache_type: KvCacheType,
     pub use_gpu: bool,
     pub prefer_direct_io: bool,
     pub full_resident_reference: bool,
@@ -38,6 +47,7 @@ impl EngineConfig {
                 .unwrap_or(4),
             resident_layers: None,
             vram_budget_bytes: 0,
+            kv_cache_type: KvCacheType::F16,
             use_gpu: true,
             prefer_direct_io: true,
             full_resident_reference: false,
@@ -91,6 +101,7 @@ pub struct StreamEngine {
     raw: NonNull<LsEngine>,
     io_pool: Option<Box<LayerIoPool>>,
     n_batch: usize,
+    cached_kv_tokens: Vec<i32>,
 }
 
 unsafe impl Send for StreamEngine {}
@@ -119,6 +130,7 @@ impl StreamEngine {
             n_threads: cfg.n_threads,
             resident_layers: cfg.resident_layers.map_or(-1, |v| v as i32),
             vram_budget_bytes: cfg.vram_budget_bytes,
+            kv_cache_type: cfg.kv_cache_type as i32,
             use_gpu: cfg.use_gpu,
             full_resident_reference: cfg.full_resident_reference,
             io_user_data: io_ptr,
@@ -144,6 +156,7 @@ impl StreamEngine {
             raw,
             io_pool,
             n_batch: cfg.n_batch.max(1) as usize,
+            cached_kv_tokens: Vec::new(),
         })
     }
 
@@ -291,11 +304,16 @@ impl StreamEngine {
     }
 
     pub fn kv_clear(&mut self) {
+        self.cached_kv_tokens.clear();
         unsafe { ls_engine_kv_clear(self.raw.as_ptr()) };
     }
 
     pub fn kv_trim(&mut self, pos_min: i32) -> bool {
-        unsafe { ls_engine_kv_trim(self.raw.as_ptr(), pos_min) }
+        let ok = unsafe { ls_engine_kv_trim(self.raw.as_ptr(), pos_min) };
+        if ok && pos_min >= 0 {
+            self.cached_kv_tokens.truncate(pos_min as usize);
+        }
+        ok
     }
 
     pub fn eval_greedy(&mut self, tokens: &[i32], pos_start: i32) -> Result<i32> {
@@ -403,22 +421,42 @@ impl StreamEngine {
     where
         F: FnMut(i32, &str) -> bool,
     {
-        self.kv_clear();
-        if let Some(dp) = draft_proposer.as_deref_mut() {
-            dp.reset();
-        }
-
         let prompt_tokens = self.tokenize(prompt, true, true)?;
         if prompt_tokens.is_empty() {
             bail!("prompt tokenized to 0 tokens");
         }
 
+        // Reuse longest matching KV prefix on multi-turn chat continuations
+        // (avoids re-prefilling unchanged system prompts & prior turns off NVMe!).
+        let can_reuse_kv = self.stats().can_speculate;
+        let mut common_prefix = 0usize;
+        if can_reuse_kv && !self.cached_kv_tokens.is_empty() {
+            let max_shared = self
+                .cached_kv_tokens
+                .len()
+                .min(prompt_tokens.len().saturating_sub(1));
+            while common_prefix < max_shared
+                && self.cached_kv_tokens[common_prefix] == prompt_tokens[common_prefix]
+            {
+                common_prefix += 1;
+            }
+        }
+        if common_prefix > 0 && self.kv_trim(common_prefix as i32) {
+            tracing::debug!(common_prefix, "reusing cached KV prefix across turn");
+        } else {
+            self.kv_clear();
+            common_prefix = 0;
+        }
+        if let Some(dp) = draft_proposer.as_deref_mut() {
+            dp.reset();
+        }
+
         let mut history = prompt_tokens.clone();
-        let mut pos = 0i32;
+        let mut pos = common_prefix as i32;
         let mut next_tok = 0i32;
         let mut spec_stats = SpeculationStats::default();
 
-        for chunk in prompt_tokens.chunks(self.n_batch) {
+        for chunk in prompt_tokens[common_prefix..].chunks(self.n_batch) {
             next_tok = if opts.sample.temperature <= 0.0 {
                 self.eval_greedy(chunk, pos)?
             } else {
@@ -427,15 +465,14 @@ impl StreamEngine {
             spec_stats.sweeps += 1;
             pos += chunk.len() as i32;
         }
+        self.cached_kv_tokens = prompt_tokens.clone();
 
         let can_speculate = self.stats().can_speculate
             && opts.sample.temperature <= 0.0
             && (opts.enable_ngram_speculation || draft_proposer.is_some());
 
-        let ngram = NgramProposer {
-            max_draft: opts.max_draft_tokens,
-            ..Default::default()
-        };
+        let mut adaptive_draft_k = opts.max_draft_tokens.max(1);
+        let max_adaptive_k = (opts.max_draft_tokens * 2).clamp(4, 12);
 
         let mut completion_tokens = 0usize;
         let mut finish_reason = "length".to_string();
@@ -454,13 +491,25 @@ impl StreamEngine {
                 let mut probe_history = history.clone();
                 probe_history.push(next_tok);
 
-                let draft = if let Some(dp) = draft_proposer.as_deref_mut() {
-                    dp.propose(&probe_history, remaining_after_current)?
-                } else if opts.enable_ngram_speculation {
+                // Cascade: try zero-VRAM n-gram first (0 ms) on strong hits (>= 2 tokens),
+                // then fall back to resident `--draft-model` with adaptive draft depth.
+                let ngram = NgramProposer {
+                    max_draft: adaptive_draft_k,
+                    ..Default::default()
+                };
+                let mut draft = if opts.enable_ngram_speculation {
                     ngram.propose(&probe_history, remaining_after_current)
                 } else {
                     Vec::new()
                 };
+                if draft.len() < 2
+                    && let Some(dp) = draft_proposer.as_deref_mut()
+                {
+                    draft = dp.propose(
+                        &probe_history,
+                        remaining_after_current.min(adaptive_draft_k),
+                    )?;
+                }
 
                 if !draft.is_empty() {
                     // Emit `next_tok` first (already verified by previous sweep).
@@ -519,6 +568,14 @@ impl StreamEngine {
                     }
 
                     spec_stats.accepted_tokens += accepted;
+                    self.cached_kv_tokens = history.clone();
+
+                    // Adapt draft depth upward on full acceptance streaks, downward on misses.
+                    if accepted == draft.len() {
+                        adaptive_draft_k = (adaptive_draft_k + 2).min(max_adaptive_k);
+                    } else if accepted == 0 {
+                        adaptive_draft_k = (adaptive_draft_k.saturating_sub(1)).max(3);
+                    }
 
                     if let Some(corrected) = diverged_next {
                         // Trim rejected draft tail from KV cache.
@@ -559,6 +616,7 @@ impl StreamEngine {
             } else {
                 self.eval_sample(&[next_tok], pos, &step_sample)?
             };
+            self.cached_kv_tokens = history.clone();
             spec_stats.sweeps += 1;
             pos += 1;
         }
@@ -584,7 +642,7 @@ impl Drop for StreamEngine {
 
 unsafe extern "C" fn rust_load_tensors_cb(
     user_data: *mut c_void,
-    _layer_idx: i32,
+    layer_idx: i32,
     tensor_names: *const *const c_char,
     tensor_offsets: *const u64,
     tensor_sizes: *const u64,
@@ -597,6 +655,16 @@ unsafe extern "C" fn rust_load_tensors_cb(
     }
     let pool = unsafe { &*(user_data as *const LayerIoPool) };
     let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, dst_cap) };
+
+    // Fast path: reuse cached 4K-aligned CoalescedSpan plan on sweeps 2..N.
+    match pool.load_cached_layer_into(layer_idx, dst) {
+        Ok(true) => return 0,
+        Ok(false) => {}
+        Err(err) => {
+            tracing::error!("layerstream cached IO callback failed: {err:#}");
+            return -5;
+        }
+    }
 
     let mut requests = Vec::with_capacity(tensor_count);
     for i in 0..tensor_count {
@@ -612,7 +680,7 @@ unsafe extern "C" fn rust_load_tensors_cb(
         requests.push((name, off, sz));
     }
 
-    match pool.load_tensors_into(&requests, dst) {
+    match pool.load_layer_tensors_into(layer_idx, &requests, dst) {
         Ok(()) => 0,
         Err(err) => {
             tracing::error!("layerstream IO callback failed: {err:#}");

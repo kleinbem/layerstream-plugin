@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Args;
+use layerstream_core::KvCacheType;
 use layerstream_server::{ModelRegistry, ServerConfig};
 
 #[derive(Debug, Clone, Args)]
@@ -39,6 +40,10 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = 0)]
     pub vram_budget_mb: u64,
 
+    /// KV cache quantization type: f16, q8_0 (2x smaller, recommended), or q4_0 (4x smaller).
+    #[arg(long, default_value = "q8_0")]
+    pub kv_cache_type: String,
+
     /// Seconds of idle time before freeing 100% of GPU memory (0 = free immediately after each request).
     #[arg(long, default_value_t = 60)]
     pub idle_timeout_secs: u64,
@@ -74,6 +79,13 @@ impl EngineArgs {
                 .unwrap_or(4)
         });
 
+        let kv_cache_type = match self.kv_cache_type.as_str() {
+            "f16" => KvCacheType::F16,
+            "q8_0" => KvCacheType::Q8_0,
+            "q4_0" => KvCacheType::Q4_0,
+            other => bail!("invalid --kv-cache-type '{other}' (expected f16, q8_0, or q4_0)"),
+        };
+
         Ok(ServerConfig {
             registry,
             n_ctx: self.ctx_size,
@@ -81,6 +93,7 @@ impl EngineArgs {
             n_threads,
             resident_layers: self.resident_layers,
             vram_budget_bytes: self.vram_budget_mb.saturating_mul(1024 * 1024),
+            kv_cache_type,
             use_gpu: !self.no_gpu,
             prefer_direct_io: !self.no_direct_io,
             idle_timeout: Duration::from_secs(self.idle_timeout_secs),

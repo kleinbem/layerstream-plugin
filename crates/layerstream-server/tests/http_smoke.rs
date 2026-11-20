@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use layerstream_core::KvCacheType;
 use layerstream_server::{AppState, ModelRegistry, ServerConfig, build_router};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -16,6 +17,7 @@ async fn health_and_empty_models_work_with_zero_vram() {
         n_threads: 2,
         resident_layers: Some(0),
         vram_budget_bytes: 0,
+        kv_cache_type: KvCacheType::F16,
         use_gpu: false,
         prefer_direct_io: true,
         idle_timeout: Duration::ZERO,
@@ -60,6 +62,7 @@ async fn chat_completions_and_immediate_eviction_on_real_gguf() {
         n_threads: 4,
         resident_layers: Some(0),
         vram_budget_bytes: 0,
+        kv_cache_type: KvCacheType::F16,
         use_gpu: false,
         prefer_direct_io: true,
         idle_timeout: Duration::ZERO,

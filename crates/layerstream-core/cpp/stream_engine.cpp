@@ -422,6 +422,13 @@ struct ls_engine {
                 next_layer > self->highest_enqueued_layer) {
                 self->enqueue_prefetch(next_layer);
                 self->highest_enqueued_layer = next_layer;
+            } else if (next_layer == static_cast<int32_t>(self->n_layers) &&
+                       self->streamed_layers >= 2 &&
+                       ((self->active_stream_layer - static_cast<int32_t>(self->resident_layers)) & 1) == 1) {
+                // Inter-sweep wraparound prefetch: the final layer uses Slot 1, so Slot 0
+                // is free now. Prefetch the first streamed layer R while `output.weight`,
+                // sampling, and the draft model run!
+                self->enqueue_prefetch(static_cast<int32_t>(self->resident_layers));
             }
             return true;
         }
@@ -815,7 +822,17 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     cparams.n_ubatch = n_batch;
     cparams.n_threads = static_cast<int32_t>(n_threads);
     cparams.n_threads_batch = static_cast<int32_t>(n_threads);
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    if (cfg->kv_cache_type == 1) {
+        cparams.type_k = GGML_TYPE_Q8_0;
+        cparams.type_v = GGML_TYPE_Q8_0;
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    } else if (cfg->kv_cache_type == 2) {
+        cparams.type_k = GGML_TYPE_Q4_0;
+        cparams.type_v = GGML_TYPE_Q4_0;
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    } else {
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    }
     if (eng->streamed_layers > 0) {
         cparams.cb_eval = &ls_engine::cb_eval;
         cparams.cb_eval_user_data = eng;

@@ -15,8 +15,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use layerstream_core::{
-    ChatMessage, DraftModelProposer, EngineConfig, GenerateOptions, LsSampleParams, Residency,
-    StreamEngine,
+    ChatMessage, DraftModelProposer, EngineConfig, GenerateOptions, KvCacheType, LsSampleParams,
+    Residency, StreamEngine,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,6 +34,7 @@ pub struct ServerConfig {
     pub n_threads: u32,
     pub resident_layers: Option<u32>,
     pub vram_budget_bytes: u64,
+    pub kv_cache_type: KvCacheType,
     pub use_gpu: bool,
     pub prefer_direct_io: bool,
     pub idle_timeout: Duration,
@@ -88,6 +89,7 @@ impl AppState {
         cfg.n_threads = self.config.n_threads;
         cfg.resident_layers = self.config.resident_layers;
         cfg.vram_budget_bytes = self.config.vram_budget_bytes;
+        cfg.kv_cache_type = self.config.kv_cache_type;
         cfg.use_gpu = self.config.use_gpu;
         cfg.prefer_direct_io = self.config.prefer_direct_io;
 

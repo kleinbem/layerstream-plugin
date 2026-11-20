@@ -53,6 +53,8 @@ typedef struct ls_engine_config {
     uint32_t n_threads;
     int32_t resident_layers;
     uint64_t vram_budget_bytes;
+    /** KV cache type: 0 = F16 (default), 1 = Q8_0 (2x smaller), 2 = Q4_0 (4x smaller). */
+    int32_t kv_cache_type;
     bool use_gpu;
     bool full_resident_reference;
 

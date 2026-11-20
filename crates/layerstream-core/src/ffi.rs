@@ -27,6 +27,7 @@ pub struct LsEngineConfig {
     pub n_threads: u32,
     pub resident_layers: i32,
     pub vram_budget_bytes: u64,
+    pub kv_cache_type: i32,
     pub use_gpu: bool,
     pub full_resident_reference: bool,
     pub io_user_data: *mut c_void,

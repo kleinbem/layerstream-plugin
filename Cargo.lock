@@ -836,6 +836,7 @@ dependencies = [
  "cmake",
  "libc",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
