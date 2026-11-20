@@ -26,7 +26,9 @@ configs:
 
 # Out-of-Core NVMe Layer Streaming on an 8 GB Jetson Orin Nano: 4-Engine Hardware Benchmark Dataset
 
-Reproducible bare-metal benchmark dataset (**130 normalized runs, 75 columns** in Parquet + JSON + JSONL) comparing four inference approaches on an **8 GB NVIDIA Jetson Orin Nano** running oversized dense and sparse MoE models (**7B MoE, 14B at 8.37 GiB, 30B-A3B MoE at 17.3 GiB, and 32B at 18.49 GiB — 2.53× total system RAM**):
+**Source code & `v0.1.0` release:** [github.com/kleinbem/layerstream-plugin](https://github.com/kleinbem/layerstream-plugin) ([`v0.1.0` releases](https://github.com/kleinbem/layerstream-plugin/releases/tag/v0.1.0) · [engineering details](https://github.com/kleinbem/layerstream-plugin/blob/main/docs/DETAILS.md))
+
+Reproducible bare-metal benchmark dataset (**130 normalized runs, 75 columns** in Parquet + JSON + JSONL, plus reproduction scripts in `scripts/`) comparing four inference approaches on an **8 GB NVIDIA Jetson Orin Nano** running oversized dense and sparse MoE models (**7B MoE, 14B at 8.37 GiB, 30B-A3B MoE at 17.3 GiB, and 32B at 18.49 GiB — 2.53× total system RAM**):
 
 1. **`layerstream-plugin v0.1.0`** (`113` rows across iterative tuning rounds R2–R8) — Native Rust + stock unpatched `llama.cpp` (`0693dbfb`) with page-aligned `O_DIRECT → cudaHostAlloc` async ping-pong GPU streaming, auto-sized hybrid partial-residency, sparse MoE active-expert streaming + scan-resistant TinyLFU hot-expert RAM cache, and speculative verification (greedy & `temperature > 0`).
 2. **Stock `llama.cpp`** (`0693dbfb`, CUDA `sm_87`, `12` rows) — Standard `mmap` + `-ngl` / `-ot exps=CPU` partial offload (also representing the underlying GGUF runtime used by Ollama and LM Studio).
