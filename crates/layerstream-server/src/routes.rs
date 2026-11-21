@@ -293,14 +293,61 @@ impl Drop for ActiveCancelGuard {
     }
 }
 
+pub const WORKER_TOKEN_HEADER: &str = "x-layerstream-worker-token";
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
+        .route("/v1/unload", post(unload_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(text_completions))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .with_state(state)
+}
+
+/// Builds the worker router requiring a matching `x-layerstream-worker-token` header on every request.
+pub fn build_router_with_token(state: AppState, expected_token: String) -> Router {
+    let expected = Arc::new(expected_token.into_bytes());
+    build_router(state).layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let expected = expected.clone();
+            async move {
+                let authorized = req
+                    .headers()
+                    .get(WORKER_TOKEN_HEADER)
+                    .map(|v| ct_eq(v.as_bytes(), &expected))
+                    .unwrap_or(false);
+                if !authorized {
+                    return api_error(StatusCode::FORBIDDEN, "missing or invalid worker token");
+                }
+                next.run(req).await
+            }
+        },
+    ))
+}
+
+async fn unload_model(State(state): State<AppState>) -> impl IntoResponse {
+    let unloaded = state.residency.evict_now().await;
+    if unloaded {
+        tracing::info!("unloaded layerstream model via /v1/unload");
+    }
+    Json(json!({
+        "unloaded": unloaded,
+        "loaded": state.residency.is_loaded(),
+        "worker_isolated": false,
+    }))
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -336,14 +383,10 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     .into_response()
 }
 
-async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
+pub fn models_list_json(registry: &ModelRegistry) -> Value {
     let now = unix_now();
-    let entries: Vec<ModelEntry> = state
-        .registry
-        .read()
-        .map(|r| r.list().into_iter().cloned().collect())
-        .unwrap_or_default();
-    let data: Vec<Value> = entries
+    let data: Vec<Value> = registry
+        .list()
         .into_iter()
         .map(|entry| {
             json!({
@@ -361,10 +404,19 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         })
         .collect();
 
-    Json(json!({
+    json!({
         "object": "list",
         "data": data,
-    }))
+    })
+}
+
+async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
+    let payload = state
+        .registry
+        .read()
+        .map(|r| models_list_json(&r))
+        .unwrap_or_else(|_| json!({ "object": "list", "data": [] }));
+    Json(payload)
 }
 
 #[derive(Debug, Deserialize)]
@@ -539,8 +591,11 @@ struct ErrorBody {
     kind: String,
 }
 
-fn api_error(status: StatusCode, msg: impl Into<String>) -> Response {
-    let kind = if status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND {
+pub fn api_error(status: StatusCode, msg: impl Into<String>) -> Response {
+    let kind = if status == StatusCode::BAD_REQUEST
+        || status == StatusCode::NOT_FOUND
+        || status == StatusCode::FORBIDDEN
+    {
         "invalid_request_error"
     } else if status == StatusCode::SERVICE_UNAVAILABLE {
         "service_unavailable"

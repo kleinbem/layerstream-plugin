@@ -41,9 +41,15 @@ pub struct EngineArgs {
     #[arg(long, default_value = "q8_0")]
     pub kv_cache_type: String,
 
-    /// Seconds of idle time before freeing model/KV GPU buffers (0 = free immediately after each request).
+    /// Seconds of idle time before freeing model/KV GPU buffers and terminating the GPU worker
+    /// (0 = free immediately after each request so host runtimes reclaim 100% of VRAM/UMA).
     #[arg(long, default_value_t = 60)]
     pub idle_timeout_secs: u64,
+
+    /// Run GPU inference in-process instead of an isolated on-demand worker subprocess
+    /// (retains GPU driver/CUDA context memory after idle eviction).
+    #[arg(long)]
+    pub in_process: bool,
 
     /// Allow streaming oversize models even on slow storage (<150 MiB/s) or non-O_DIRECT mounts (for batch jobs).
     #[arg(long)]
@@ -131,24 +137,15 @@ impl EngineArgs {
     /// Builds a `ServerConfig`; when `defer_uncached_hf == true` (Mesh-LLM plugin mode),
     /// uncached `hf://` pulls are deferred to a background task so the plugin connects to
     /// `MESH_LLM_PLUGIN_ENDPOINT` immediately without tripping the host's 10 s connect timeout.
+    ///
+    /// Note: intentionally does NOT probe GPU drivers at startup so the coordinator process stays
+    /// at ~10 MiB RSS / 0 B GPU driver context while idle. Explicit GPU checks happen in `check`
+    /// / `recommend` and lazily inside the GPU worker on first inference request.
     pub fn into_server_config_with_deferred(
         self,
         defer_uncached_hf: bool,
     ) -> Result<(ServerConfig, Option<DeferredPullPlan>)> {
         let use_gpu = !self.no_gpu;
-        let has_sources = self.has_model_sources();
-        // In Mesh-LLM plugin mode with zero configured model sources, skip GPU probing so
-        // `mesh_adapter` can complete the handshake and return `PluginError::startup_disabled`.
-        if (!defer_uncached_hf || has_sources)
-            && use_gpu
-            && StreamEngine::probe_gpu_memory(true).is_none()
-        {
-            bail!(
-                "no usable GPU device found (CUDA/Vulkan/Metal); verify GPU drivers \
-                 (on NixOS CUDA ensure /run/opengl-driver/lib is reachable) or rebuild with \
-                 the matching GPU backend feature"
-            );
-        }
 
         let cache_root = self.cache_dir.clone().unwrap_or_else(hf::default_cache_dir);
 

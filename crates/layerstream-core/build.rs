@@ -148,6 +148,18 @@ fn main() {
         if let Ok(host_cc) = env::var("CMAKE_CUDA_HOST_COMPILER") {
             cfg.define("CMAKE_CUDA_HOST_COMPILER", host_cc);
         }
+        // In dynamic-backends builds on NixOS, ensure `libggml-cuda.so` resolves the host
+        // driver `/run/opengl-driver/lib/libcuda.so.1` without requiring `LD_LIBRARY_PATH`.
+        if dynamic_backends && Path::new("/run/opengl-driver/lib").is_dir() {
+            let mut flags = env::var("CMAKE_SHARED_LINKER_FLAGS").unwrap_or_default();
+            if !flags.contains("/run/opengl-driver/lib") {
+                if !flags.is_empty() {
+                    flags.push(' ');
+                }
+                flags.push_str("-Wl,-rpath,/run/opengl-driver/lib");
+            }
+            cfg.define("CMAKE_SHARED_LINKER_FLAGS", flags);
+        }
     }
 
     if env::var("CMAKE_GENERATOR").is_err() && which_ninja() {
@@ -173,7 +185,12 @@ fn main() {
         cc_build.define("LAYERSTREAM_DYNAMIC_BACKENDS", None);
     }
 
-    if use_cuda && !dynamic_backends {
+    if use_cuda && dynamic_backends {
+        // Resolve libcudart symbols lazily via dlopen/dlsym ONLY inside the worker once
+        // `libggml-cuda.so` is loaded, keeping the parent executable free of CUDA DT_NEEDED
+        // (and avoiding libcublasLt's ~224 MiB `.init_array` RSS overhead while idle).
+        cc_build.define("LAYERSTREAM_USE_CUDA_DYNAMIC", None);
+    } else if use_cuda && !dynamic_backends {
         cc_build.define("LAYERSTREAM_USE_CUDA", None);
         let has_nixos_driver = Path::new("/run/opengl-driver/lib/libcuda.so.1").exists();
         if Path::new("/run/opengl-driver/lib").is_dir() {

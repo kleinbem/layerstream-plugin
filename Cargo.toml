@@ -15,7 +15,13 @@ repository = "https://github.com/kleinbem/layerstream-plugin"
 [workspace.dependencies]
 anyhow = "1"
 axum = "0.8"
+bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
+getrandom = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "d9c6e5a2ff3143c2c9161236bf24d415c403b9ca" }
 serde = { version = "1", features = ["derive"] }

@@ -112,6 +112,10 @@ impl ModelRegistry {
         Ok(())
     }
 
+    pub fn register_entry(&mut self, entry: ModelEntry) {
+        self.models.insert(entry.id.clone(), entry);
+    }
+
     pub fn get(&self, id: &str) -> Option<&ModelEntry> {
         self.models.get(id)
     }

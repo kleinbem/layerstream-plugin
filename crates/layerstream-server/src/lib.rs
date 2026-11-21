@@ -6,7 +6,10 @@ use anyhow::Result;
 use tokio::net::TcpListener;
 
 pub use registry::{ModelEntry, ModelRegistry};
-pub use routes::{AppState, ServerConfig, build_router};
+pub use routes::{
+    AppState, ServerConfig, WORKER_TOKEN_HEADER, api_error, build_router, build_router_with_token,
+    models_list_json,
+};
 
 pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<()> {
     let state = AppState::new(config);
@@ -26,6 +29,17 @@ impl Drop for AbortOnDrop {
 pub async fn serve_with_state(listener: TcpListener, state: AppState) -> Result<()> {
     let _reaper = AbortOnDrop(state.spawn_reaper());
     let app = build_router(state);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+pub async fn serve_with_state_and_token(
+    listener: TcpListener,
+    state: AppState,
+    token: String,
+) -> Result<()> {
+    let _reaper = AbortOnDrop(state.spawn_reaper());
+    let app = build_router_with_token(state, token);
     axum::serve(listener, app).await?;
     Ok(())
 }

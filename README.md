@@ -2,7 +2,7 @@
 
 Out-of-core GGUF layer-streaming inference engine and [Mesh-LLM](https://github.com/Mesh-LLM/mesh-llm) v3 plugin.
 
-Run oversized dense and sparse MoE GGUF models (**14B–32B+** on 8 GB edge GPUs, or **100B–235B+** on 64 GB unified-memory mini-PCs) using **stock, unpatched `llama.cpp`**, page-aligned `O_DIRECT` async ping-pong GPU streaming, auto-sized hybrid partial-residency (`blk.0..R-1` pinned in VRAM), sparse MoE active-expert streaming with a scan-resistant TinyLFU hot-expert RAM cache, speculative verification (greedy and `temperature > 0`), multi-turn KV prefix reuse, and lazy **0 MB model/KV weights while idle** eviction.
+Run oversized dense and sparse MoE GGUF models (**14B–32B+** on 8 GB edge GPUs, or **100B–235B+** on 64 GB unified-memory mini-PCs) using **stock, unpatched `llama.cpp`**, page-aligned `O_DIRECT` async ping-pong GPU streaming, auto-sized hybrid partial-residency (`blk.0..R-1` pinned in VRAM), sparse MoE active-expert streaming with a scan-resistant TinyLFU hot-expert RAM cache, speculative verification (greedy and `temperature > 0`), multi-turn KV prefix reuse, and isolated on-demand GPU workers for true **0 MB VRAM/UMA & 0 MB GPU driver context while idle**.
 
 ## Benchmark Highlights (`orin-nano`, 7.3 GiB RAM, CUDA `sm_87`, LUKS2 NVMe)
 
@@ -39,7 +39,7 @@ Measured bare-metal on an 8 GB NVIDIA Jetson Orin Nano with **INA3221 hardware p
 
 ## Why `layerstream-plugin`?
 
-* **0 MB model/KV weights while idle:** Startup parses only GGUF metadata headers (~20–50 ms, `0 MB` GPU memory) so `/v1/models` advertises all configured models immediately. After `--idle-timeout-secs` (`0` = immediate eviction), all model, KV, and slot buffers are freed (only the initialized CUDA/Vulkan driver context remains resident, e.g., ~230–325 MiB on Jetson CUDA).
+* **True 0 MB GPU & driver memory while idle (isolated on-demand worker):** Startup parses only GGUF metadata headers (~20–50 ms, `0 MB` GPU memory) so `/v1/models` advertises all configured models immediately. GPU inference runs inside a lazily spawned isolated worker subprocess (`layerstream _worker`, opt-out via `--in-process`). When `--idle-timeout-secs` elapses (or `POST /v1/unload` is called), the worker exits and the OS kernel reclaims **100%** of VRAM/UMA, CUDA/Vulkan/Metal driver contexts (`~300–524 MiB` on Jetson CUDA), and host heap arenas. With `--idle-timeout-secs 0`, the worker is synchronously reaped *before* the HTTP response / SSE stream finishes — preventing race conditions with immediate native model reloads on tight unified-memory GPUs.
 * **Zero `llama.cpp` patches:** Loads models with `llama_model_params.no_alloc = true`, binds layers to real backend `ggml_backend_buffer_t` slots (`Slot A` / `Slot B`), and synchronizes via a race-free tensor-pointer `cb_eval` hook. Inherits all 70+ `llama.cpp` architectures, Flash Attention, quantized KV cache (`Q8_0` default), and chat templates automatically.
 * **Single-owner async `O_DIRECT` I/O:**
   * **Discrete & Jetson CUDA:** Full-layer 4K-aligned `O_DIRECT` `pread` straight into a single shared `cudaHostAlloc` pinned staging buffer → per-tensor `cudaMemcpyAsync` on a dedicated non-blocking copy stream overlapped with GPU compute. *(On Jetson Orin CUDA, upstream `llama.cpp` currently disables Tegra `CUDA_Host` unified memory — `upstream: ggml-org/llama.cpp#15034` — so `layerstream-plugin` uses this discrete pinned-staging path while still sizing headroom for unified physical RAM.)*
@@ -99,6 +99,7 @@ layerstream-plugin serve \
 Endpoints:
 * `GET /health`
 * `GET /v1/models`
+* `POST /v1/unload` (immediately terminates and reaps any idle/warm GPU worker, returning 100% of VRAM/UMA and driver contexts to the OS)
 * `POST /v1/chat/completions` (SSE streaming, stateful `<think>` → `reasoning_content` and `<tool_call>` → `tool_calls`, stop-sequence holdback, client-disconnect cancellation, `503` backpressure when queue is full)
 * `POST /v1/completions`
 
@@ -115,9 +116,9 @@ LAYERSTREAM_TEST_GGUF=/path/to/model.gguf cargo test --locked --workspace -- --n
 LAYERSTREAM_TEST_GGUF=/path/to/model.gguf LAYERSTREAM_TEST_GPU=1 \
   cargo test --locked -p layerstream-core --features vulkan --test parity_test -- --nocapture
 
-# With CUDA (x86_64 or Jetson Orin Nano aarch64):
+# With CUDA (x86_64 or Jetson Orin Nano aarch64 — `dynamic-backends` keeps idle coordinator RSS ~10–15 MiB with zero CUDA DT_NEEDED):
 nix develop .#cuda
-cargo build --release -p layerstream-plugin --features cuda
+cargo build --release -p layerstream-plugin --features cuda,dynamic-backends
 ```
 
 ## Documentation & Reproducibility

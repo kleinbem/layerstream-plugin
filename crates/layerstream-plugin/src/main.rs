@@ -1,6 +1,7 @@
 mod config;
 mod hf;
 mod mesh_adapter;
+mod worker;
 
 use std::time::Duration;
 
@@ -80,6 +81,9 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Internal on-demand isolated GPU worker subprocess (spawned automatically by parent coordinator).
+    #[command(name = "_worker", hide = true)]
+    Worker,
 }
 
 fn main() -> Result<()> {
@@ -196,7 +200,9 @@ fn main() -> Result<()> {
 
     let result = rt.block_on(async move {
         match cli.command {
+            Some(Command::Worker) => worker::run_worker_process().await,
             Some(Command::Serve { host, port, engine }) => {
+                let in_process = engine.in_process;
                 let server_cfg = engine.into_server_config()?;
                 let addr = format!("{host}:{port}");
                 let listener = TcpListener::bind(&addr)
@@ -205,20 +211,34 @@ fn main() -> Result<()> {
                 tracing::info!(
                     addr = %addr,
                     models = server_cfg.registry.len(),
-                    "starting standalone layerstream OpenAI server (0 MB model/KV weights idle)"
+                    worker_isolated = !in_process,
+                    "starting standalone layerstream OpenAI server (0 MB GPU memory idle)"
                 );
-                layerstream_server::serve(listener, server_cfg).await
+                if in_process {
+                    layerstream_server::serve(listener, server_cfg).await
+                } else {
+                    let coordinator = worker::WorkerCoordinator::new(server_cfg)?;
+                    let coord_shutdown = coordinator.clone();
+                    let serve_res = tokio::select! {
+                        res = worker::serve_with_coordinator(listener, coordinator) => res,
+                        _ = mesh_adapter::shutdown_signal() => Ok(()),
+                    };
+                    coord_shutdown.shutdown_cleanly().await;
+                    serve_res
+                }
             }
             Some(Command::Plugin { engine }) => {
+                let in_process = engine.in_process;
                 let has_sources = engine.has_model_sources();
                 let (server_cfg, deferred) = engine.into_server_config_with_deferred(true)?;
-                mesh_adapter::run_mesh_plugin(server_cfg, has_sources, deferred).await
+                mesh_adapter::run_mesh_plugin(server_cfg, in_process, has_sources, deferred).await
             }
             None => {
+                let in_process = cli.plugin_args.in_process;
                 let has_sources = cli.plugin_args.has_model_sources();
                 let (server_cfg, deferred) =
                     cli.plugin_args.into_server_config_with_deferred(true)?;
-                mesh_adapter::run_mesh_plugin(server_cfg, has_sources, deferred).await
+                mesh_adapter::run_mesh_plugin(server_cfg, in_process, has_sources, deferred).await
             }
             Some(Command::Pull { .. } | Command::Check { .. } | Command::Recommend { .. }) => {
                 unreachable!()

@@ -1,11 +1,12 @@
-//! Native Mesh-LLM plugin adapter hosting `layerstream-server` in-process on an
-//! ephemeral loopback port (0 MB model/KV weights idle, zero child-process orchestration).
+//! Native Mesh-LLM plugin adapter hosting `layerstream-server` on an ephemeral
+//! loopback port (0 MB VRAM/UMA and 0 MB GPU driver context while idle via
+//! on-demand worker isolation, or opt-in `--in-process` mode).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use layerstream_server::{AppState, ServerConfig, serve_with_state};
+use layerstream_server::{AppState, ModelRegistry, ServerConfig, serve_with_state};
 use mesh_llm_plugin::{
     PROTOCOL_VERSION, PluginError, PluginMetadata, PluginRuntime, PluginStartupPolicy,
     SimplePlugin, capability, plugin_server_info,
@@ -15,14 +16,86 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::DeferredPullPlan;
+use crate::worker::{WorkerCoordinator, serve_with_coordinator};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PLUGIN_NAME: &str = "layerstream";
 const ENDPOINT_ID: &str = "layerstream";
 
+#[derive(Clone)]
+pub enum BackendHandle {
+    Isolated(WorkerCoordinator),
+    InProcess(AppState),
+}
+
+impl BackendHandle {
+    fn model_count(&self) -> usize {
+        match self {
+            Self::Isolated(c) => c.model_count(),
+            Self::InProcess(s) => s.model_count(),
+        }
+    }
+
+    fn is_loaded(&self) -> bool {
+        match self {
+            Self::Isolated(c) => c.is_loaded(),
+            Self::InProcess(s) => s.residency.is_loaded(),
+        }
+    }
+
+    fn set_registry(&self, registry: ModelRegistry) {
+        match self {
+            Self::Isolated(c) => c.set_registry(registry),
+            Self::InProcess(s) => s.set_registry(registry),
+        }
+    }
+
+    fn set_loading_status(&self, status: Option<String>) {
+        match self {
+            Self::Isolated(c) => c.set_loading_status(status),
+            Self::InProcess(s) => s.set_loading_status(status),
+        }
+    }
+
+    fn set_loading_failed(&self, err: String) {
+        match self {
+            Self::Isolated(c) => c.set_loading_failed(err),
+            Self::InProcess(s) => s.set_loading_failed(err),
+        }
+    }
+
+    fn loading_status(&self) -> Option<String> {
+        match self {
+            Self::Isolated(c) => c.loading_status(),
+            Self::InProcess(s) => s.loading_status(),
+        }
+    }
+
+    fn loading_error(&self) -> Option<String> {
+        match self {
+            Self::Isolated(c) => c.loading_error(),
+            Self::InProcess(s) => s.loading_error(),
+        }
+    }
+
+    async fn shutdown_cleanly(&self) {
+        match self {
+            Self::Isolated(c) => c.shutdown_cleanly().await,
+            Self::InProcess(s) => s.request_shutdown(),
+        }
+    }
+
+    async fn serve(self, listener: TcpListener) -> Result<()> {
+        match self {
+            Self::Isolated(c) => serve_with_coordinator(listener, c).await,
+            Self::InProcess(s) => serve_with_state(listener, s).await,
+        }
+    }
+}
+
 pub fn build_plugin(
     endpoint_base: String,
-    state: AppState,
+    state: BackendHandle,
     has_model_sources: bool,
     listener_slot: Arc<Mutex<Option<TcpListener>>>,
     shutdown_rx_slot: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
@@ -80,7 +153,7 @@ pub fn build_plugin(
                         health_state.model_count()
                     ));
                 }
-                let loaded = if health_state.residency.is_loaded() {
+                let loaded = if health_state.is_loaded() {
                     "loaded"
                 } else {
                     "idle_0mb_vram"
@@ -112,7 +185,7 @@ pub fn build_plugin(
                 let shutdown_rx = shutdown_rx_slot.lock().await.take();
                 let serve_state = startup_state.clone();
                 let handle = tokio::spawn(async move {
-                    let serve_fut = serve_with_state(listener, serve_state);
+                    let serve_fut = serve_state.serve(listener);
                     tokio::pin!(serve_fut);
                     if let Some(rx) = shutdown_rx {
                         tokio::select! {
@@ -173,6 +246,7 @@ pub fn build_plugin(
 
 pub async fn run_mesh_plugin(
     server_config: ServerConfig,
+    in_process: bool,
     has_model_sources: bool,
     deferred_pull: Option<DeferredPullPlan>,
 ) -> Result<()> {
@@ -182,7 +256,11 @@ pub async fn run_mesh_plugin(
     let port = listener.local_addr()?.port();
     let endpoint_base = format!("http://127.0.0.1:{port}/v1");
 
-    let state = AppState::new(server_config);
+    let state = if in_process {
+        BackendHandle::InProcess(AppState::new(server_config))
+    } else {
+        BackendHandle::Isolated(WorkerCoordinator::new(server_config)?)
+    };
     let listener_slot = Arc::new(Mutex::new(Some(listener)));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let shutdown_rx_slot = Arc::new(Mutex::new(Some(shutdown_rx)));
@@ -203,9 +281,10 @@ pub async fn run_mesh_plugin(
         _ = shutdown_signal() => Ok(()),
     };
 
-    // Immediately cancel any in-flight prefill/decode so `spawn_blocking` exits within one layer
-    // and GPU/RAM buffers are released promptly on host EOF, ShutdownRequest, or SIGTERM.
-    state.request_shutdown();
+    // Immediately cancel any in-flight prefill/decode and reap any isolated GPU worker
+    // so GPU/RAM buffers and driver contexts are released promptly on host EOF,
+    // ShutdownRequest, or SIGTERM.
+    state.shutdown_cleanly().await;
     let _ = shutdown_tx.send(());
     if let Some(handle) = server_handle_slot.lock().await.take() {
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -213,7 +292,7 @@ pub async fn run_mesh_plugin(
     result
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         if let Ok(mut term) =
@@ -263,7 +342,7 @@ mod tests {
         };
         let plugin = build_plugin(
             "http://127.0.0.1:1/v1".to_string(),
-            AppState::new(cfg),
+            BackendHandle::InProcess(AppState::new(cfg)),
             true,
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),

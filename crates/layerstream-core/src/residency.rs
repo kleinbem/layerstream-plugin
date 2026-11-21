@@ -176,6 +176,23 @@ impl<E: Send + 'static> Residency<E> {
         false
     }
 
+    /// Unconditionally evicts any loaded model once exclusive slot ownership is acquired.
+    /// Drops the engine on a blocking worker thread so multi-GiB GPU frees never stall async I/O.
+    pub async fn evict_now(&self) -> bool {
+        let mut guard = self.slot.clone().lock_owned().await;
+        let Some(evicted) = guard.take() else {
+            return false;
+        };
+        let loaded = self.loaded.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            drop(evicted);
+            loaded.store(false, Ordering::SeqCst);
+            drop(guard);
+        })
+        .await;
+        true
+    }
+
     pub fn is_loaded(&self) -> bool {
         self.loaded.load(Ordering::SeqCst)
     }

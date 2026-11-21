@@ -223,3 +223,78 @@ async fn chat_completions_and_immediate_eviction_on_real_gguf() {
 
     let _ = PathBuf::from(model_path);
 }
+
+#[tokio::test]
+async fn unload_endpoint_and_worker_token_auth() {
+    let cfg = ServerConfig {
+        registry: ModelRegistry::default(),
+        n_ctx: 512,
+        n_batch: 128,
+        n_threads: 2,
+        resident_layers: Some(0),
+        vram_budget_bytes: 0,
+        vram_budget_auto: false,
+        kv_cache_type: KvCacheType::F16,
+        use_gpu: false,
+        prefer_direct_io: true,
+        cpu_embeddings: false,
+        cpu_head: false,
+        stream_head: false,
+        moe_active_streaming: true,
+        idle_timeout: Duration::ZERO,
+        enable_ngram_speculation: true,
+        max_draft_tokens: 4,
+        max_queued_requests: 4,
+    };
+    let app = layerstream_server::build_router_with_token(
+        AppState::new(cfg),
+        "test-secret-token".to_string(),
+    );
+
+    // Missing token -> 403 Forbidden.
+    let no_tok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_tok.status(), StatusCode::FORBIDDEN);
+
+    // Wrong token -> 403 Forbidden.
+    let bad_tok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header(layerstream_server::WORKER_TOKEN_HEADER, "wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_tok.status(), StatusCode::FORBIDDEN);
+
+    // Valid token -> 200 OK on /v1/unload.
+    let ok_unload = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/unload")
+                .header(layerstream_server::WORKER_TOKEN_HEADER, "test-secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_unload.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(ok_unload.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["unloaded"], false);
+    assert_eq!(v["loaded"], false);
+}

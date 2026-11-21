@@ -18,12 +18,189 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
+#if defined(LAYERSTREAM_USE_CUDA)
+#define LAYERSTREAM_HAS_CUDA_RT 1
 #include <cuda_runtime.h>
+#elif defined(LAYERSTREAM_USE_CUDA_DYNAMIC) && !defined(_WIN32)
+#define LAYERSTREAM_HAS_CUDA_RT 1
+#include <dlfcn.h>
+#endif
+
+#ifdef LAYERSTREAM_HAS_CUDA_RT
+namespace ls_cuda {
+#if defined(LAYERSTREAM_USE_CUDA)
+using Stream = cudaStream_t;
+using Event = cudaEvent_t;
+static constexpr int kSuccess = static_cast<int>(cudaSuccess);
+static constexpr int kMemcpyHostToDevice = static_cast<int>(cudaMemcpyHostToDevice);
+static constexpr unsigned int kStreamNonBlocking = cudaStreamNonBlocking;
+static constexpr unsigned int kEventDisableTiming = cudaEventDisableTiming;
+static constexpr unsigned int kHostAllocDefault = cudaHostAllocDefault;
+static constexpr int kDevAttrIntegrated = static_cast<int>(cudaDevAttrIntegrated);
+
+static bool ensure_loaded() { return true; }
+static int device_get_attribute(int * value, int attr, int device) {
+    return static_cast<int>(cudaDeviceGetAttribute(value, static_cast<cudaDeviceAttr>(attr), device));
+}
+static int stream_create_with_flags(Stream * s, unsigned int flags) {
+    return static_cast<int>(cudaStreamCreateWithFlags(s, flags));
+}
+static int stream_destroy(Stream s) { return static_cast<int>(cudaStreamDestroy(s)); }
+static int stream_synchronize(Stream s) { return static_cast<int>(cudaStreamSynchronize(s)); }
+static int event_create_with_flags(Event * e, unsigned int flags) {
+    return static_cast<int>(cudaEventCreateWithFlags(e, flags));
+}
+static int event_destroy(Event e) { return static_cast<int>(cudaEventDestroy(e)); }
+static int event_record(Event e, Stream s) { return static_cast<int>(cudaEventRecord(e, s)); }
+static int event_synchronize(Event e) { return static_cast<int>(cudaEventSynchronize(e)); }
+static int host_alloc(void ** ptr, size_t bytes, unsigned int flags) {
+    return static_cast<int>(cudaHostAlloc(ptr, bytes, flags));
+}
+static int free_host(void * ptr) { return static_cast<int>(cudaFreeHost(ptr)); }
+static int memcpy_async(void * dst, const void * src, size_t count, int kind, Stream s) {
+    return static_cast<int>(cudaMemcpyAsync(dst, src, count, static_cast<cudaMemcpyKind>(kind), s));
+}
+static int memset_async(void * dst, int value, size_t count, Stream s) {
+    return static_cast<int>(cudaMemsetAsync(dst, value, count, s));
+}
+#else
+using Stream = void *;
+using Event = void *;
+static constexpr int kSuccess = 0;
+static constexpr int kMemcpyHostToDevice = 1;
+static constexpr unsigned int kStreamNonBlocking = 0x01;
+static constexpr unsigned int kEventDisableTiming = 0x02;
+static constexpr unsigned int kHostAllocDefault = 0x00;
+static constexpr int kDevAttrIntegrated = 18;
+
+struct Api {
+    int (*device_get_attribute)(int *, int, int) = nullptr;
+    int (*stream_create_with_flags)(Stream *, unsigned int) = nullptr;
+    int (*stream_destroy)(Stream) = nullptr;
+    int (*stream_synchronize)(Stream) = nullptr;
+    int (*event_create_with_flags)(Event *, unsigned int) = nullptr;
+    int (*event_destroy)(Event) = nullptr;
+    int (*event_record)(Event, Stream) = nullptr;
+    int (*event_synchronize)(Event) = nullptr;
+    int (*host_alloc)(void **, size_t, unsigned int) = nullptr;
+    int (*free_host)(void *) = nullptr;
+    int (*memcpy_async)(void *, const void *, size_t, int, Stream) = nullptr;
+    int (*memset_async)(void *, int, size_t, Stream) = nullptr;
+    bool ready = false;
+};
+
+static const Api & get_api() {
+    static Api api = []() {
+        Api out;
+        static constexpr const char * kCandidates[] = {
+            "libcudart.so",
+            "libcudart.so.13",
+            "libcudart.so.12",
+            "libcudart.so.11",
+        };
+        void * handle = nullptr;
+        for (const char * name : kCandidates) {
+            handle = dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
+            if (handle) {
+                break;
+            }
+        }
+        if (!handle) {
+            for (const char * name : kCandidates) {
+                handle = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
+                if (handle) {
+                    break;
+                }
+            }
+        }
+        if (!handle) {
+            return out;
+        }
+        auto load_sym = [&](auto & fn, const char * sym) -> bool {
+            void * p = dlsym(handle, sym);
+            if (!p) {
+                return false;
+            }
+            fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(p);
+            return true;
+        };
+        out.ready = load_sym(out.device_get_attribute, "cudaDeviceGetAttribute") &&
+                    load_sym(out.stream_create_with_flags, "cudaStreamCreateWithFlags") &&
+                    load_sym(out.stream_destroy, "cudaStreamDestroy") &&
+                    load_sym(out.stream_synchronize, "cudaStreamSynchronize") &&
+                    load_sym(out.event_create_with_flags, "cudaEventCreateWithFlags") &&
+                    load_sym(out.event_destroy, "cudaEventDestroy") &&
+                    load_sym(out.event_record, "cudaEventRecord") &&
+                    load_sym(out.event_synchronize, "cudaEventSynchronize") &&
+                    load_sym(out.host_alloc, "cudaHostAlloc") &&
+                    load_sym(out.free_host, "cudaFreeHost") &&
+                    load_sym(out.memcpy_async, "cudaMemcpyAsync") &&
+                    load_sym(out.memset_async, "cudaMemsetAsync");
+        return out;
+    }();
+    return api;
+}
+
+static bool ensure_loaded() { return get_api().ready; }
+static int device_get_attribute(int * value, int attr, int device) {
+    const auto & a = get_api();
+    return a.ready ? a.device_get_attribute(value, attr, device) : -1;
+}
+static int stream_create_with_flags(Stream * s, unsigned int flags) {
+    const auto & a = get_api();
+    return a.ready ? a.stream_create_with_flags(s, flags) : -1;
+}
+static int stream_destroy(Stream s) {
+    const auto & a = get_api();
+    return a.ready ? a.stream_destroy(s) : -1;
+}
+static int stream_synchronize(Stream s) {
+    const auto & a = get_api();
+    return a.ready ? a.stream_synchronize(s) : -1;
+}
+static int event_create_with_flags(Event * e, unsigned int flags) {
+    const auto & a = get_api();
+    return a.ready ? a.event_create_with_flags(e, flags) : -1;
+}
+static int event_destroy(Event e) {
+    const auto & a = get_api();
+    return a.ready ? a.event_destroy(e) : -1;
+}
+static int event_record(Event e, Stream s) {
+    const auto & a = get_api();
+    return a.ready ? a.event_record(e, s) : -1;
+}
+static int event_synchronize(Event e) {
+    const auto & a = get_api();
+    return a.ready ? a.event_synchronize(e) : -1;
+}
+static int host_alloc(void ** ptr, size_t bytes, unsigned int flags) {
+    const auto & a = get_api();
+    return a.ready ? a.host_alloc(ptr, bytes, flags) : -1;
+}
+static int free_host(void * ptr) {
+    const auto & a = get_api();
+    return a.ready ? a.free_host(ptr) : -1;
+}
+static int memcpy_async(void * dst, const void * src, size_t count, int kind, Stream s) {
+    const auto & a = get_api();
+    return a.ready ? a.memcpy_async(dst, src, count, kind, s) : -1;
+}
+static int memset_async(void * dst, int value, size_t count, Stream s) {
+    const auto & a = get_api();
+    return a.ready ? a.memset_async(dst, value, count, s) : -1;
+}
+#endif
+} // namespace ls_cuda
 #endif
 
 #ifdef _WIN32
@@ -283,10 +460,10 @@ struct ls_engine {
     // zero data races and zero aliasing &mut [u8] UB while saving ~166-385 MiB of locked RAM.
     uint8_t * pin_buf = nullptr;
     size_t pin_cap = 0;
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef LAYERSTREAM_HAS_CUDA_RT
     bool pin_is_cuda_host = false;
-    cudaStream_t copy_stream = nullptr;
-    cudaEvent_t slot_event[2] = {nullptr, nullptr};
+    ls_cuda::Stream copy_stream = nullptr;
+    ls_cuda::Event slot_event[2] = {nullptr, nullptr};
     int last_h2d_slot = -1; // exclusively accessed on worker_thread
 #endif
 
@@ -358,7 +535,7 @@ struct ls_engine {
     std::atomic<uint64_t> prof_decode_total_us{0};
 
     bool uses_deferred_eval_h2d() const {
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef LAYERSTREAM_HAS_CUDA_RT
         return !is_uma_zero_copy && (copy_stream == nullptr);
 #else
         return !is_uma_zero_copy;
@@ -404,11 +581,11 @@ struct ls_engine {
         } else {
             using Clock = std::chrono::steady_clock;
             auto t_h2d_wait0 = profile_enabled ? Clock::now() : Clock::time_point{};
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef LAYERSTREAM_HAS_CUDA_RT
             // Ensure the previous H2D DMA from our shared pinned buffer has finished
             // before refilling it with the next layer's NVMe read.
             if (copy_stream != nullptr && last_h2d_slot >= 0 && slot_event[last_h2d_slot] != nullptr) {
-                if (cudaEventSynchronize(slot_event[last_h2d_slot]) != cudaSuccess) {
+                if (ls_cuda::event_synchronize(slot_event[last_h2d_slot]) != ls_cuda::kSuccess) {
                     return -9;
                 }
             }
@@ -463,39 +640,39 @@ struct ls_engine {
                 );
             }
 
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef LAYERSTREAM_HAS_CUDA_RT
             if (copy_stream != nullptr) {
                 auto * gpu_dst = static_cast<uint8_t *>(ggml_backend_buffer_get_base(slot_buf[slot]));
                 bool submitted_h2d = false;
                 auto fence_on_err = [&]() {
                     if (submitted_h2d) {
-                        (void)cudaStreamSynchronize(copy_stream);
+                        (void)ls_cuda::stream_synchronize(copy_stream);
                     }
                 };
                 if (n_direct > 0) {
                     for (int i = 0; i < n_direct; ++i) {
-                        cudaError_t ce = cudaMemcpyAsync(
+                        int ce = ls_cuda::memcpy_async(
                             gpu_dst + direct_slices[i].dst_offset,
                             pin_buf + direct_slices[i].src_offset,
                             direct_slices[i].len,
-                            cudaMemcpyHostToDevice,
+                            ls_cuda::kMemcpyHostToDevice,
                             copy_stream
                         );
-                        if (ce != cudaSuccess) {
+                        if (ce != ls_cuda::kSuccess) {
                             fence_on_err();
                             return -10;
                         }
                         submitted_h2d = true;
                     }
                 } else {
-                    cudaError_t ce = cudaMemcpyAsync(
+                    int ce = ls_cuda::memcpy_async(
                         gpu_dst,
                         pin_buf,
                         plan.total_bytes,
-                        cudaMemcpyHostToDevice,
+                        ls_cuda::kMemcpyHostToDevice,
                         copy_stream
                     );
-                    if (ce != cudaSuccess) {
+                    if (ce != ls_cuda::kSuccess) {
                         return -10;
                     }
                     submitted_h2d = true;
@@ -503,19 +680,19 @@ struct ls_engine {
                 // Zero any quantized row padding tails between heterogeneous layers reusing slot_buf.
                 for (const auto & tb : plan.tensors) {
                     if (tb.alloc_size > tb.nbytes) {
-                        if (cudaMemsetAsync(
+                        if (ls_cuda::memset_async(
                                 gpu_dst + tb.offset + tb.nbytes,
                                 0,
                                 static_cast<size_t>(tb.alloc_size - tb.nbytes),
                                 copy_stream
-                            ) != cudaSuccess) {
+                            ) != ls_cuda::kSuccess) {
                             fence_on_err();
                             return -10;
                         }
                     }
                 }
-                cudaError_t ce = cudaEventRecord(slot_event[slot], copy_stream);
-                if (ce != cudaSuccess) {
+                int ce = ls_cuda::event_record(slot_event[slot], copy_stream);
+                if (ce != ls_cuda::kSuccess) {
                     fence_on_err();
                     return -11;
                 }
@@ -571,9 +748,9 @@ struct ls_engine {
                 return 0;
             }
 
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef LAYERSTREAM_HAS_CUDA_RT
             if (copy_stream != nullptr && last_h2d_slot >= 0 && slot_event[last_h2d_slot] != nullptr) {
-                if (cudaEventSynchronize(slot_event[last_h2d_slot]) != cudaSuccess) {
+                if (ls_cuda::event_synchronize(slot_event[last_h2d_slot]) != ls_cuda::kSuccess) {
                     return -21;
                 }
             }
@@ -614,55 +791,55 @@ struct ls_engine {
             }
             req.n_direct = n_direct;
 
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef LAYERSTREAM_HAS_CUDA_RT
             if (copy_stream != nullptr) {
                 auto * gpu_dst = static_cast<uint8_t *>(ggml_backend_buffer_get_base(expert_slot_buf));
                 bool submitted_h2d = false;
                 auto fence_on_err = [&]() {
                     if (submitted_h2d) {
-                        (void)cudaStreamSynchronize(copy_stream);
+                        (void)ls_cuda::stream_synchronize(copy_stream);
                     }
                 };
                 if (n_direct > 0) {
                     for (int i = 0; i < n_direct; ++i) {
-                        if (cudaMemcpyAsync(
+                        if (ls_cuda::memcpy_async(
                                 gpu_dst + req.direct_slices[i].dst_offset,
                                 pin_buf + req.direct_slices[i].src_offset,
                                 req.direct_slices[i].len,
-                                cudaMemcpyHostToDevice,
+                                ls_cuda::kMemcpyHostToDevice,
                                 copy_stream
-                            ) != cudaSuccess) {
+                            ) != ls_cuda::kSuccess) {
                             fence_on_err();
                             return -22;
                         }
                         submitted_h2d = true;
                     }
                 } else {
-                    if (cudaMemcpyAsync(
+                    if (ls_cuda::memcpy_async(
                             gpu_dst,
                             pin_buf,
                             plan.total_bytes,
-                            cudaMemcpyHostToDevice,
+                            ls_cuda::kMemcpyHostToDevice,
                             copy_stream
-                        ) != cudaSuccess) {
+                        ) != ls_cuda::kSuccess) {
                         return -22;
                     }
                     submitted_h2d = true;
                 }
                 for (const auto & tb : plan.tensors) {
                     if (tb.alloc_size > tb.nbytes) {
-                        if (cudaMemsetAsync(
+                        if (ls_cuda::memset_async(
                                 gpu_dst + tb.offset + tb.nbytes,
                                 0,
                                 static_cast<size_t>(tb.alloc_size - tb.nbytes),
                                 copy_stream
-                            ) != cudaSuccess) {
+                            ) != ls_cuda::kSuccess) {
                             fence_on_err();
                             return -22;
                         }
                     }
                 }
-                if (cudaStreamSynchronize(copy_stream) != cudaSuccess) {
+                if (ls_cuda::stream_synchronize(copy_stream) != ls_cuda::kSuccess) {
                     return -23;
                 }
             }
@@ -677,9 +854,9 @@ struct ls_engine {
             return load_slices_cb(io_user_data, reqs.data(), reqs.size(), dst, expert_slot_bytes);
         }
 
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef LAYERSTREAM_HAS_CUDA_RT
         if (copy_stream != nullptr && last_h2d_slot >= 0 && slot_event[last_h2d_slot] != nullptr) {
-            if (cudaEventSynchronize(slot_event[last_h2d_slot]) != cudaSuccess) {
+            if (ls_cuda::event_synchronize(slot_event[last_h2d_slot]) != ls_cuda::kSuccess) {
                 return -24;
             }
         }
@@ -690,26 +867,26 @@ struct ls_engine {
             return rc;
         }
 
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef LAYERSTREAM_HAS_CUDA_RT
         if (copy_stream != nullptr) {
             auto * gpu_dst = static_cast<uint8_t *>(ggml_backend_buffer_get_base(expert_slot_buf));
             bool submitted_h2d = false;
             for (size_t i = 0; i < reqs.size(); ++i) {
-                if (cudaMemcpyAsync(
+                if (ls_cuda::memcpy_async(
                         gpu_dst + reqs[i].dst_offset,
                         pin_buf + packed_reqs[i].dst_offset,
                         reqs[i].len,
-                        cudaMemcpyHostToDevice,
+                        ls_cuda::kMemcpyHostToDevice,
                         copy_stream
-                    ) != cudaSuccess) {
+                    ) != ls_cuda::kSuccess) {
                     if (submitted_h2d) {
-                        (void)cudaStreamSynchronize(copy_stream);
+                        (void)ls_cuda::stream_synchronize(copy_stream);
                     }
                     return -25;
                 }
                 submitted_h2d = true;
             }
-            if (cudaStreamSynchronize(copy_stream) != cudaSuccess) {
+            if (ls_cuda::stream_synchronize(copy_stream) != ls_cuda::kSuccess) {
                 return -26;
             }
         }
@@ -1070,9 +1247,9 @@ struct ls_engine {
             worker_cv.notify_all();
         }
 
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef LAYERSTREAM_HAS_CUDA_RT
         if (!is_uma_zero_copy && copy_stream != nullptr && slot_event[slot] != nullptr) {
-            if (cudaEventSynchronize(slot_event[slot]) != cudaSuccess) {
+            if (ls_cuda::event_synchronize(slot_event[slot]) != ls_cuda::kSuccess) {
                 return false;
             }
         }
@@ -1429,10 +1606,11 @@ static bool select_target_buft(
         const char * dev_name = ggml_backend_dev_name(chosen);
         out_is_cuda_backend = (dev_name != nullptr && std::strstr(dev_name, "CUDA") != nullptr);
 
-#ifdef LAYERSTREAM_USE_CUDA
-        if (out_is_cuda_backend) {
-            cudaDeviceProp prop{};
-            if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess && prop.integrated != 0) {
+#ifdef LAYERSTREAM_HAS_CUDA_RT
+        if (out_is_cuda_backend && ls_cuda::ensure_loaded()) {
+            int integrated = 0;
+            if (ls_cuda::device_get_attribute(&integrated, ls_cuda::kDevAttrIntegrated, 0) == ls_cuda::kSuccess &&
+                integrated != 0) {
                 out_is_unified_memory = true;
                 ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(chosen);
                 if (host_buft != nullptr && ggml_backend_dev_supports_buft(chosen, host_buft)) {
@@ -2218,11 +2396,11 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         // Add +2 MiB headroom for 4K-aligned O_DIRECT span padding around a single layer.
         const uint64_t max_stream_buf = std::max(eng->slot_bytes, eng->expert_slot_bytes);
         const size_t pin_bytes = align_up(max_stream_buf + (2ULL * 1024 * 1024), 4096);
-#ifdef LAYERSTREAM_USE_CUDA
-        if (eng->is_cuda_backend &&
-            cudaStreamCreateWithFlags(&eng->copy_stream, cudaStreamNonBlocking) == cudaSuccess) {
+#ifdef LAYERSTREAM_HAS_CUDA_RT
+        if (eng->is_cuda_backend && ls_cuda::ensure_loaded() &&
+            ls_cuda::stream_create_with_flags(&eng->copy_stream, ls_cuda::kStreamNonBlocking) == ls_cuda::kSuccess) {
             eng->pin_is_cuda_host = true;
-            if (cudaHostAlloc(reinterpret_cast<void **>(&eng->pin_buf), pin_bytes, cudaHostAllocDefault) != cudaSuccess) {
+            if (ls_cuda::host_alloc(reinterpret_cast<void **>(&eng->pin_buf), pin_bytes, ls_cuda::kHostAllocDefault) != ls_cuda::kSuccess) {
                 set_error(err_buf, err_cap, "failed to allocate CUDA pinned staging buffer");
                 ls_engine_free(eng);
                 return nullptr;
@@ -2230,7 +2408,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             std::memset(eng->pin_buf, 0, pin_bytes);
             eng->pin_cap = pin_bytes;
             for (int s = 0; s < 2; ++s) {
-                if (cudaEventCreateWithFlags(&eng->slot_event[s], cudaEventDisableTiming) != cudaSuccess) {
+                if (ls_cuda::event_create_with_flags(&eng->slot_event[s], ls_cuda::kEventDisableTiming) != ls_cuda::kSuccess) {
                     set_error(err_buf, err_cap, "failed to create CUDA slot event");
                     ls_engine_free(eng);
                     return nullptr;
@@ -2335,23 +2513,23 @@ void ls_engine_free(ls_engine * eng) {
         eng->model = nullptr;
     }
 
-#ifdef LAYERSTREAM_USE_CUDA
+#ifdef LAYERSTREAM_HAS_CUDA_RT
     for (int s = 0; s < 2; ++s) {
         if (eng->slot_event[s]) {
-            cudaEventDestroy(eng->slot_event[s]);
+            ls_cuda::event_destroy(eng->slot_event[s]);
             eng->slot_event[s] = nullptr;
         }
     }
     if (eng->pin_buf) {
         if (eng->pin_is_cuda_host) {
-            cudaFreeHost(eng->pin_buf);
+            ls_cuda::free_host(eng->pin_buf);
         } else {
             free_aligned_4k(eng->pin_buf);
         }
         eng->pin_buf = nullptr;
     }
     if (eng->copy_stream) {
-        cudaStreamDestroy(eng->copy_stream);
+        ls_cuda::stream_destroy(eng->copy_stream);
         eng->copy_stream = nullptr;
     }
 #else
@@ -2381,6 +2559,11 @@ void ls_engine_free(ls_engine * eng) {
     }
 
     delete eng;
+
+#ifdef __GLIBC__
+    // Return freed host allocator arenas to the OS when running in-process.
+    malloc_trim(0);
+#endif
 }
 
 void ls_engine_get_stats(const ls_engine * eng, ls_engine_stats * out) {
