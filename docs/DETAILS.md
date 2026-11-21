@@ -15,7 +15,7 @@ Both `ggml-cuda` and `ggml-vulkan` validate backend buffer ownership by checking
 3. **Real Backend Buffers (`Resident` + `Slot A` + `Slot B`):**
    - Non-layer tensors (`token_embd.weight`, `output.weight`, norms) plus early resident layers `blk.0..R-1` are packed into one real `ggml_backend_buffer_t` (`resident_buf`) loaded in bounded host chunks (`<= max_single_tensor`) to prevent 2× RAM spikes during load.
    - Streamed layers `blk.R..L-1` are aliased into two real ping-pong backend buffers (`slot_buf[0]` for even, `slot_buf[1]` for odd) sized to the single largest streamed layer.
-   - `model->hparams.no_alloc` is cleared immediately before `llama_init_from_model()` so `llama_context` allocates real Flash Attention KV cache (`Q8_0` default, or `Q4_0`/`F16`) and compute scheduler buffers.
+   - `model->hparams.no_alloc` is cleared immediately before `llama_init_from_model()` so `llama_context` allocates real Flash Attention KV cache (`Q8_0` default, or `Q4_0`/`F16`) and compute scheduler buffers (upstream: `ggml-org/llama.cpp#31141`, already merged upstream; remove once pinned `llama.cpp` is bumped past `#31141`).
 4. **Race-Free Tensor-Pointer `cb_eval` Hook & Single-Owner I/O Worker:**
    - Every streamed `ggml_tensor*` is mapped O(1) to its layer index (`tensor_to_layer`).
    - A single I/O worker thread exclusively owns `pin_buf`, the dedicated `cudaStreamNonBlocking` copy stream, and `LayerIoPool` scratch buffers, handling both background dense prefetches and priority MoE expert slice jobs cleanly without data races. (On Vulkan, `ggml_backend_tensor_set` runs on the eval thread inside `cb_eval(ask=false)` while the worker handles `pread` only.)

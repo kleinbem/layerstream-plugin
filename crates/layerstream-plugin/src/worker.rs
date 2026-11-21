@@ -1014,7 +1014,8 @@ async fn coord_proxy_inference(
 
             // For `--idle-timeout-secs 0` (when no other request is queued behind us),
             // synchronously reap the worker BEFORE dropping `tx` (HTTP chunked EOF) so
-            // callers like Mesh-LLM `exclusive_gpu` see 0 MB VRAM the instant the stream ends.
+            // callers like Mesh-LLM `exclusive_gpu` (tracking: Mesh-LLM/mesh-llm#3174)
+            // see 0 MB VRAM the instant the stream ends.
             if (evict_immediately && state_bg.activity.in_flight.load(Ordering::SeqCst) <= 1)
                 || shutdown_hit
             {

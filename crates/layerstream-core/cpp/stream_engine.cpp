@@ -1612,6 +1612,8 @@ static bool select_target_buft(
             if (ls_cuda::device_get_attribute(&integrated, ls_cuda::kDevAttrIntegrated, 0) == ls_cuda::kSuccess &&
                 integrated != 0) {
                 out_is_unified_memory = true;
+                // upstream: ggml-org/llama.cpp#15034 (Tegra CUDA_Host UMA is currently disabled
+                // upstream; once re-enabled, uma_zero_copy activates here automatically).
                 ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(chosen);
                 if (host_buft != nullptr && ggml_backend_dev_supports_buft(chosen, host_buft)) {
                     out_buft = host_buft;
@@ -2433,7 +2435,9 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     }
 
     // 7. Critical: clear hparams.no_alloc BEFORE llama_init_from_model so
-    // llama_context allocates real KV cache + compute scheduler buffers!
+    // llama_context allocates real KV cache + compute scheduler buffers.
+    // upstream: ggml-org/llama.cpp#31141 (merged; removes llama_hparams::no_alloc,
+    // drop this mutation once pinned llama.cpp is bumped past #31141).
     eng->model->hparams.no_alloc = false;
 
     llama_context_params cparams = llama_context_default_params();
