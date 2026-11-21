@@ -135,6 +135,35 @@ fn main() {
         cfg.build_target("llama");
     }
 
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    if dynamic_backends && target_os == "linux" {
+        // Ensure staged `libggml-*.so` MODULE/SHARED libraries resolve sibling `libggml-base.so`
+        // via `$ORIGIN` (relocatable tarballs) and, on NixOS, the host GPU driver directory
+        // `/run/opengl-driver/lib` without requiring `LD_LIBRARY_PATH`.
+        let has_opengl_dir = Path::new("/run/opengl-driver/lib").is_dir();
+        let build_rpath = if has_opengl_dir {
+            "$ORIGIN;/run/opengl-driver/lib"
+        } else {
+            "$ORIGIN"
+        };
+        cfg.define("CMAKE_BUILD_RPATH", build_rpath);
+        cfg.define("CMAKE_INSTALL_RPATH", build_rpath);
+        for var in ["CMAKE_SHARED_LINKER_FLAGS", "CMAKE_MODULE_LINKER_FLAGS"] {
+            let mut flags = env::var(var).unwrap_or_default();
+            if !flags.contains("$ORIGIN") {
+                if !flags.is_empty() {
+                    flags.push(' ');
+                }
+                flags.push_str("-Wl,-rpath,$ORIGIN");
+            }
+            if has_opengl_dir && !flags.contains("/run/opengl-driver/lib") {
+                flags.push_str(" -Wl,-rpath,/run/opengl-driver/lib");
+            }
+            cfg.define(var, flags);
+        }
+    }
+
     if use_cuda {
         if let Ok(archs) = env::var("CMAKE_CUDA_ARCHITECTURES") {
             cfg.define("CMAKE_CUDA_ARCHITECTURES", archs);
@@ -148,17 +177,14 @@ fn main() {
         if let Ok(host_cc) = env::var("CMAKE_CUDA_HOST_COMPILER") {
             cfg.define("CMAKE_CUDA_HOST_COMPILER", host_cc);
         }
-        // In dynamic-backends builds on NixOS, ensure `libggml-cuda.so` resolves the host
-        // driver `/run/opengl-driver/lib/libcuda.so.1` without requiring `LD_LIBRARY_PATH`.
-        if dynamic_backends && Path::new("/run/opengl-driver/lib").is_dir() {
-            let mut flags = env::var("CMAKE_SHARED_LINKER_FLAGS").unwrap_or_default();
-            if !flags.contains("/run/opengl-driver/lib") {
-                if !flags.is_empty() {
-                    flags.push(' ');
-                }
-                flags.push_str("-Wl,-rpath,/run/opengl-driver/lib");
-            }
-            cfg.define("CMAKE_SHARED_LINKER_FLAGS", flags);
+        // On NixOS with a live host CUDA driver, point CMake's `FindCUDAToolkit` at the real
+        // driver instead of `lib/stubs/libcuda.so` so `lib/stubs` never enters `libggml-cuda.so`'s
+        // DT_RUNPATH and shadows the real driver when launched outside `nix develop .#cuda`.
+        if Path::new("/run/opengl-driver/lib/libcuda.so.1").exists() {
+            cfg.define(
+                "CUDA_cuda_driver_LIBRARY",
+                "/run/opengl-driver/lib/libcuda.so.1",
+            );
         }
     }
 
@@ -231,8 +257,6 @@ fn main() {
     }
 
     cc_build.compile("layerstream_cpp");
-
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
     if dynamic_backends {
         let mut shared_libs = Vec::new();
