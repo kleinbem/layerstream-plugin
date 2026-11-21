@@ -25,71 +25,39 @@ pub struct ParsedAssistantOutput {
     pub tool_calls: Vec<OpenAiToolCall>,
 }
 
-/// Splits `<think>...</think>` and `<tool_call>...</tool_call>` blocks out of raw assistant text.
+/// Splits `<think>...</think>` and `<tool_call>...</tool_call>` blocks out of raw assistant text
+/// using the exact same single-pass state machine as streaming mode so tags inside JSON tool
+/// arguments are never stripped or prematurely terminated.
 pub fn parse_assistant_output(raw: &str) -> ParsedAssistantOutput {
+    let mut parser = StreamTagParser::new();
+    let mut events = parser.push(raw);
+    events.extend(parser.flush());
+
+    let mut visible = String::with_capacity(raw.len());
     let mut reasoning_parts = Vec::new();
-    let mut after_think = String::with_capacity(raw.len());
-    let mut cursor = raw;
-
-    while let Some(start) = cursor.find("<think>") {
-        after_think.push_str(&cursor[..start]);
-        let rest = &cursor[start + "<think>".len()..];
-        if let Some(end) = rest.find("</think>") {
-            let block = rest[..end].trim();
-            if !block.is_empty() {
-                reasoning_parts.push(block.to_string());
-            }
-            cursor = &rest[end + "</think>".len()..];
-        } else {
-            let block = rest.trim();
-            if !block.is_empty() {
-                reasoning_parts.push(block.to_string());
-            }
-            cursor = "";
-            break;
-        }
-    }
-    after_think.push_str(cursor);
-
     let mut tool_calls = Vec::new();
-    let mut visible = String::with_capacity(after_think.len());
-    let mut tcur = after_think.as_str();
-    let mut call_idx = 0usize;
 
-    while let Some(start) = tcur.find("<tool_call>") {
-        visible.push_str(&tcur[..start]);
-        let rest = &tcur[start + "<tool_call>".len()..];
-        if let Some(end) = rest.find("</tool_call>") {
-            let body = rest[..end].trim();
-            if let Ok(val) = serde_json::from_str::<Value>(body)
-                && let Some(name) = val.get("name").and_then(Value::as_str)
-            {
-                let args_val = val
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Object(Default::default()));
-                let arguments = match args_val {
-                    Value::String(s) => s,
-                    other => other.to_string(),
-                };
-                call_idx += 1;
-                tool_calls.push(OpenAiToolCall {
-                    id: format!("call_ls_{call_idx}"),
-                    kind: "function".to_string(),
-                    function: OpenAiFunctionCall {
-                        name: name.to_string(),
-                        arguments,
-                    },
-                });
+    for ev in events {
+        match ev {
+            StreamDelta::Content(s) => visible.push_str(&s),
+            StreamDelta::Reasoning(s) => {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    reasoning_parts.push(trimmed.to_string());
+                }
             }
-            tcur = &rest[end + "</tool_call>".len()..];
-        } else {
-            visible.push_str(&tcur[start..]);
-            tcur = "";
-            break;
+            StreamDelta::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => tool_calls.push(OpenAiToolCall {
+                id,
+                kind: "function".to_string(),
+                function: OpenAiFunctionCall { name, arguments },
+            }),
         }
     }
-    visible.push_str(tcur);
 
     let reasoning_content = if reasoning_parts.is_empty() {
         None
@@ -232,11 +200,15 @@ impl StreamTagParser {
                     }
                 }
                 TagState::InToolCall => {
-                    if let Some(end) = self.pending.find("</tool_call>") {
-                        self.tool_buf.push_str(&self.pending[..end]);
-                        self.pending.drain(..end + "</tool_call>".len());
-                        let body = self.tool_buf.trim().to_string();
+                    if !self.pending.is_empty() {
+                        self.tool_buf.push_str(&self.pending);
+                        self.pending.clear();
+                    }
+                    if let Some(end) = find_tool_call_close(&self.tool_buf) {
+                        let body = self.tool_buf[..end].trim().to_string();
+                        let rest = self.tool_buf[end + "</tool_call>".len()..].to_string();
                         self.tool_buf.clear();
+                        self.pending = rest;
                         self.state = TagState::Normal;
                         if let Ok(val) = serde_json::from_str::<Value>(&body)
                             && let Some(name) = val.get("name").and_then(Value::as_str)
@@ -263,12 +235,6 @@ impl StreamTagParser {
                             )));
                         }
                     } else {
-                        let hold = partial_tag_suffix(&self.pending, &["</tool_call>"]);
-                        let move_len = self.pending.len() - hold;
-                        if move_len > 0 {
-                            self.tool_buf.push_str(&self.pending[..move_len]);
-                            self.pending.drain(..move_len);
-                        }
                         break;
                     }
                 }
@@ -303,6 +269,51 @@ impl StreamTagParser {
         self.state = TagState::Normal;
         out
     }
+}
+
+/// Finds the closing `</tool_call>` tag outside of JSON string literals so that a
+/// `"</tool_call>"` substring inside a tool argument value does not truncate the call.
+fn find_tool_call_close(buf: &str) -> Option<usize> {
+    const CLOSE: &[u8] = b"</tool_call>";
+    let bytes = buf.as_bytes();
+    let trimmed_start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    if trimmed_start >= bytes.len() {
+        return None;
+    }
+    if bytes[trimmed_start] != b'{' {
+        return buf.find("</tool_call>");
+    }
+
+    let mut in_string = false;
+    let mut escape = false;
+    let mut i = trimmed_start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if b == b'<' && bytes[i..].starts_with(CLOSE) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Returns the byte length of the longest suffix of `s` that is a proper prefix of any tag.
@@ -377,5 +388,67 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "ls");
         assert!(parser.has_tool_calls());
+    }
+
+    #[test]
+    fn preserves_think_and_close_tags_inside_tool_arguments_in_both_modes() {
+        let raw = r#"<tool_call>{"name":"write_note","arguments":{"text":"<think>note</think> and </tool_call> literal"}}</tool_call>done"#;
+
+        // Non-streaming parity
+        let parsed = parse_assistant_output(raw);
+        assert!(parsed.reasoning_content.is_none());
+        assert_eq!(parsed.content, "done");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].function.name, "write_note");
+        assert_eq!(
+            parsed.tool_calls[0].function.arguments,
+            r#"{"text":"<think>note</think> and </tool_call> literal"}"#
+        );
+
+        // Streaming parity with split closing tag
+        let mut parser = StreamTagParser::new();
+        let pieces = [
+            "<tool_call>{\"name\":\"write_note\",\"arguments\":{\"text\":\"<think>note</think> and </tool_",
+            "call> literal\"}}</tool",
+            "_call>done",
+        ];
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut calls = Vec::new();
+        for p in pieces {
+            for ev in parser.push(p) {
+                match ev {
+                    StreamDelta::Content(s) => content.push_str(&s),
+                    StreamDelta::Reasoning(s) => reasoning.push_str(&s),
+                    StreamDelta::ToolCall {
+                        name, arguments, ..
+                    } => calls.push((name, arguments)),
+                }
+            }
+        }
+        for ev in parser.flush() {
+            if let StreamDelta::Content(s) = ev {
+                content.push_str(&s);
+            }
+        }
+        assert!(reasoning.is_empty());
+        assert_eq!(content, "done");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "write_note");
+        assert_eq!(
+            calls[0].1,
+            r#"{"text":"<think>note</think> and </tool_call> literal"}"#
+        );
+    }
+
+    #[test]
+    fn malformed_tool_call_is_preserved_in_content() {
+        let raw = "before <tool_call>{not valid json</tool_call> after";
+        let parsed = parse_assistant_output(raw);
+        assert!(parsed.tool_calls.is_empty());
+        assert_eq!(
+            parsed.content,
+            "before <tool_call>{not valid json</tool_call> after"
+        );
     }
 }

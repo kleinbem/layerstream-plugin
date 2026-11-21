@@ -31,14 +31,15 @@ impl NgramProposer {
     /// (`max_n` down to `min_n`) and returns up to `limit` continuation tokens.
     pub fn propose(&self, history: &[i32], limit: usize) -> Vec<i32> {
         let cap = limit.min(self.max_draft);
-        if cap == 0 || history.len() < self.min_n + 1 {
+        if cap == 0 || self.min_n == 0 || history.len() < self.min_n + 1 {
+            return Vec::new();
+        }
+        let max_n = self.max_n.min(history.len() - 1);
+        if max_n < self.min_n {
             return Vec::new();
         }
 
-        for n in (self.min_n..=self.max_n).rev() {
-            if history.len() <= n {
-                continue;
-            }
+        for n in (self.min_n..=max_n).rev() {
             let needle = &history[history.len() - n..];
             // Search backwards for the most recent earlier occurrence of `needle`.
             let search_end = history.len() - n;
@@ -61,7 +62,7 @@ impl NgramProposer {
 pub struct DraftModelProposer {
     draft: StreamEngine,
     draft_pos: i32,
-    synced_len: usize,
+    synced_tokens: Vec<i32>,
     max_draft: usize,
     draft_batch: usize,
 }
@@ -77,7 +78,7 @@ impl DraftModelProposer {
         Ok(Self {
             draft,
             draft_pos: 0,
-            synced_len: 0,
+            synced_tokens: Vec::new(),
             max_draft: max_draft.max(1),
             draft_batch,
         })
@@ -90,7 +91,7 @@ impl DraftModelProposer {
     pub fn reset(&mut self) {
         self.draft.kv_clear();
         self.draft_pos = 0;
-        self.synced_len = 0;
+        self.synced_tokens.clear();
     }
 
     /// Preserves the shared KV prefix across multi-turn conversations when `prefix_len > 0`.
@@ -99,11 +100,11 @@ impl DraftModelProposer {
             self.reset();
             return;
         }
-        let target = prefix_len.min(self.synced_len);
-        if target < self.synced_len {
+        let target = prefix_len.min(self.synced_tokens.len());
+        if target < self.synced_tokens.len() {
             if self.draft.kv_trim(target as i32) {
                 self.draft_pos = target as i32;
-                self.synced_len = target;
+                self.synced_tokens.truncate(target);
             } else {
                 self.reset();
             }
@@ -117,11 +118,19 @@ impl DraftModelProposer {
             return Ok(Vec::new());
         }
 
-        // If target trimmed/diverged or reset, roll draft KV back cleanly.
-        if history.len() < self.synced_len {
-            if self.draft.kv_trim(history.len() as i32) {
-                self.draft_pos = history.len() as i32;
-                self.synced_len = history.len();
+        // Synchronize draft KV strictly by token identity (longest common prefix), not just length.
+        let common = self
+            .synced_tokens
+            .iter()
+            .zip(history.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common < self.synced_tokens.len() {
+            if common == 0 {
+                self.reset();
+            } else if self.draft.kv_trim(common as i32) {
+                self.draft_pos = common as i32;
+                self.synced_tokens.truncate(common);
             } else {
                 self.reset();
             }
@@ -141,8 +150,8 @@ impl DraftModelProposer {
 
         // Feed any newly committed tokens (including the target's latest token) into draft KV.
         let mut next_draft = 0i32;
-        if self.synced_len < history.len() {
-            let delta = &history[self.synced_len..];
+        if self.synced_tokens.len() < history.len() {
+            let delta = &history[self.synced_tokens.len()..];
             for chunk in delta.chunks(self.draft_batch) {
                 match self.draft.eval_greedy(chunk, self.draft_pos) {
                     Ok(tok) => {
@@ -155,13 +164,13 @@ impl DraftModelProposer {
                     }
                 }
             }
-            self.synced_len = history.len();
+            self.synced_tokens.extend_from_slice(delta);
         } else {
             return Ok(Vec::new());
         }
 
         let max_by_ctx = if draft_n_ctx > 0 {
-            draft_n_ctx.saturating_sub(self.synced_len)
+            draft_n_ctx.saturating_sub(self.synced_tokens.len())
         } else {
             cap
         };
@@ -191,9 +200,9 @@ impl DraftModelProposer {
         }
 
         // Trim speculative draft tokens back out so next call syncs strictly from committed history.
-        if self.draft_pos > self.synced_len as i32 {
-            if self.draft.kv_trim(self.synced_len as i32) {
-                self.draft_pos = self.synced_len as i32;
+        if self.draft_pos > self.synced_tokens.len() as i32 {
+            if self.draft.kv_trim(self.synced_tokens.len() as i32) {
+                self.draft_pos = self.synced_tokens.len() as i32;
             } else {
                 self.reset();
             }

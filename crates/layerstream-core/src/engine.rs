@@ -967,8 +967,8 @@ impl StreamEngine {
         // Flush any safe held-back suffix bytes when generation ended without hitting a stop sequence.
         if finish_reason != "cancelled" {
             let tail = stop_filter.flush();
-            if !tail.is_empty() {
-                let _ = on_token(last_emitted_tok, &tail);
+            if !tail.is_empty() && !on_token(last_emitted_tok, &tail) {
+                finish_reason = "cancelled".to_string();
             }
         }
 

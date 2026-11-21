@@ -61,7 +61,7 @@ Add to `~/.mesh-llm/config.toml` (pair with `--vram-budget-mb auto` and `--idle-
 
 ```toml
 [[plugin]]
-name = "layerstream-plugin"
+name = "layerstream"
 args = [
   "--model", "/models/Qwen2.5-14B-Instruct-Q4_K_M.gguf",
   "--draft-model", "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf",

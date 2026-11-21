@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use crate::config::DeferredPullPlan;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_PLUGIN_NAME: &str = "layerstream-plugin";
+const DEFAULT_PLUGIN_NAME: &str = "layerstream";
 const ENDPOINT_ID: &str = "layerstream";
 
 pub fn build_plugin(
@@ -46,7 +46,7 @@ pub fn build_plugin(
                 "Layerstream GGUF NVMe Streaming Provider",
                 "Runs oversized dense & MoE GGUF models via GPU layer streaming with 0 MB idle model weights.",
                 Some(
-                    "Configure [[plugin]] name = \"layerstream-plugin\" with args such as \
+                    "Configure [[plugin]] name = \"layerstream\" with args such as \
                      [\"--model\", \"hf://org/repo:model.gguf\"].",
                 ),
             ),
@@ -101,6 +101,14 @@ pub fn build_plugin(
                 let Some(listener) = listener_slot.lock().await.take() else {
                     return Ok(());
                 };
+                let deferred_plan = deferred_slot.lock().await.take();
+                if let Some(ref plan) = deferred_plan {
+                    startup_state.set_loading_status(Some(format!(
+                        "pulling {} model(s) from Hugging Face",
+                        plan.models.len()
+                    )));
+                }
+
                 let shutdown_rx = shutdown_rx_slot.lock().await.take();
                 let serve_state = startup_state.clone();
                 let handle = tokio::spawn(async move {
@@ -123,12 +131,8 @@ pub fn build_plugin(
                 });
                 *server_handle_slot.lock().await = Some(handle);
 
-                if let Some(plan) = deferred_slot.lock().await.take() {
+                if let Some(plan) = deferred_plan {
                     let pull_state = startup_state;
-                    pull_state.set_loading_status(Some(format!(
-                        "pulling {} model(s) from Hugging Face",
-                        plan.models.len()
-                    )));
                     tokio::task::spawn_blocking(move || match plan.execute() {
                         Ok(registry) => {
                             let count = registry.len();
@@ -141,8 +145,7 @@ pub fn build_plugin(
                         }
                         Err(err) => {
                             tracing::error!("background Hugging Face model pull failed: {err:#}");
-                            pull_state.set_loading_error(Some(format!("{err:#}")));
-                            pull_state.set_loading_status(None);
+                            pull_state.set_loading_failed(format!("{err:#}"));
                         }
                     });
                 }

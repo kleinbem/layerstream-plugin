@@ -75,16 +75,18 @@ jobs:
       - name: Package and smoke-test Unix plugin archive
         if: matrix.archive == 'tar.gz'
         run: |
-          stage="layerstream-plugin-${{ matrix.target }}"
-          root="${stage}/layerstream-plugin"
+          version=$(awk -F'"' '/^version =/{print $2; exit}' plugin.toml)
+          stable="layerstream-${{ matrix.target }}"
+          versioned="layerstream-${version}-${{ matrix.target }}"
+          root="${stable}/layerstream"
           mkdir -p "$root"
-          cp target/release/layerstream-plugin "$root/layerstream-plugin"
+          cp target/release/layerstream-plugin "$root/layerstream"
           for lib in target/release/libggml*.so* target/release/libllama*.so* target/release/libggml*.dylib target/release/libllama*.dylib; do
             [ -e "$lib" ] && cp "$lib" "$root/"
           done
           if [ "${{ runner.os }}" = "macOS" ]; then
-            codesign --force --sign - "$root/layerstream-plugin"
-            codesign --verify --strict "$root/layerstream-plugin"
+            codesign --force --sign - "$root/layerstream"
+            codesign --verify --strict "$root/layerstream"
             for lib in "$root"/*.dylib; do
               if [ -e "$lib" ]; then
                 codesign --force --sign - "$lib"
@@ -96,39 +98,45 @@ jobs:
           cp README.md "$root/README.md"
           cp LICENSE "$root/LICENSE"
           cp -r licenses "$root/licenses"
-          tar czf "${stage}.tar.gz" -C "$stage" layerstream-plugin
-          sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          tar czf "${stable}.tar.gz" -C "$stable" layerstream
+          cp "${stable}.tar.gz" "${versioned}.tar.gz"
+          sha256sum "${stable}.tar.gz" > "${stable}.tar.gz.sha256"
+          sha256sum "${versioned}.tar.gz" > "${versioned}.tar.gz.sha256"
           mkdir -p smoke-extract
-          tar xzf "${stage}.tar.gz" -C smoke-extract
-          ./smoke-extract/layerstream-plugin/layerstream-plugin --help
+          tar xzf "${stable}.tar.gz" -C smoke-extract
+          ./smoke-extract/layerstream/layerstream --help
 
       - name: Package and smoke-test Windows plugin archive
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $stage = "layerstream-plugin-${{ matrix.target }}"
-          $root = "$stage\layerstream-plugin"
+          $version = (Select-String -Path plugin.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $stable = "layerstream-${{ matrix.target }}"
+          $versioned = "layerstream-$version-${{ matrix.target }}"
+          $root = "$stable\layerstream"
           New-Item -ItemType Directory -Force -Path $root | Out-Null
-          Copy-Item target\release\layerstream-plugin.exe "$root\layerstream-plugin.exe"
+          Copy-Item target\release\layerstream-plugin.exe "$root\layerstream.exe"
           Get-ChildItem target\release\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination "$root"
           Copy-Item plugin.toml "$root\plugin.toml"
           Copy-Item README.md "$root\README.md"
           Copy-Item LICENSE "$root\LICENSE"
           Copy-Item -Recurse licenses "$root\licenses"
-          Compress-Archive -Path "$root" -DestinationPath "$stage.zip" -Force
-          $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $stage.zip" | Out-File -Encoding ascii "$stage.zip.sha256"
-          Expand-Archive -Path "$stage.zip" -DestinationPath "smoke-extract" -Force
-          .\smoke-extract\layerstream-plugin\layerstream-plugin.exe --help
+          Compress-Archive -Path "$root" -DestinationPath "$stable.zip" -Force
+          Copy-Item "$stable.zip" "$versioned.zip" -Force
+          $hash = (Get-FileHash "$stable.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stable.zip" | Out-File -Encoding ascii "$stable.zip.sha256"
+          "$hash  $versioned.zip" | Out-File -Encoding ascii "$versioned.zip.sha256"
+          Expand-Archive -Path "$stable.zip" -DestinationPath "smoke-extract" -Force
+          .\smoke-extract\layerstream\layerstream.exe --help
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: layerstream-plugin-${{ matrix.target }}
+          name: layerstream-${{ matrix.target }}
           path: |
-            layerstream-plugin-*.tar.gz
-            layerstream-plugin-*.tar.gz.sha256
-            layerstream-plugin-*.zip
-            layerstream-plugin-*.zip.sha256
+            layerstream-*.tar.gz
+            layerstream-*.tar.gz.sha256
+            layerstream-*.zip
+            layerstream-*.zip.sha256
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')

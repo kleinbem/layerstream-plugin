@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cc",
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-plugin"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",

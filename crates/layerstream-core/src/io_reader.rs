@@ -1158,14 +1158,22 @@ pub fn probe_storage_mib_per_s(
     } else {
         None
     };
-    let direct_active = direct.is_some();
+    let mut direct_active = direct.is_some();
     let probe_bytes = (file_len as usize).min(16 * 1024 * 1024);
     let aligned_len = align_up(probe_bytes as u64, DIRECT_IO_ALIGN) as usize;
     let mut buf = AlignedBuf::new(aligned_len)?;
     let slice = buf.as_mut_slice(aligned_len);
-    let t0 = std::time::Instant::now();
+    let mut t0 = std::time::Instant::now();
     let n = if let Some(ref df) = direct {
-        pread_exact_or_eof(df, slice, 0)?
+        match pread_exact_or_eof(df, slice, 0) {
+            Ok(n) => n,
+            Err(_) => {
+                // Some filesystems (e.g. FUSE/overlayfs) accept O_DIRECT on open() but fail on read().
+                direct_active = false;
+                t0 = std::time::Instant::now();
+                pread_exact_or_eof(&buffered, &mut slice[..probe_bytes], 0)?
+            }
+        }
     } else {
         pread_exact_or_eof(&buffered, &mut slice[..probe_bytes], 0)?
     };

@@ -13,8 +13,18 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<()> {
     serve_with_state(listener, state).await
 }
 
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 pub async fn serve_with_state(listener: TcpListener, state: AppState) -> Result<()> {
-    state.spawn_reaper();
+    let _reaper = AbortOnDrop(state.spawn_reaper());
     let app = build_router(state);
     axum::serve(listener, app).await?;
     Ok(())

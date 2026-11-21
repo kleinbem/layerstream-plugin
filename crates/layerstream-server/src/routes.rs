@@ -129,6 +129,13 @@ impl AppState {
         }
     }
 
+    /// Atomically publishes a background pull failure before clearing `loading_status`,
+    /// avoiding a transient window where neither status nor error is visible.
+    pub fn set_loading_failed(&self, err: String) {
+        self.set_loading_error(Some(err));
+        self.set_loading_status(None);
+    }
+
     pub fn loading_status(&self) -> Option<String> {
         self.loading_status.read().ok().and_then(|g| g.clone())
     }
@@ -152,13 +159,13 @@ impl AppState {
         }
     }
 
-    pub fn spawn_reaper(&self) {
+    pub fn spawn_reaper(&self) -> Option<tokio::task::JoinHandle<()>> {
         if self.config.idle_timeout.is_zero() {
-            return;
+            return None;
         }
         let residency = self.residency.clone();
         let shutdown = self.shutdown.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
@@ -171,7 +178,7 @@ impl AppState {
                     );
                 }
             }
-        });
+        }))
     }
 
     fn load_pair(&self, entry: &ModelEntry) -> Result<LoadedPair> {
@@ -182,7 +189,9 @@ impl AppState {
         cfg.resident_layers = self.config.resident_layers;
         cfg.vram_budget_auto = self.config.vram_budget_auto;
         let draft_reserve = entry.draft_path.as_ref().map_or(0, |draft_path| {
-            let draft_bytes = std::fs::metadata(draft_path).map(|m| m.len()).unwrap_or(0);
+            let draft_bytes = layerstream_core::GgufIndex::open(draft_path)
+                .map(|idx| idx.meta.total_file_bytes)
+                .unwrap_or_else(|_| std::fs::metadata(draft_path).map(|m| m.len()).unwrap_or(0));
             // Account for draft weights + compute buffer (~64 MiB) + draft KV cache scaled by ctx & kv type.
             let kv_scale_num: u64 = match self.config.kv_cache_type {
                 KvCacheType::F16 => 4,

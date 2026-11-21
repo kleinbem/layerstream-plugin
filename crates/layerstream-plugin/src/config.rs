@@ -232,7 +232,14 @@ pub fn run_preflight_checks(
     allow_slow: bool,
     print_report: bool,
 ) -> Result<()> {
-    let gpu_mem = StreamEngine::probe_gpu_memory(use_gpu);
+    // Only initialize the GPU driver during explicit `check` reports; in `serve` / `plugin`
+    // startup keep cold GPU memory strictly at 0 MB (no ~325 MiB CUDA primary context pinned
+    // while idle) so resident runtimes like Mesh-LLM Skippy have full headroom.
+    let gpu_mem = if print_report {
+        StreamEngine::probe_gpu_memory(use_gpu)
+    } else {
+        None
+    };
     if print_report {
         match gpu_mem {
             Some((free_b, total_b)) => {
@@ -258,10 +265,16 @@ pub fn run_preflight_checks(
             .map(|(free_b, _)| size_bytes.saturating_add(768 * 1024 * 1024) < free_b)
             .unwrap_or(false);
 
-        let (mib_s, direct_ok) = probe_storage_mib_per_s(&entry.path, true).unwrap_or((0.0, false));
+        let probe_res = probe_storage_mib_per_s(&entry.path, true).ok();
+        let (mib_s, direct_ok) = probe_res.unwrap_or((0.0, false));
         let is_oversize = size_bytes >= OVERSIZE_GUARD_BYTES && !fits_in_vram;
 
-        if is_oversize && use_gpu && mib_s > 0.0 && mib_s < MIN_STREAMING_STORAGE_MIB_S {
+        if is_oversize
+            && use_gpu
+            && probe_res.is_some()
+            && mib_s > 0.0
+            && mib_s < MIN_STREAMING_STORAGE_MIB_S
+        {
             let msg = format!(
                 "storage for '{}' ({size_gib:.1} GiB) measured only {mib_s:.0} MiB/s \
                  (minimum recommended {MIN_STREAMING_STORAGE_MIB_S:.0} MiB/s NVMe; \

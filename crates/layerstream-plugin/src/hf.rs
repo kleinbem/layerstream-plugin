@@ -72,7 +72,16 @@ impl HfSpec {
             (repo_slice, clean_file.trim_start_matches('/'))
         };
 
-        if !repo_id.contains('/') || repo_id.starts_with('/') || repo_id.ends_with('/') {
+        if !repo_id.contains('/')
+            || repo_id.starts_with('/')
+            || repo_id.ends_with('/')
+            || repo_id.contains("..")
+            || repo_id.contains('\\')
+            || repo_id.contains(':')
+            || repo_id
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
             bail!("invalid Hugging Face repo id '{repo_id}' in '{uri}' (expected org/repo)");
         }
         if filename.is_empty()
@@ -539,7 +548,10 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
             }
             if range_from > 0 {
                 req = req.header("Range", &format!("bytes={range_from}-"));
-                if let Some(etag) = if_range {
+                // RFC 9110 §13.1.5 forbids weak ETags (`W/"..."`) in `If-Range`.
+                if let Some(etag) = if_range
+                    && !etag.trim_start().starts_with("W/")
+                {
                     req = req.header("If-Range", etag);
                 }
             }

@@ -56,16 +56,16 @@ jobs:
           LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
         run: |
           cargo build --locked --release -p layerstream-plugin --features vulkan,dynamic-backends
-          stage="layerstream-plugin-x86_64-unknown-linux-gnu"
-          root="${stage}/layerstream-plugin"
+          stage="layerstream-x86_64-unknown-linux-gnu"
+          root="${stage}/layerstream"
           mkdir -p "$root"
-          cp target/release/layerstream-plugin "$root/layerstream-plugin"
+          cp target/release/layerstream-plugin "$root/layerstream"
           for lib in target/release/libggml*.so* target/release/libllama*.so*; do
             [ -e "$lib" ] && cp "$lib" "$root/"
           done
           cp plugin.toml README.md LICENSE "$root/"
           cp -r licenses "$root/licenses"
-          tar czf "${stage}.tar.gz" -C "$stage" layerstream-plugin
+          tar czf "${stage}.tar.gz" -C "$stage" layerstream
           mkdir -p smoke-extract
           tar xzf "${stage}.tar.gz" -C smoke-extract
-          ./smoke-extract/layerstream-plugin/layerstream-plugin --help
+          ./smoke-extract/layerstream/layerstream --help
