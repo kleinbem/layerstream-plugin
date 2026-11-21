@@ -174,6 +174,8 @@ impl HfSpec {
     }
 }
 
+// tracking: Mesh-LLM/mesh-llm#3192 (mesh-llm 0.80.0 does not yet pass a host model/cache
+// directory env var to spawned plugins, so fall back to LAYERSTREAM_CACHE_DIR / XDG cache).
 pub fn default_cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LAYERSTREAM_CACHE_DIR")
         && !dir.trim().is_empty()
@@ -396,18 +398,56 @@ fn write_part_meta(path: &Path, meta: &PartMeta) {
     let _ = fs::write(path, body);
 }
 
-fn extract_expected_sha256(headers: &ureq::http::HeaderMap) -> Option<String> {
-    for key in ["x-linked-etag", "etag"] {
-        if let Some(raw) = headers.get(key).and_then(|v| v.to_str().ok()) {
-            let cleaned = raw
-                .trim()
-                .trim_start_matches("W/")
-                .trim_matches('"')
-                .to_ascii_lowercase();
-            if cleaned.len() == 64 && cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Some(cleaned);
-            }
-        }
+fn extract_header_sha256(headers: &ureq::http::HeaderMap, key: &str) -> Option<String> {
+    let raw = headers.get(key).and_then(|v| v.to_str().ok())?;
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    if cleaned.len() == 64 && cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(cleaned)
+    } else {
+        None
+    }
+}
+
+fn url_origin(url: &str) -> Option<String> {
+    let parsed = url.parse::<ureq::http::Uri>().ok()?;
+    let scheme = parsed.scheme_str()?;
+    let authority = parsed.authority()?.as_str();
+    Some(format!("{scheme}://{authority}"))
+}
+
+fn resolve_redirect_url(base_url: &str, location: &str) -> Result<String> {
+    let loc = location.trim();
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        return Ok(loc.to_string());
+    }
+    let origin = url_origin(base_url).ok_or_else(|| {
+        anyhow::anyhow!("cannot resolve relative redirect '{loc}' against '{base_url}'")
+    })?;
+    if loc.starts_with('/') {
+        Ok(format!("{origin}{loc}"))
+    } else {
+        Ok(format!("{origin}/{loc}"))
+    }
+}
+
+fn extract_expected_sha256(
+    headers: &ureq::http::HeaderMap,
+    hub_redirected: bool,
+    hub_sha256: Option<&str>,
+) -> Option<String> {
+    if let Some(sha) = hub_sha256 {
+        return Some(sha.to_string());
+    }
+    if let Some(sha) = extract_header_sha256(headers, "x-linked-etag") {
+        return Some(sha);
+    }
+    // Never treat a redirected CDN's ETag (e.g., HF Xet-bridge CAS hash) as file SHA-256.
+    if !hub_redirected {
+        return extract_header_sha256(headers, "etag");
     }
     None
 }
@@ -522,28 +562,41 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
     };
 
     let url = spec.download_url();
+    let initial_origin = url_origin(&url);
     let read_timeout_secs = std::env::var("LAYERSTREAM_HF_READ_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_READ_TIMEOUT_SECS)
         .max(1);
 
+    // Handle redirects manually so we capture the Hub's 302 `X-Linked-Etag` (authoritative
+    // LFS SHA-256) before following redirects to CDNs such as Xet-bridge whose 200 `ETag`
+    // is a 64-hex CAS identifier rather than the file's SHA-256.
     let agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .max_redirects(0)
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(read_timeout_secs)))
         .timeout_recv_body(Some(Duration::from_secs(read_timeout_secs)))
-        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::SameHost)
         .build()
         .new_agent();
 
-    let send_get =
-        |range_from: u64, if_range: Option<&str>| -> Result<ureq::http::Response<ureq::Body>> {
-            let mut req = agent.get(&url).header(
+    let send_get = |range_from: u64,
+                    if_range: Option<&str>|
+     -> Result<(ureq::http::Response<ureq::Body>, bool, Option<String>)> {
+        let mut current_url = url.clone();
+        let mut redirected = false;
+        let mut hub_sha256: Option<String> = None;
+
+        for _hop in 0..10 {
+            let mut req = agent.get(&current_url).header(
                 "User-Agent",
                 concat!("layerstream-plugin/", env!("CARGO_PKG_VERSION")),
             );
-            if let Some(tok) = token {
+            // Send Authorization only to the original Hub origin (never to redirected CDNs).
+            if let Some(tok) = token
+                && url_origin(&current_url) == initial_origin
+            {
                 req = req.header("Authorization", &format!("Bearer {tok}"));
             }
             if range_from > 0 {
@@ -555,17 +608,33 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
                     req = req.header("If-Range", etag);
                 }
             }
-            req.call()
-                .with_context(|| format!("HTTP GET failed for {url}"))
-        };
+            let resp = req
+                .call()
+                .with_context(|| format!("HTTP GET failed for {current_url}"))?;
+            let code = resp.status().as_u16();
+            if matches!(code, 301 | 302 | 303 | 307 | 308)
+                && let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok())
+            {
+                if hub_sha256.is_none() {
+                    hub_sha256 = extract_header_sha256(resp.headers(), "x-linked-etag");
+                }
+                redirected = true;
+                current_url = resolve_redirect_url(&current_url, loc)?;
+                continue;
+            }
+            return Ok((resp, redirected, hub_sha256));
+        }
+        bail!("too many redirects downloading {url}")
+    };
 
-    let mut resp = send_get(existing_len, resume_etag.as_deref())?;
+    let (mut resp, mut hub_redirected, mut hub_sha256) =
+        send_get(existing_len, resume_etag.as_deref())?;
     if resp.status().as_u16() == 416 && existing_len > 0 {
         let _ = fs::remove_file(&part_path);
         let _ = fs::remove_file(&meta_path);
         existing_len = 0;
         resume_etag = None;
-        resp = send_get(0, None)?;
+        (resp, hub_redirected, hub_sha256) = send_get(0, None)?;
     }
 
     let mut status = resp.status().as_u16();
@@ -581,7 +650,7 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
         let _ = fs::remove_file(&part_path);
         let _ = fs::remove_file(&meta_path);
         existing_len = 0;
-        resp = send_get(0, None)?;
+        (resp, hub_redirected, hub_sha256) = send_get(0, None)?;
         status = resp.status().as_u16();
     }
 
@@ -594,7 +663,9 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
     }
 
     let resp_etag = extract_etag(resp.headers());
-    let expected_sha256 = extract_expected_sha256(resp.headers()).or(saved_meta.sha256.clone());
+    let expected_sha256 =
+        extract_expected_sha256(resp.headers(), hub_redirected, hub_sha256.as_deref())
+            .or(saved_meta.sha256.clone());
 
     // If the server returned 206 with a different ETag (ignoring If-Range), restart from byte 0!
     let mut resuming = status == 206 && existing_len > 0;
@@ -611,7 +682,7 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
         let _ = fs::remove_file(&meta_path);
         existing_len = 0;
         resuming = false;
-        resp = send_get(0, None)?;
+        (resp, hub_redirected, hub_sha256) = send_get(0, None)?;
         status = resp.status().as_u16();
         if status != 200 {
             bail!(
@@ -628,9 +699,10 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
         extract_etag(resp.headers())
     };
     let final_sha256 = if resuming {
-        extract_expected_sha256(resp.headers()).or(expected_sha256)
+        extract_expected_sha256(resp.headers(), hub_redirected, hub_sha256.as_deref())
+            .or(expected_sha256)
     } else {
-        extract_expected_sha256(resp.headers())
+        extract_expected_sha256(resp.headers(), hub_redirected, hub_sha256.as_deref())
     };
 
     let content_len = resp
@@ -1480,5 +1552,89 @@ mod tests {
             best.hf_uri,
             "hf://Qwen/Qwen2.5-14B-Instruct-GGUF:model-q4_k_m-00001-of-00003.gguf"
         );
+    }
+
+    #[test]
+    fn xet_redirect_uses_hub_x_linked_etag_not_cdn_xet_etag() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let payload: Vec<u8> = (0..16_384).map(|i| ((i * 29 + 11) % 251) as u8).collect();
+        let real_sha256 = to_hex_lower(&Sha256::digest(&payload));
+        let fake_xet_cas_etag = "0663b826e09042345d6e2069d9655cd3ae84812d8f39a5894bed7b24fc0e86cc";
+        assert_ne!(real_sha256, fake_xet_cas_etag);
+
+        // Simulate HF Hub 302 with `X-Linked-Etag` (real SHA-256) redirecting to a CDN 200
+        // whose `ETag` is a different 64-hex Xet CAS hash (and verify Authorization is stripped).
+        let cdn_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cdn_addr = cdn_listener.local_addr().unwrap();
+        let cdn_payload = payload.clone();
+        let cdn_thread = std::thread::spawn(move || {
+            let (mut sock, _) = cdn_listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut saw_auth = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if line.to_ascii_lowercase().starts_with("authorization:") {
+                    saw_auth = true;
+                }
+            }
+            assert!(
+                !saw_auth,
+                "Authorization header must not leak to redirected CDN"
+            );
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nETag: \"{fake_xet_cas_etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                cdn_payload.len()
+            );
+            sock.write_all(header.as_bytes()).unwrap();
+            sock.write_all(&cdn_payload).unwrap();
+            let _ = sock.flush();
+        });
+
+        let hub_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub_addr = hub_listener.local_addr().unwrap();
+        let hub_sha = real_sha256.clone();
+        let hub_thread = std::thread::spawn(move || {
+            let (mut sock, _) = hub_listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            let header = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{cdn_addr}/xet-bridge/blob\r\nX-Linked-Etag: \"{hub_sha}\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            sock.write_all(header.as_bytes()).unwrap();
+            let _ = sock.flush();
+        });
+
+        let tmp = std::env::temp_dir().join(format!("layerstream-xet-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        unsafe {
+            std::env::set_var("HF_ENDPOINT", format!("http://{hub_addr}"));
+            std::env::set_var("HF_TOKEN", "hf_test_secret_token");
+        }
+
+        let res = ensure_hf_downloaded("hf://testorg/xetrepo:model.gguf", &tmp);
+
+        unsafe {
+            std::env::remove_var("HF_ENDPOINT");
+            std::env::remove_var("HF_TOKEN");
+        }
+        hub_thread.join().unwrap();
+        cdn_thread.join().unwrap();
+
+        let local = res.expect("Xet redirect download must verify against Hub X-Linked-Etag");
+        assert_eq!(fs::read(&local).unwrap(), payload);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
