@@ -158,7 +158,13 @@ int32_t ls_sample_from_logits(
     const ls_sample_params * sample_params
 );
 
-/** Pure speculative rejection sampling helper for tests (matches eval_verify_sample). */
+/**
+ * Pure speculative rejection sampling helper for tests (matches eval_verify_sample).
+ * Buffer requirements:
+ * - `logits_per_pos`: array of `k + 1` pointers, each pointing to `n_vocab` floats.
+ * - `draft_tokens`: array of `k` token IDs (`k >= 0`).
+ * - `out_accepted_count` and `out_next_token`: non-null output pointers.
+ */
 void ls_verify_sample_from_logits(
     const float * const * logits_per_pos,
     int32_t n_vocab,

@@ -214,7 +214,12 @@ async fn chat_completions_and_immediate_eviction_on_real_gguf() {
         .unwrap();
     let sse_text = String::from_utf8_lossy(&sse_bytes);
     assert!(sse_text.contains("chat.completion.chunk"));
-    assert!(sse_text.contains("[DONE]"));
+    let last_data = sse_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .next_back();
+    assert_eq!(last_data, Some("[DONE]"));
 
     let _ = PathBuf::from(model_path);
 }

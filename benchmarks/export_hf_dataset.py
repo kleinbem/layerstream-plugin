@@ -17,15 +17,20 @@ from typing import Any
 
 
 def extract_json_array(raw: str) -> list[dict[str, Any]]:
-    """Extract the trailing JSON array from stdout that may include library banners."""
-    idx = raw.find("\n[")
-    if idx == -1:
-        idx = raw.find("[")
-    if idx == -1:
-        return []
-    candidate = raw[idx:].strip()
-    data = json.loads(candidate)
-    return data if isinstance(data, list) else []
+    """Extract the trailing JSON array from stdout that may include bracketed library banners."""
+    pos = len(raw)
+    while True:
+        idx = raw.rfind("[", 0, pos)
+        if idx == -1:
+            return []
+        candidate = raw[idx:].strip()
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, list) and (not data or isinstance(data[0], dict)):
+                return data
+        except json.JSONDecodeError:
+            pass
+        pos = idx
 
 
 DEFAULT_HARDWARE = "NVIDIA Jetson Orin Nano (8 GiB unified LPDDR5, CUDA sm_87, dm-crypt NVMe)"
@@ -53,13 +58,15 @@ def normalize_record(
     default_hw: str = DEFAULT_HARDWARE,
     default_hw_id: str = DEFAULT_HARDWARE_ID,
 ) -> dict[str, Any]:
+    engine = rec.get("engine")
+    default_ver = "0.1.0" if engine == "layerstream-plugin" else None
     return {
         "round": round_name,
         "source_file": source_file,
         "hardware": rec.get("hardware") or default_hw,
         "hardware_id": rec.get("hardware_id") or default_hw_id,
-        "engine": rec.get("engine"),
-        "engine_version": rec.get("engine_version", "0.1.0"),
+        "engine": engine,
+        "engine_version": rec.get("engine_version", default_ver),
         "git_rev": rec.get("git_rev"),
         "mode": rec.get("mode"),
         "status": rec.get("status", "ok"),

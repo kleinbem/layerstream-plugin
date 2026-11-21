@@ -4,7 +4,7 @@
 //! share one active GPU lease so peak VRAM stays strictly bounded and drops back
 //! to 0 MB whenever idle.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,7 @@ pub struct AdmissionPermit {
 
 pub struct Residency<E> {
     slot: Arc<AsyncMutex<Option<LoadedSlot<E>>>>,
+    loaded: Arc<AtomicBool>,
     activity: Arc<Activity>,
     admission: Arc<Semaphore>,
     idle_timeout: Duration,
@@ -49,6 +50,7 @@ pub struct Residency<E> {
 
 pub struct EngineLease<E> {
     slot: OwnedMutexGuard<Option<LoadedSlot<E>>>,
+    loaded: Arc<AtomicBool>,
     evict_immediately: bool,
     _request: RequestLease,
 }
@@ -69,11 +71,13 @@ impl<E: Send + 'static> EngineLease<E> {
         if needs_load {
             // Drop previous model FIRST so its GPU buffers are freed before allocating the next one.
             *self.slot = None;
+            self.loaded.store(false, Ordering::SeqCst);
             let engine = loader()?;
             *self.slot = Some(LoadedSlot {
                 model_id: model_id.to_string(),
                 engine,
             });
+            self.loaded.store(true, Ordering::SeqCst);
         }
         Ok(&mut self.slot.as_mut().expect("slot just loaded").engine)
     }
@@ -83,6 +87,7 @@ impl<E> Drop for EngineLease<E> {
     fn drop(&mut self) {
         if self.evict_immediately {
             *self.slot = None;
+            self.loaded.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -93,6 +98,7 @@ impl<E: Send + 'static> Residency<E> {
     pub fn new(idle_timeout: Duration, max_queued_requests: usize) -> Self {
         Self {
             slot: Arc::new(AsyncMutex::new(None)),
+            loaded: Arc::new(AtomicBool::new(false)),
             activity: Arc::new(Activity {
                 in_flight: AtomicUsize::new(0),
                 last_finished: Mutex::new(Instant::now()),
@@ -125,6 +131,7 @@ impl<E: Send + 'static> Residency<E> {
         let slot = self.slot.clone().lock_owned().await;
         EngineLease {
             slot,
+            loaded: self.loaded.clone(),
             evict_immediately: self.evict_immediately,
             _request: permit.request,
         }
@@ -152,13 +159,16 @@ impl<E: Send + 'static> Residency<E> {
             return false;
         }
         if let Some(evicted) = guard.take() {
+            let loaded = self.loaded.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn_blocking(move || {
                     drop(evicted);
+                    loaded.store(false, Ordering::SeqCst);
                     drop(guard);
                 });
             } else {
                 drop(evicted);
+                loaded.store(false, Ordering::SeqCst);
                 drop(guard);
             }
             return true;
@@ -167,6 +177,6 @@ impl<E: Send + 'static> Residency<E> {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.slot.try_lock().map(|g| g.is_some()).unwrap_or(true)
+        self.loaded.load(Ordering::SeqCst)
     }
 }

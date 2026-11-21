@@ -35,20 +35,22 @@ Summary:",
     },
     Workload {
         id: "code_edit",
-        prompt: "Repeat the following Rust struct verbatim and add a single field `pub timeout_secs: u64,` right before the closing brace:\n\n\
-```rust\n\
-#[derive(Debug, Clone)]\n\
-pub struct StreamConfig {\n\
-    pub model_path: PathBuf,\n\
-    pub n_ctx: u32,\n\
-    pub n_batch: u32,\n\
-    pub resident_layers: Option<u32>,\n\
-    pub vram_budget_bytes: u64,\n\
-    pub use_gpu: bool,\n\
-    pub prefer_direct_io: bool,\n\
-}\n\
-```\n\n\
-Updated struct:\n```rust\n",
+        prompt: concat!(
+            "Repeat the following Rust struct verbatim and add a single field `pub timeout_secs: u64,` right before the closing brace:\n\n",
+            "```rust\n",
+            "#[derive(Debug, Clone)]\n",
+            "pub struct StreamConfig {\n",
+            "    pub model_path: PathBuf,\n",
+            "    pub n_ctx: u32,\n",
+            "    pub n_batch: u32,\n",
+            "    pub resident_layers: Option<u32>,\n",
+            "    pub vram_budget_bytes: u64,\n",
+            "    pub use_gpu: bool,\n",
+            "    pub prefer_direct_io: bool,\n",
+            "}\n",
+            "```\n\n",
+            "Updated struct:\n```rust\n",
+        ),
         max_tokens: 48,
     },
     Workload {

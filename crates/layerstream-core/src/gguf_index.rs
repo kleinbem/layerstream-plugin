@@ -1,4 +1,4 @@
-//! Pure-Rust GGUF v2/v3 header parser & 4K-aligned coalesced layer span planner.
+//! Pure-Rust little-endian GGUF v2/v3 header parser & 4K-aligned coalesced layer span planner.
 //!
 //! Reads only GGUF metadata headers (single-file or multi-part `*-00001-of-0000N.gguf`)
 //! so model discovery uses 0 MB of VRAM and ~milliseconds of startup time.
@@ -111,10 +111,10 @@ impl GgufIndex {
             .map(ToOwned::to_owned);
 
         let block_count_key = format!("{architecture}.block_count");
-        let n_layers = kv_all
-            .get(&block_count_key)
-            .and_then(KvValue::as_u32)
-            .unwrap_or_else(|| infer_layer_count(&tensors));
+        let n_layers = match kv_all.get(&block_count_key).and_then(KvValue::as_u32) {
+            Some(v) => v,
+            None => infer_layer_count(&tensors)?,
+        };
 
         let ctx_key = format!("{architecture}.context_length");
         let context_length = kv_all.get(&ctx_key).and_then(KvValue::as_u32);
@@ -241,7 +241,7 @@ impl GgufIndex {
     }
 }
 
-fn infer_layer_count(tensors: &HashMap<String, TensorLocation>) -> u32 {
+fn infer_layer_count(tensors: &HashMap<String, TensorLocation>) -> Result<u32> {
     let mut max_idx: Option<u32> = None;
     for name in tensors.keys() {
         if let Some(rest) = name.strip_prefix("blk.")
@@ -251,7 +251,12 @@ fn infer_layer_count(tensors: &HashMap<String, TensorLocation>) -> u32 {
             max_idx = Some(max_idx.map_or(idx, |m| m.max(idx)));
         }
     }
-    max_idx.map_or(0, |m| m + 1)
+    match max_idx {
+        None => Ok(0),
+        Some(m) => m
+            .checked_add(1)
+            .context("GGUF block_count exceeds u32::MAX"),
+    }
 }
 
 fn discover_shards(primary: &Path) -> Result<Vec<PathBuf>> {

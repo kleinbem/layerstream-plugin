@@ -137,8 +137,8 @@ fn rejection_sampler_matches_eval_sample_distribution() {
 
 #[test]
 fn corrupt_gguf_headers_are_rejected_without_oom() {
-    let dir = std::env::temp_dir().join(format!("layerstream-gguf-corrupt-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     // 1. Huge tensor_count (0xFFFF_FFFF_FFFF) must fail cleanly instead of OOM-aborting.
     let bad_tc = dir.join("bad_tc.gguf");
@@ -166,6 +166,4 @@ fn corrupt_gguf_headers_are_rejected_without_oom() {
         f.write_all(&0u32.to_le_bytes()).unwrap(); // invalid alignment=0
     }
     assert!(GgufIndex::open(&bad_align).is_err());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

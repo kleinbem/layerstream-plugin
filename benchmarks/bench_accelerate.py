@@ -135,7 +135,7 @@ def main() -> None:
     ap.add_argument("--gpu-max-mem", default="3GiB")
     ap.add_argument("--cpu-max-mem", default="1GiB")
     ap.add_argument("--workload", default=None)
-    ap.add_argument("--max-tokens", type=int, default=16)
+    ap.add_argument("--max-tokens", type=int, default=None)
     ap.add_argument("--no-4bit", action="store_true")
     args = ap.parse_args()
 

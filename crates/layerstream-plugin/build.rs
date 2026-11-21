@@ -7,10 +7,7 @@ fn main() {
             println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@loader_path");
         }
     }
-    if target_os == "linux"
-        && std::env::var("CARGO_FEATURE_CUDA").is_ok()
-        && std::path::Path::new("/run/opengl-driver/lib").is_dir()
-    {
+    if target_os == "linux" && std::env::var("CARGO_FEATURE_CUDA").is_ok() {
         println!("cargo:rustc-link-arg-bins=-Wl,-rpath,/run/opengl-driver/lib");
     }
 }

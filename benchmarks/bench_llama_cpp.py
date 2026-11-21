@@ -207,6 +207,7 @@ def main() -> None:
             str(max_tok),
             "--temp",
             "0",
+            "--no-conversation",
             "--no-display-prompt",
             "-p",
             prompt,
@@ -242,9 +243,9 @@ def main() -> None:
         toks = timings["completion_tokens"] or 0
         eval_s = timings["eval_s"] or wall_s
         prompt_s = timings["prompt_eval_s"] or 0.0
-        infer_s = (prompt_s + eval_s) if timings["eval_s"] else wall_s
+        # Compute gross energy over `wall_s` — the exact interval during which `mon.watts` was sampled.
         j_per_tok = (
-            round((avg_w * infer_s) / max(toks, 1), 2)
+            round((avg_w * wall_s) / max(toks, 1), 2)
             if (avg_w is not None and toks > 0)
             else None
         )

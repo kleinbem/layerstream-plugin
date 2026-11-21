@@ -407,16 +407,38 @@ struct IncomingMessage {
 }
 
 impl IncomingMessage {
-    fn to_chat_message(&self) -> ChatMessage {
+    fn to_chat_message(&self) -> std::result::Result<ChatMessage, String> {
         let mut text = match &self.content {
             Value::String(s) => s.clone(),
-            Value::Array(parts) => parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            Value::Array(parts) => {
+                let mut texts = Vec::with_capacity(parts.len());
+                for part in parts {
+                    let kind = part.get("type").and_then(Value::as_str);
+                    match kind {
+                        Some("text") | None => {
+                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                texts.push(t);
+                            } else {
+                                return Err(format!(
+                                    "unsupported chat message content part: {part}"
+                                ));
+                            }
+                        }
+                        Some(other) => {
+                            return Err(format!(
+                                "unsupported multimodal content part type '{other}'; only text content is supported"
+                            ));
+                        }
+                    }
+                }
+                texts.join("\n")
+            }
             Value::Null => String::new(),
-            other => other.to_string(),
+            other => {
+                return Err(format!(
+                    "unsupported chat message content value (expected string, array, or null): {other}"
+                ));
+            }
         };
 
         // Preserve assistant `tool_calls` across multi-turn agent loops.
@@ -462,10 +484,10 @@ impl IncomingMessage {
             }
         }
 
-        ChatMessage {
+        Ok(ChatMessage {
             role: self.role.clone(),
             content: text,
-        }
+        })
     }
 }
 
@@ -625,11 +647,15 @@ async fn chat_completions(
         Err(err) => return api_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
     };
 
-    let mut messages: Vec<ChatMessage> = req
+    let mut messages: Vec<ChatMessage> = match req
         .messages
         .iter()
         .map(IncomingMessage::to_chat_message)
-        .collect();
+        .collect::<std::result::Result<Vec<_>, _>>()
+    {
+        Ok(msgs) => msgs,
+        Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
+    };
 
     if allow_tool_calls
         && let Some(tools) = &req.tools
@@ -1211,4 +1237,38 @@ fn unix_now_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_message_accepts_text_parts_and_rejects_multimodal_parts() {
+        let ok_msg = IncomingMessage {
+            role: "user".to_string(),
+            content: json!([
+                {"type": "text", "text": "hello"},
+                {"type": "text", "text": "world"}
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let converted = ok_msg.to_chat_message().unwrap();
+        assert_eq!(converted.content, "hello\nworld");
+
+        let bad_msg = IncomingMessage {
+            role: "user".to_string(),
+            content: json!([
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let err = bad_msg.to_chat_message().unwrap_err();
+        assert!(err.contains("image_url"), "unexpected error: {err}");
+    }
 }

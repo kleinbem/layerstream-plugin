@@ -161,8 +161,13 @@ unsafe impl Send for StreamEngine {}
 
 impl StreamEngine {
     pub fn open(cfg: &EngineConfig) -> Result<Self> {
-        let c_path = CString::new(cfg.model_path.to_string_lossy().as_bytes())
-            .context("model_path contains interior NUL")?;
+        #[cfg(unix)]
+        let path_bytes = std::os::unix::ffi::OsStrExt::as_bytes(cfg.model_path.as_os_str());
+        #[cfg(not(unix))]
+        let path_lossy = cfg.model_path.to_string_lossy();
+        #[cfg(not(unix))]
+        let path_bytes = path_lossy.as_bytes();
+        let c_path = CString::new(path_bytes).context("model_path contains interior NUL")?;
 
         let io_pool_raw: Option<*mut LayerIoPool> = if cfg.full_resident_reference {
             None
@@ -911,11 +916,21 @@ impl StreamEngine {
                                  model memory does not support partial rollback"
                             );
                         }
-                        self.cached_kv_tokens = history.clone();
+                        if self.cached_kv_tokens.len() <= history.len() {
+                            self.cached_kv_tokens
+                                .extend_from_slice(&history[self.cached_kv_tokens.len()..]);
+                        } else {
+                            self.cached_kv_tokens = history.clone();
+                        }
                         pos = valid_pos;
                         next_tok = corrected_or_bonus;
                     } else {
-                        self.cached_kv_tokens = history.clone();
+                        if self.cached_kv_tokens.len() <= history.len() {
+                            self.cached_kv_tokens
+                                .extend_from_slice(&history[self.cached_kv_tokens.len()..]);
+                        } else {
+                            self.cached_kv_tokens = history.clone();
+                        }
                         pos += 1 + draft.len() as i32;
                         next_tok = corrected_or_bonus;
                     }
@@ -948,7 +963,12 @@ impl StreamEngine {
             match eval_res {
                 Ok(tok) => {
                     next_tok = tok;
-                    self.cached_kv_tokens = history.clone();
+                    if self.cached_kv_tokens.len() <= history.len() {
+                        self.cached_kv_tokens
+                            .extend_from_slice(&history[self.cached_kv_tokens.len()..]);
+                    } else {
+                        self.cached_kv_tokens = history.clone();
+                    }
                     spec_stats.sweeps += 1;
                     pos += 1;
                 }

@@ -3,9 +3,9 @@
 //! Optimizations:
 //! - Caches planned `CoalescedSpan`s per `layer_idx` after sweep 1 (zero CStr/HashMap
 //!   overhead in the hot decode loop).
-//! - Splits large layer spans (>= 16 MiB) across `io_threads` (default 4) parallel
-//!   4K-aligned `pread` calls using `std::thread::scope`, driving NVMe queue depth > 1
-//!   and parallelizing dm-crypt/LUKS decryption across CPU cores.
+//! - Optionally splits large layer spans (>= 4 MiB) across `io_threads` (`DEFAULT_IO_THREADS = 1`
+//!   to avoid Linux dm-crypt contention; `DEFAULT_MOE_IO_THREADS = 4` on macOS, `1` elsewhere;
+//!   override via `LAYERSTREAM_IO_THREADS` / `LAYERSTREAM_MOE_IO_THREADS`) using `std::thread::scope`.
 //! - Uses `O_DIRECT` on Linux, `F_NOCACHE` on macOS, and `FILE_FLAG_NO_BUFFERING` on
 //!   Windows to avoid polluting the host OS page cache.
 
@@ -50,10 +50,12 @@ unsafe impl Sync for AlignedBuf {}
 
 impl AlignedBuf {
     pub fn new(min_bytes: usize) -> Result<Self> {
-        let len = align_up(
-            min_bytes.max(DIRECT_IO_ALIGN as usize) as u64,
-            DIRECT_IO_ALIGN,
-        ) as usize;
+        let base = min_bytes.max(DIRECT_IO_ALIGN as usize) as u64;
+        let rounded = base
+            .checked_add(DIRECT_IO_ALIGN - 1)
+            .map(|v| v & !(DIRECT_IO_ALIGN - 1))
+            .context("AlignedBuf size overflow during 4K alignment")?;
+        let len = usize::try_from(rounded).context("AlignedBuf size exceeds usize")?;
         let layout = Layout::from_size_align(len, DIRECT_IO_ALIGN as usize)
             .context("invalid AlignedBuf layout")?;
         let raw = unsafe { alloc_zeroed(layout) };
@@ -226,29 +228,6 @@ impl ExpertSliceLru {
         self.entries[idx].as_ref().map(|e| e.data.as_slice())
     }
 
-    /// Picks the lowest-frequency victim within the LRU tail window (tie-broken by oldest).
-    fn pick_victim(&self) -> Option<(usize, u16)> {
-        let mut cur = self.tail;
-        let mut best: Option<(usize, u16)> = None;
-        let mut steps = 0usize;
-        while let Some(idx) = cur {
-            if steps >= Self::TAIL_SAMPLE_WINDOW {
-                break;
-            }
-            let e = self.entries[idx].as_ref().expect("valid LRU slot");
-            let f = self.key_freq(e.key);
-            if best.is_none_or(|(_, bf)| f < bf) {
-                best = Some((idx, f));
-                if f <= 1 {
-                    break;
-                }
-            }
-            cur = e.prev;
-            steps += 1;
-        }
-        best
-    }
-
     fn evict_slot(&mut self, idx: usize) {
         self.detach(idx);
         if let Some(entry) = self.entries[idx].take() {
@@ -272,25 +251,43 @@ impl ExpertSliceLru {
             return;
         }
 
-        // Scan-resistant TinyLFU admission gate: once full, only admit if the incoming slice
-        // is strictly hotter than the coldest candidate in the LRU tail window!
+        // Scan-resistant TinyLFU admission gate: pre-select coldest colder victims in the
+        // LRU tail window and verify we can reclaim enough space BEFORE evicting anything.
         if self.used_bytes.saturating_add(bytes.len()) > budget {
-            let Some((_, victim_freq)) = self.pick_victim() else {
-                return;
-            };
-            if incoming_freq <= victim_freq {
+            let needed = self.used_bytes.saturating_add(bytes.len()) - budget;
+            let mut candidates: Vec<(u16, usize, usize, usize)> = Vec::new();
+            let mut cur = self.tail;
+            let mut steps = 0usize;
+            while let Some(idx) = cur
+                && steps < Self::TAIL_SAMPLE_WINDOW
+            {
+                let Some(entry) = &self.entries[idx] else {
+                    break;
+                };
+                let freq = self.key_freq(entry.key);
+                if freq < incoming_freq {
+                    candidates.push((freq, steps, idx, entry.data.len()));
+                }
+                cur = entry.prev;
+                steps += 1;
+            }
+            // Evict lowest frequency first, tie-broken by oldest (`steps` ascending).
+            candidates.sort_by_key(|&(freq, age, _, _)| (freq, age));
+            let mut reclaimable = 0usize;
+            let mut take_count = 0usize;
+            for &(_, _, _, sz) in &candidates {
+                reclaimable = reclaimable.saturating_add(sz);
+                take_count += 1;
+                if reclaimable >= needed {
+                    break;
+                }
+            }
+            if reclaimable < needed {
                 return;
             }
-        }
-
-        while self.used_bytes.saturating_add(bytes.len()) > budget {
-            let Some((victim_idx, victim_freq)) = self.pick_victim() else {
-                return;
-            };
-            if incoming_freq <= victim_freq {
-                return;
+            for &(_, _, victim_idx, _) in &candidates[..take_count] {
+                self.evict_slot(victim_idx);
             }
-            self.evict_slot(victim_idx);
         }
         let entry = LruEntry {
             key,
@@ -973,7 +970,16 @@ impl LayerIoPool {
                     let len = ov_end - ov_start;
                     let src_off = ov_start - chunk_rel;
                     let dst_off = slice.dst_offset + (ov_start - slice.span_offset);
-                    dst[dst_off..dst_off + len].copy_from_slice(&read_buf[src_off..src_off + len]);
+                    let dst_end = dst_off
+                        .checked_add(len)
+                        .context("serial span destination offset overflow")?;
+                    if dst_end > dst.len() {
+                        bail!(
+                            "serial span slice [{dst_off}..{dst_end}) exceeds destination buffer ({} bytes)",
+                            dst.len()
+                        );
+                    }
+                    dst[dst_off..dst_end].copy_from_slice(&read_buf[src_off..src_off + len]);
                 }
             }
             if let Some(t0) = t_copy {
