@@ -4,3 +4,5 @@
 *.gguf
 .direnv/
 .envrc.local
+__pycache__/
+*.pyc
