@@ -7,14 +7,13 @@ from pathlib import Path
 import pytest
 
 
-def write_synthetic_mixed_dense_moe_gguf(dest: Path) -> Path:
+def write_synthetic_mixed_dense_moe_gguf(dest: Path, *, n_vocab: int = 64) -> Path:
     """Build a tiny deterministic 6-layer mixed Dense (0..3) + Sparse MoE (4..5) GGUF v3 file.
 
     Mirrors `crates/layerstream-core/tests/parity_test.rs::write_synthetic_mixed_dense_moe_gguf`
     so Python integration tests exercise real llama.cpp streaming, MoE active-expert streaming,
     chat templating, KV reuse, and GIL release without external model downloads.
     """
-    n_vocab = 64
     n_embd = 64
     n_head = 2
     n_head_kv = 2
@@ -195,3 +194,9 @@ def write_synthetic_mixed_dense_moe_gguf(dest: Path) -> Path:
 def synthetic_gguf(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("gguf") / "synthetic-mixed-dense-moe.gguf"
     return write_synthetic_mixed_dense_moe_gguf(path)
+
+
+@pytest.fixture(scope="session")
+def incompatible_vocab_gguf(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("gguf-mismatch") / "synthetic-vocab-512.gguf"
+    return write_synthetic_mixed_dense_moe_gguf(path, n_vocab=512)
