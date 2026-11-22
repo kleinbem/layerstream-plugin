@@ -7,12 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result, bail};
 
 use crate::ffi::{
-    LsChatMessage, LsEngine, LsEngineConfig, LsEngineStats, LsSampleParams, LsSpanSlice,
+    LsChatMessage, LsEngine, LsEngineConfig, LsEngineStats, LsGrammar, LsSampleParams, LsSpanSlice,
     LsTensorSliceReq, ls_engine_apply_chat_template, ls_engine_create, ls_engine_eval_greedy,
     ls_engine_eval_sample, ls_engine_eval_verify_greedy, ls_engine_eval_verify_sample,
-    ls_engine_free, ls_engine_get_stats, ls_engine_kv_clear, ls_engine_kv_trim, ls_engine_n_ctx,
+    ls_engine_eval_verify_with_grammar, ls_engine_eval_with_grammar, ls_engine_free,
+    ls_engine_get_stats, ls_engine_kv_clear, ls_engine_kv_trim, ls_engine_n_ctx,
     ls_engine_set_cancel_cb, ls_engine_token_is_eog, ls_engine_token_to_piece, ls_engine_tokenize,
-    ls_engine_vocab_size, ls_probe_gpu_memory, ls_set_log_verbose,
+    ls_engine_vocab_size, ls_grammar_accept, ls_grammar_create, ls_grammar_free,
+    ls_probe_gpu_memory, ls_set_log_verbose,
 };
 use crate::gguf_index::{GgufIndex, MAX_DRAFT_VOCAB_PAD_DELTA};
 use crate::io_reader::{IoStats, LayerIoPool};
@@ -138,6 +140,8 @@ pub struct GenerateOptions {
     pub stop: Vec<String>,
     pub enable_ngram_speculation: bool,
     pub max_draft_tokens: usize,
+    /// Optional GBNF grammar (with `root` start rule) constraining generated output.
+    pub grammar: Option<String>,
 }
 
 impl Default for GenerateOptions {
@@ -148,6 +152,7 @@ impl Default for GenerateOptions {
             stop: Vec::new(),
             enable_ngram_speculation: true,
             max_draft_tokens: 5,
+            grammar: None,
         }
     }
 }
@@ -435,7 +440,7 @@ impl StreamEngine {
         Ok(out)
     }
 
-    pub fn token_to_piece(&self, token: i32) -> Result<String> {
+    fn token_to_piece_bytes(&self, token: i32) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; 64];
         let n = unsafe {
             ls_engine_token_to_piece(
@@ -463,7 +468,23 @@ impl StreamEngine {
         } else {
             buf.truncate(n as usize);
         }
+        Ok(buf)
+    }
+
+    pub fn token_to_piece(&self, token: i32) -> Result<String> {
+        let buf = self.token_to_piece_bytes(token)?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    pub fn detokenize(&self, tokens: &[i32]) -> Result<String> {
+        let mut out = String::with_capacity(tokens.len() * 4);
+        let mut utf8 = Utf8PieceAssembler::default();
+        for &tok in tokens {
+            let bytes = self.token_to_piece_bytes(tok)?;
+            out.push_str(&utf8.push(&bytes));
+        }
+        out.push_str(&utf8.flush());
+        Ok(out)
     }
 
     pub fn token_is_eog(&self, token: i32) -> bool {
@@ -603,6 +624,83 @@ impl StreamEngine {
         Ok((accepted.max(0) as usize, next_tok))
     }
 
+    fn eval_step_with_grammar(
+        &mut self,
+        tokens: &[i32],
+        pos_start: i32,
+        sample: &LsSampleParams,
+        grammar: Option<&GrammarHandle>,
+    ) -> Result<i32> {
+        let Some(g) = grammar else {
+            return if sample.temperature <= 0.0 {
+                self.eval_greedy(tokens, pos_start)
+            } else {
+                self.eval_sample(tokens, pos_start, sample)
+            };
+        };
+        let mut next = 0i32;
+        let mut err_buf = [0 as c_char; 512];
+        let rc = unsafe {
+            ls_engine_eval_with_grammar(
+                self.raw.as_ptr(),
+                tokens.as_ptr(),
+                tokens.len() as i32,
+                pos_start,
+                sample,
+                g.raw.as_ptr(),
+                &mut next,
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if rc == RC_CANCELLED {
+            return Err(CancelledError.into());
+        }
+        if rc != 0 {
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!("eval_with_grammar failed (rc={rc}): {msg}");
+        }
+        Ok(next)
+    }
+
+    fn eval_verify_with_grammar(
+        &mut self,
+        tokens: &[i32],
+        pos_start: i32,
+        sample: &LsSampleParams,
+        grammar: &GrammarHandle,
+    ) -> Result<(usize, i32)> {
+        let mut accepted = 0i32;
+        let mut next_tok = 0i32;
+        let mut err_buf = [0 as c_char; 512];
+        let rc = unsafe {
+            ls_engine_eval_verify_with_grammar(
+                self.raw.as_ptr(),
+                tokens.as_ptr(),
+                tokens.len() as i32,
+                pos_start,
+                sample,
+                grammar.raw.as_ptr(),
+                &mut accepted,
+                &mut next_tok,
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if rc == RC_CANCELLED {
+            return Err(CancelledError.into());
+        }
+        if rc != 0 {
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!("eval_verify_with_grammar failed (rc={rc}): {msg}");
+        }
+        Ok((accepted.max(0) as usize, next_tok))
+    }
+
     /// Runs chunked layer-major prefill followed by greedy decode (without speculation).
     pub fn generate_greedy(&mut self, prompt: &str, max_tokens: usize) -> Result<Vec<i32>> {
         let mut opts = GenerateOptions {
@@ -671,6 +769,17 @@ impl StreamEngine {
             .into());
         }
 
+        let mut grammar = match opts.grammar.as_deref() {
+            None => None,
+            Some(raw) => {
+                let g_str = raw.trim();
+                if g_str.is_empty() {
+                    bail!("grammar string must not be empty");
+                }
+                Some(GrammarHandle::create(self.raw, g_str)?)
+            }
+        };
+
         // Reuse longest matching KV prefix on multi-turn chat continuations
         // (avoids re-prefilling unchanged system prompts & prior turns off NVMe!).
         let can_reuse_kv = self.stats().can_speculate;
@@ -707,7 +816,9 @@ impl StreamEngine {
         let mut next_tok = 0i32;
         let mut spec_stats = SpeculationStats::default();
 
-        for chunk in prompt_tokens[common_prefix..].chunks(self.n_batch) {
+        let prefill_slice = &prompt_tokens[common_prefix..];
+        let total_prefill_chunks = prefill_slice.chunks(self.n_batch).len();
+        for (chunk_idx, chunk) in prefill_slice.chunks(self.n_batch).enumerate() {
             if is_cancelled() {
                 return Ok(GenerateSummary {
                     prompt_tokens: prompt_tokens.len(),
@@ -716,7 +827,10 @@ impl StreamEngine {
                     speculation: spec_stats,
                 });
             }
-            let eval_res = if opts.sample.temperature <= 0.0 {
+            let is_last_prefill = chunk_idx + 1 == total_prefill_chunks;
+            let eval_res = if is_last_prefill {
+                self.eval_step_with_grammar(chunk, pos, &opts.sample, grammar.as_ref())
+            } else if opts.sample.temperature <= 0.0 {
                 self.eval_greedy(chunk, pos)
             } else {
                 self.eval_sample(chunk, pos, &opts.sample)
@@ -769,7 +883,9 @@ impl StreamEngine {
 
         let mut completion_tokens = 0usize;
         let mut finish_reason = "length".to_string();
+        let mut utf8_assembler = Utf8PieceAssembler::default();
         let mut stop_filter = StopFilter::new(&opts.stop);
+        let mut hit_stop_any = false;
         let mut last_emitted_tok = next_tok;
 
         'gen_loop: while completion_tokens < max_gen_tokens {
@@ -781,19 +897,28 @@ impl StreamEngine {
                 finish_reason = "stop".to_string();
                 break;
             }
+            if let Some(ref mut g) = grammar {
+                g.accept(next_tok)?;
+            }
 
             // Emit `next_tok` BEFORE calling `draft_proposer.propose(...)` so draft latency
-            // never pads TTFT, and route through `StopFilter` so stop text is never leaked.
-            let piece = self.token_to_piece(next_tok)?;
+            // never pads TTFT, buffering incomplete multi-byte UTF-8 sequences across tokens
+            // and routing through `StopFilter` so stop text is never leaked.
+            let raw_bytes = self.token_to_piece_bytes(next_tok)?;
+            let piece = utf8_assembler.push(&raw_bytes);
             completion_tokens += 1;
             history.push(next_tok);
             last_emitted_tok = next_tok;
             let (safe_emit, hit_stop_seq) = stop_filter.push(&piece);
-            if (!safe_emit.is_empty() || opts.stop.is_empty()) && !on_token(next_tok, &safe_emit) {
+            if (!safe_emit.is_empty()
+                || (opts.stop.is_empty() && piece.is_empty() && raw_bytes.is_empty()))
+                && !on_token(next_tok, &safe_emit)
+            {
                 finish_reason = "cancelled".to_string();
                 break 'gen_loop;
             }
             if hit_stop_seq {
+                hit_stop_any = true;
                 finish_reason = "stop".to_string();
                 break 'gen_loop;
             }
@@ -861,7 +986,16 @@ impl StreamEngine {
                     batch.push(next_tok);
                     batch.extend_from_slice(&draft);
 
-                    let verify_res = if opts.sample.temperature <= 0.0 {
+                    let mut step_sample = opts.sample;
+                    if step_sample.temperature > 0.0 {
+                        step_sample.seed = step_sample
+                            .seed
+                            .wrapping_add((completion_tokens as u32).wrapping_mul(2654435761));
+                    }
+
+                    let verify_res = if let Some(ref g) = grammar {
+                        self.eval_verify_with_grammar(&batch, pos, &step_sample, g)
+                    } else if step_sample.temperature <= 0.0 {
                         self.eval_verify_greedy(&batch, pos).map(|verified| {
                             let mut acc = 0usize;
                             let mut next_after = verified[draft.len()];
@@ -876,10 +1010,6 @@ impl StreamEngine {
                             (acc, next_after)
                         })
                     } else {
-                        let mut step_sample = opts.sample;
-                        step_sample.seed = step_sample
-                            .seed
-                            .wrapping_add((completion_tokens as u32).wrapping_mul(2654435761));
                         self.eval_verify_sample(&batch, pos, &step_sample)
                     };
 
@@ -908,12 +1038,17 @@ impl StreamEngine {
                             early_stop = true;
                             break;
                         }
-                        let d_piece = self.token_to_piece(d_tok)?;
+                        if let Some(ref mut g) = grammar {
+                            g.accept(d_tok)?;
+                        }
+                        let d_bytes = self.token_to_piece_bytes(d_tok)?;
+                        let d_piece = utf8_assembler.push(&d_bytes);
                         completion_tokens += 1;
                         history.push(d_tok);
                         last_emitted_tok = d_tok;
                         let (safe_emit, hit_stop_seq) = stop_filter.push(&d_piece);
-                        if (!safe_emit.is_empty() || opts.stop.is_empty())
+                        if (!safe_emit.is_empty()
+                            || (opts.stop.is_empty() && d_piece.is_empty() && d_bytes.is_empty()))
                             && !on_token(d_tok, &safe_emit)
                         {
                             finish_reason = "cancelled".to_string();
@@ -921,6 +1056,7 @@ impl StreamEngine {
                             break;
                         }
                         if hit_stop_seq {
+                            hit_stop_any = true;
                             finish_reason = "stop".to_string();
                             early_stop = true;
                             break;
@@ -981,11 +1117,8 @@ impl StreamEngine {
             // Standard 1-token sweep fallback.
             let mut step_sample = opts.sample;
             step_sample.seed = step_sample.seed.wrapping_add(completion_tokens as u32);
-            let eval_res = if step_sample.temperature <= 0.0 {
-                self.eval_greedy(&[next_tok], pos)
-            } else {
-                self.eval_sample(&[next_tok], pos, &step_sample)
-            };
+            let eval_res =
+                self.eval_step_with_grammar(&[next_tok], pos, &step_sample, grammar.as_ref());
             match eval_res {
                 Ok(tok) => {
                     next_tok = tok;
@@ -1010,8 +1143,21 @@ impl StreamEngine {
             }
         }
 
-        // Flush any safe held-back suffix bytes when generation ended without hitting a stop sequence.
-        if finish_reason != "cancelled" {
+        // Flush any trailing incomplete UTF-8 bytes and held-back stop-filter suffix bytes
+        // when generation ended without cancellation or an already-matched stop sequence.
+        if finish_reason != "cancelled" && !hit_stop_any {
+            let utf8_tail = utf8_assembler.flush();
+            if !utf8_tail.is_empty() {
+                let (safe_emit, hit_stop_seq) = stop_filter.push(&utf8_tail);
+                if !safe_emit.is_empty() && !on_token(last_emitted_tok, &safe_emit) {
+                    finish_reason = "cancelled".to_string();
+                } else if hit_stop_seq {
+                    hit_stop_any = true;
+                    finish_reason = "stop".to_string();
+                }
+            }
+        }
+        if finish_reason != "cancelled" && !hit_stop_any {
             let tail = stop_filter.flush();
             if !tail.is_empty() && !on_token(last_emitted_tok, &tail) {
                 finish_reason = "cancelled".to_string();
@@ -1024,6 +1170,60 @@ impl StreamEngine {
             finish_reason,
             speculation: spec_stats,
         })
+    }
+}
+
+struct GrammarHandle {
+    raw: NonNull<LsGrammar>,
+}
+
+impl GrammarHandle {
+    fn create(eng: NonNull<LsEngine>, grammar_str: &str) -> Result<Self> {
+        let c_grammar =
+            CString::new(grammar_str).context("GBNF grammar contains interior NUL byte")?;
+        let c_root = CString::new("root").unwrap();
+        let mut err_buf = [0 as c_char; 512];
+        let ptr = unsafe {
+            ls_grammar_create(
+                eng.as_ptr(),
+                c_grammar.as_ptr(),
+                c_root.as_ptr(),
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        let Some(raw) = NonNull::new(ptr) else {
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!("invalid grammar: {msg}");
+        };
+        Ok(Self { raw })
+    }
+
+    fn accept(&mut self, token: i32) -> Result<()> {
+        let mut err_buf = [0 as c_char; 512];
+        let rc = unsafe {
+            ls_grammar_accept(
+                self.raw.as_ptr(),
+                token,
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if rc != 0 {
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!("grammar state error on token {token}: {msg}");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GrammarHandle {
+    fn drop(&mut self) {
+        unsafe { ls_grammar_free(self.raw.as_ptr()) };
     }
 }
 
@@ -1294,4 +1494,91 @@ unsafe extern "C" fn rust_load_slices_cb(
         }
     }));
     res.unwrap_or(-99)
+}
+
+/// Buffers incomplete trailing multi-byte UTF-8 sequences across token boundaries so byte-level
+/// BPE tokenizers never emit spurious `U+FFFD` replacement characters mid-codepoint.
+#[derive(Default)]
+struct Utf8PieceAssembler {
+    pending: Vec<u8>,
+}
+
+impl Utf8PieceAssembler {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        if bytes.is_empty() {
+            return String::new();
+        }
+        if self.pending.is_empty()
+            && let Ok(s) = std::str::from_utf8(bytes)
+        {
+            return s.to_string();
+        }
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(valid) => {
+                    if !valid.is_empty() {
+                        out.push_str(valid);
+                    }
+                    self.pending.clear();
+                    break;
+                }
+                Err(err) => {
+                    let valid_len = err.valid_up_to();
+                    if valid_len > 0 {
+                        let valid_str =
+                            unsafe { std::str::from_utf8_unchecked(&self.pending[..valid_len]) };
+                        out.push_str(valid_str);
+                    }
+                    match err.error_len() {
+                        Some(bad_len) => {
+                            out.push('\u{FFFD}');
+                            self.pending.drain(..valid_len + bad_len);
+                        }
+                        None => {
+                            // Incomplete trailing 2..=4 byte UTF-8 sequence; wait for next token.
+                            if valid_len > 0 {
+                                self.pending.drain(..valid_len);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn flush(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let rem = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&rem).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod utf8_tests {
+    use super::Utf8PieceAssembler;
+
+    #[test]
+    fn reassembles_multibyte_utf8_across_token_pieces() {
+        let mut asm = Utf8PieceAssembler::default();
+        // "🦀" = [0xF0, 0x9F, 0xA6, 0x80], "é" = [0xC3, 0xA9]
+        assert_eq!(asm.push(&[b'h', b'i', 0xF0]), "hi");
+        assert_eq!(asm.push(&[0x9F]), "");
+        assert_eq!(asm.push(&[0xA6]), "");
+        assert_eq!(asm.push(&[0x80, 0xC3]), "🦀");
+        assert_eq!(asm.push(&[0xA9, b'!']), "é!");
+        assert_eq!(asm.flush(), "");
+    }
+
+    #[test]
+    fn flushes_truncated_utf8_tail_as_replacement_char() {
+        let mut asm = Utf8PieceAssembler::default();
+        assert_eq!(asm.push(&[0xF0, 0x9F]), "");
+        assert_eq!(asm.flush(), "\u{FFFD}");
+    }
 }

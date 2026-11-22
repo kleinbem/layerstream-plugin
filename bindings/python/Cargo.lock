@@ -183,6 +183,7 @@ dependencies = [
  "anyhow",
  "layerstream-core",
  "pyo3",
+ "serde_json",
 ]
 
 [[package]]

@@ -152,7 +152,7 @@ with AutoModel.from_pretrained("Qwen/Qwen2.5-14B-Instruct") as model:
     print("\n", model.stats())
 ```
 
-Accepts local `.gguf` paths, `hf://org/repo:file.gguf` URIs, HF `-GGUF` repos (hardware-aware auto-quant selection), and official base HF repos (`{org}/{name}-GGUF`), with full GIL release (`py.detach`), `.chat(messages)`, optional `draft_model=...` speculation, and deterministic `.unload()`. Build locally via `nix develop .#python` (see [bindings/python/README.md](bindings/python/README.md)).
+Accepts local `.gguf` paths, `hf://org/repo:file.gguf` URIs, HF `-GGUF` repos (hardware-aware auto-quant selection), and official base HF repos (`{org}/{name}-GGUF`), with full GIL release (`py.detach`), `isolated_worker=True` for **true 0 MB VRAM / CUDA context handoff back to PyTorch** on `.unload()`, drop-in in-process `layerstream.OpenAI` / `AsyncOpenAI` clients, native GBNF / JSON Schema / Pydantic structured decoding (`response_format` / `json_schema`), `<think>` & `<tool_call>` parsing, `recommend()` / `check()` / `inspect_gguf()`, and `.tokenize()` / `.kv_trim()`. Build locally via `nix develop .#python` (see [bindings/python/README.md](bindings/python/README.md)).
 
 ## Build & Test
 

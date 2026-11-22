@@ -5,6 +5,11 @@ pub struct LsEngine {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct LsGrammar {
+    _private: [u8; 0],
+}
+
 pub type LsLoadTensorsCb = unsafe extern "C" fn(
     user_data: *mut c_void,
     layer_idx: i32,
@@ -244,6 +249,48 @@ unsafe extern "C" {
         n_tokens: i32,
         pos_start: i32,
         sample_params: *const LsSampleParams,
+        out_accepted_count: *mut i32,
+        out_next_token: *mut i32,
+        err_buf: *mut c_char,
+        err_cap: usize,
+    ) -> c_int;
+
+    pub fn ls_grammar_create(
+        eng: *const LsEngine,
+        grammar_str: *const c_char,
+        root_rule: *const c_char,
+        err_buf: *mut c_char,
+        err_cap: usize,
+    ) -> *mut LsGrammar;
+
+    pub fn ls_grammar_free(grammar: *mut LsGrammar);
+
+    pub fn ls_grammar_accept(
+        grammar: *mut LsGrammar,
+        token: i32,
+        err_buf: *mut c_char,
+        err_cap: usize,
+    ) -> c_int;
+
+    pub fn ls_engine_eval_with_grammar(
+        eng: *mut LsEngine,
+        tokens: *const i32,
+        n_tokens: i32,
+        pos_start: i32,
+        sample_params: *const LsSampleParams,
+        grammar: *mut LsGrammar,
+        out_next_token: *mut i32,
+        err_buf: *mut c_char,
+        err_cap: usize,
+    ) -> c_int;
+
+    pub fn ls_engine_eval_verify_with_grammar(
+        eng: *mut LsEngine,
+        tokens: *const i32,
+        n_tokens: i32,
+        pos_start: i32,
+        sample_params: *const LsSampleParams,
+        grammar: *mut LsGrammar,
         out_accepted_count: *mut i32,
         out_next_token: *mut i32,
         err_buf: *mut c_char,

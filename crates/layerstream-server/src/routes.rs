@@ -755,6 +755,7 @@ async fn chat_completions(
         stop: req.stop.map(StopSpec::into_vec).unwrap_or_default(),
         enable_ngram_speculation: state.config.enable_ngram_speculation,
         max_draft_tokens: state.config.max_draft_tokens,
+        grammar: None,
     };
 
     let req_id = format!("chatcmpl-ls-{}", unix_now_nanos());
@@ -1058,6 +1059,7 @@ async fn text_completions(
         stop: req.stop.map(StopSpec::into_vec).unwrap_or_default(),
         enable_ngram_speculation: state.config.enable_ngram_speculation,
         max_draft_tokens: state.config.max_draft_tokens,
+        grammar: None,
     };
 
     let req_id = format!("cmpl-ls-{}", unix_now_nanos());
