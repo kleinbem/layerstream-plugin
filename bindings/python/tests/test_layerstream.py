@@ -495,17 +495,72 @@ def test_sigint_cancels_streaming_and_non_streaming_generation(
         recovered2 = model.generate("a b c d", max_tokens=4, temperature=0.0)
         assert recovered2 == recovered
 
+        # 3. SIGINT must promptly interrupt both stream=False and stream=True while another
+        # retained stream holds the engine mutex (neither call can complete until SIGINT cancels).
+        held_stream = model.generate(
+            "a b c d e f",
+            max_tokens=192,
+            temperature=0.0,
+            stream=True,
+            ngram_speculation=False,
+        )
+        try:
+            assert isinstance(next(held_stream), str)
+            # Let the retained stream fill its 64-slot channel and hold the engine mutex.
+            time.sleep(0.2)
+
+            timer = threading.Timer(0.05, signal.raise_signal, args=(signal.SIGINT,))
+            started = time.monotonic()
+            timer.start()
+            try:
+                with pytest.raises(KeyboardInterrupt):
+                    model.generate(
+                        "a b c d e f",
+                        max_tokens=64,
+                        temperature=0.0,
+                        ngram_speculation=False,
+                    )
+            finally:
+                timer.cancel()
+            assert time.monotonic() - started < 2.0
+
+            blocked_stream = model.generate(
+                "a b c d e f",
+                max_tokens=64,
+                temperature=0.0,
+                stream=True,
+                ngram_speculation=False,
+            )
+            timer = threading.Timer(0.05, signal.raise_signal, args=(signal.SIGINT,))
+            started = time.monotonic()
+            timer.start()
+            try:
+                with pytest.raises(KeyboardInterrupt):
+                    next(blocked_stream)
+            finally:
+                timer.cancel()
+                blocked_stream.close()
+            assert time.monotonic() - started < 2.0
+        finally:
+            held_stream.close()
+
+        recovered3 = model.generate("a b c d", max_tokens=4, temperature=0.0)
+        assert recovered3 == recovered
+
 
 def test_interpreter_exit_with_live_model_and_stream(synthetic_gguf: Path) -> None:
     """Exiting Python without calling .close() or .unload() must not crash or hang."""
     script = (
+        "import time\n"
         "from layerstream import AutoModel\n"
         f"m = AutoModel.from_pretrained({str(synthetic_gguf)!r}, use_gpu=False, "
-        "ctx_size=128, batch_size=64, vram_budget_mb=0, prefer_direct_io=False)\n"
-        "s = m.generate('a b c d', max_tokens=64, temperature=0.0, stream=True, "
+        "ctx_size=256, batch_size=64, vram_budget_mb=0, prefer_direct_io=False)\n"
+        "s = m.generate('a b c d', max_tokens=192, temperature=0.0, stream=True, "
         "ngram_speculation=False)\n"
         "first = next(s)\n"
         "assert isinstance(first, str)\n"
+        "# Give the worker time to fill the 64-slot channel and block on send.\n"
+        "time.sleep(0.25)\n"
         "# Intentionally exit without closing s or unloading m.\n"
     )
     proc = subprocess.run(

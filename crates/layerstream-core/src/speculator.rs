@@ -113,10 +113,28 @@ impl DraftModelProposer {
 
     /// Synchronizes draft KV state with the committed `history` and drafts up to `limit` tokens.
     pub fn propose(&mut self, history: &[i32], limit: usize) -> Result<Vec<i32>> {
+        self.propose_with_cancel(history, limit, None)
+    }
+
+    /// Synchronizes draft KV state with `history` and drafts up to `limit` tokens,
+    /// checking `cancel` on both the Rust chunk loop and the underlying C++ draft engine.
+    /// If cancelled mid-evaluation, resets draft KV state so partial evaluation never leaks.
+    pub fn propose_with_cancel(
+        &mut self,
+        history: &[i32],
+        limit: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<i32>> {
+        let is_cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+        if is_cancelled() {
+            return Ok(Vec::new());
+        }
         let cap = if limit == 0 { self.max_draft } else { limit };
         if cap == 0 || history.is_empty() {
             return Ok(Vec::new());
         }
+
+        let _cancel_guard = self.draft.install_cancel_cb(cancel);
 
         // Synchronize draft KV strictly by token identity (longest common prefix), not just length.
         let common = self
@@ -153,6 +171,10 @@ impl DraftModelProposer {
         if self.synced_tokens.len() < history.len() {
             let delta = &history[self.synced_tokens.len()..];
             for chunk in delta.chunks(self.draft_batch) {
+                if is_cancelled() {
+                    self.reset();
+                    return Ok(Vec::new());
+                }
                 match self.draft.eval_greedy(chunk, self.draft_pos) {
                     Ok(tok) => {
                         next_draft = tok;
@@ -160,6 +182,9 @@ impl DraftModelProposer {
                     }
                     Err(e) => {
                         self.reset();
+                        if is_cancelled() {
+                            return Ok(Vec::new());
+                        }
                         return Err(e);
                     }
                 }
@@ -177,6 +202,10 @@ impl DraftModelProposer {
         let eff_cap = cap.min(max_by_ctx);
         let mut proposed = Vec::with_capacity(eff_cap);
         for _ in 0..eff_cap {
+            if is_cancelled() {
+                self.reset();
+                return Ok(Vec::new());
+            }
             if self.draft.token_is_eog(next_draft) {
                 break;
             }
@@ -194,6 +223,9 @@ impl DraftModelProposer {
                 }
                 Err(e) => {
                     self.reset();
+                    if is_cancelled() {
+                        return Ok(Vec::new());
+                    }
                     return Err(e);
                 }
             }

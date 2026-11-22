@@ -269,6 +269,7 @@ fn map_open_err(err: anyhow::Error) -> PyErr {
 #[pyclass]
 pub struct AutoModel {
     inner: Arc<Mutex<Option<LoadedEngine>>>,
+    loaded: Arc<AtomicBool>,
 }
 
 #[pymethods]
@@ -424,6 +425,7 @@ impl AutoModel {
 
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(loaded))),
+            loaded: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -507,21 +509,15 @@ impl AutoModel {
     ) -> PyResult<Py<PyAny>> {
         let parsed_messages = parse_chat_messages(messages)?;
         let stop_seqs = parse_stop_sequences(stop)?;
-        let inner = self.inner.clone();
 
-        let prompt = py
-            .detach(move || -> anyhow::Result<String> {
-                let guard = inner
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
-                let loaded = guard
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("model has been unloaded"))?;
-                loaded
-                    .engine
-                    .apply_chat_template(&parsed_messages, add_generation_prompt)
-            })
-            .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+        let prompt = with_engine_checking_signals(py, &self.inner, |guard| {
+            let loaded = guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("model has been unloaded"))?;
+            loaded
+                .engine
+                .apply_chat_template(&parsed_messages, add_generation_prompt)
+        })?;
 
         let opts = GenerateOptions {
             max_tokens,
@@ -632,9 +628,8 @@ impl AutoModel {
     }
 
     #[getter]
-    fn is_loaded(&self, py: Python<'_>) -> bool {
-        let inner = self.inner.clone();
-        py.detach(move || inner.lock().map(|g| g.is_some()).unwrap_or(false))
+    fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::Acquire)
     }
 
     #[getter]
@@ -651,11 +646,13 @@ impl AutoModel {
     /// Deterministically drop model weights, KV cache, ping-pong buffers, and draft model.
     fn unload(&self, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.clone();
+        let loaded = self.loaded.clone();
         py.detach(move || -> anyhow::Result<()> {
             let dropped = {
                 let mut guard = inner
                     .lock()
                     .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
+                loaded.store(false, Ordering::Release);
                 guard.take()
             };
             drop(dropped);
@@ -688,6 +685,59 @@ impl AutoModel {
     }
 }
 
+fn with_engine_checking_signals<T, F>(
+    py: Python<'_>,
+    inner: &Arc<Mutex<Option<LoadedEngine>>>,
+    mut f: F,
+) -> PyResult<T>
+where
+    T: Send,
+    F: FnMut(&mut Option<LoadedEngine>) -> anyhow::Result<T> + Send,
+{
+    enum Step<T> {
+        Ready(anyhow::Result<T>),
+        Busy,
+    }
+
+    loop {
+        py.check_signals()?;
+        let step = py.detach(|| match inner.try_lock() {
+            Ok(mut guard) => Step::Ready(f(&mut guard)),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(5));
+                Step::Busy
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Step::Ready(Err(anyhow::anyhow!("model lock poisoned")))
+            }
+        });
+        match step {
+            Step::Ready(res) => return res.map_err(|e| PyRuntimeError::new_err(format!("{e:#}"))),
+            Step::Busy => continue,
+        }
+    }
+}
+
+fn lock_engine_with_cancel<'a>(
+    inner: &'a Mutex<Option<LoadedEngine>>,
+    cancel: &AtomicBool,
+) -> anyhow::Result<Option<std::sync::MutexGuard<'a, Option<LoadedEngine>>>> {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match inner.try_lock() {
+            Ok(guard) => return Ok(Some(guard)),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                anyhow::bail!("model lock poisoned");
+            }
+        }
+    }
+}
+
 impl AutoModel {
     fn run_generation(
         &self,
@@ -705,9 +755,9 @@ impl AutoModel {
 
             let worker = std::thread::spawn(move || {
                 let res = (|| -> anyhow::Result<String> {
-                    let mut guard = inner
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
+                    let Some(mut guard) = lock_engine_with_cancel(&inner, &worker_cancel)? else {
+                        return Ok(String::new());
+                    };
                     let loaded = guard
                         .as_mut()
                         .ok_or_else(|| anyhow::anyhow!("model has been unloaded"))?;
@@ -767,11 +817,7 @@ impl AutoModel {
         }
 
         // Fail fast if already unloaded before spawning a stream worker thread.
-        let is_loaded = {
-            let inner = self.inner.clone();
-            py.detach(move || inner.lock().map(|g| g.is_some()).unwrap_or(false))
-        };
-        if !is_loaded {
+        if !self.loaded.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("model has been unloaded"));
         }
 
@@ -782,9 +828,9 @@ impl AutoModel {
 
         let worker = std::thread::spawn(move || {
             let res = (|| -> anyhow::Result<()> {
-                let mut guard = inner
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
+                let Some(mut guard) = lock_engine_with_cancel(&inner, &worker_cancel)? else {
+                    return Ok(());
+                };
                 let loaded = guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("model has been unloaded"))?;
