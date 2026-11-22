@@ -60,9 +60,11 @@ import layerstream
 # Rank GGUF quantizations in any HF repo (or base repo with -GGUF sibling) against GPU + NVMe:
 recs = layerstream.recommend("Qwen/Qwen3-30B-A3B-GGUF")
 
-# Header-only (~20 ms, 0 MB VRAM) metadata & preflight check:
-report = layerstream.check("hf://Qwen/Qwen2.5-14B-Instruct-GGUF:qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf")
+# Header-only (~20 ms, 0 MB VRAM) local GGUF metadata inspection:
 info = layerstream.inspect_gguf("/models/Qwen2.5-14B-Instruct-Q4_K_M.gguf")
+
+# Preflight check (resolves/downloads uncached HF specs, probes GPU VRAM, and benchmarks storage I/O):
+report = layerstream.check("hf://Qwen/Qwen2.5-14B-Instruct-GGUF:qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf")
 ```
 
 `AutoModel` also exposes `.tokenize(text)`, `.detokenize(ids)`, `.apply_chat_template(messages)`, `.kv_clear()`, `.kv_trim(pos_min)`, `grammar=...`, `json_schema=...`, `tools=[...]`, `parse_output=True`, and `async for` on `TokenStream`.

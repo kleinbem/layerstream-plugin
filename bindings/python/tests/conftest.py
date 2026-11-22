@@ -65,12 +65,66 @@ def write_synthetic_mixed_dense_moe_gguf(
 
     tensors: list[tuple[str, list[int], bytes, int]] = []
 
+    json_extras = [
+        "{",
+        "}",
+        "[",
+        "]",
+        ":",
+        ",",
+        '"',
+        "-",
+        ".",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "_",
+        "\n",
+    ]
+
     def push_tensor(name: str, dims: list[int], is_norm: bool) -> None:
         nelems = math.prod(dims)
         vals = [
             (1.0 + next_f32(0.05)) if is_norm else next_f32(0.15)
             for _ in range(nelems)
         ]
+        if include_json_tokens:
+            if name == "token_embd.weight":
+                # Keep channel 0 positive across every token embedding so output.weight[:, 0]
+                # acts as a deterministic delimiter preference for unbounded GBNF repetitions.
+                for v in range(n_vocab):
+                    vals[v * n_embd] = 2.0
+            elif name == "output.weight":
+                tok_bias: dict[int, float] = {
+                    1: -0.5,  # <eos>: loses to letters unconstrained, beats trailing ws after '}'
+                    2: -1.5,  # ' '
+                }
+                for v in range(3, min(29, n_vocab)):
+                    tok_bias[v] = 0.4
+                extra_bias = {
+                    "}": 2.8,
+                    "]": 2.6,
+                    '"': 2.4,
+                    ",": 1.8,
+                    ".": 1.5,
+                    "1": 1.2,
+                    "\n": -1.5,
+                }
+                for idx_e, tok_s in enumerate(json_extras):
+                    tid = 29 + idx_e
+                    if tid < n_vocab:
+                        tok_bias[tid] = extra_bias.get(tok_s, -1.2)
+                for tid, bval in tok_bias.items():
+                    vals[tid * n_embd] = bval
+            elif not is_norm:
+                vals = [x * 0.15 for x in vals]
         raw = struct.pack(f"<{nelems}f", *vals)
         tensors.append((name, dims, raw, 0))
 

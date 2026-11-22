@@ -13,16 +13,21 @@ callers:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import dataclasses
+import enum
 import json
+import sys
 import threading
 import time
+import types
+import typing
 import uuid
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from types import TracebackType
-from typing import Any
+from typing import Any, Literal, Union, get_args, get_origin
 
 from ._layerstream import (
     StreamTagParser,
@@ -233,22 +238,214 @@ class SyncPage:
     to_dict = model_dump
 
 
+def _ast_node_to_json_schema(node: ast.AST, field_label: str) -> dict[str, Any]:
+    if isinstance(node, ast.Constant):
+        if node.value is None:
+            return {"type": "null"}
+        if isinstance(node.value, (str, int, float, bool)):
+            return {"const": node.value}
+        raise TypeError(f"unsupported literal annotation {node.value!r} on '{field_label}'")
+
+    if isinstance(node, ast.Name):
+        prim = {
+            "str": {"type": "string"},
+            "int": {"type": "integer"},
+            "float": {"type": "number"},
+            "bool": {"type": "boolean"},
+            "None": {"type": "null"},
+            "NoneType": {"type": "null"},
+            "list": {"type": "array"},
+            "Sequence": {"type": "array"},
+            "dict": {"type": "object"},
+            "Mapping": {"type": "object"},
+            "Any": {},
+        }
+        if node.id in prim:
+            return dict(prim[node.id])
+        raise TypeError(f"unsupported dataclass field annotation '{node.id}' on '{field_label}'")
+
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        left = _ast_node_to_json_schema(node.left, field_label)
+        right = _ast_node_to_json_schema(node.right, field_label)
+        branches: list[dict[str, Any]] = []
+        for part in (left, right):
+            if set(part.keys()) == {"anyOf"} and isinstance(part["anyOf"], list):
+                branches.extend(part["anyOf"])
+            else:
+                branches.append(part)
+        return {"anyOf": branches}
+
+    if isinstance(node, ast.Subscript):
+        base_name = (
+            node.value.id
+            if isinstance(node.value, ast.Name)
+            else (node.value.attr if isinstance(node.value, ast.Attribute) else None)
+        )
+        args = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+        if base_name in ("list", "List", "Sequence"):
+            if len(args) != 1:
+                raise TypeError(f"invalid {base_name} annotation on '{field_label}'")
+            return {"type": "array", "items": _ast_node_to_json_schema(args[0], field_label)}
+        if base_name in ("Optional",):
+            if len(args) != 1:
+                raise TypeError(f"invalid Optional annotation on '{field_label}'")
+            return {"anyOf": [_ast_node_to_json_schema(args[0], field_label), {"type": "null"}]}
+        if base_name in ("Union",):
+            if not args:
+                raise TypeError(f"empty Union annotation on '{field_label}'")
+            return {"anyOf": [_ast_node_to_json_schema(a, field_label) for a in args]}
+        if base_name in ("dict", "Dict", "Mapping"):
+            if len(args) != 2:
+                raise TypeError(f"invalid {base_name} annotation on '{field_label}'")
+            key_s = _ast_node_to_json_schema(args[0], field_label)
+            if key_s != {"type": "string"}:
+                raise TypeError(
+                    f"JSON object keys in '{field_label}' must be 'str', got {ast.unparse(args[0])}"
+                )
+            return {
+                "type": "object",
+                "additionalProperties": _ast_node_to_json_schema(args[1], field_label),
+            }
+        if base_name in ("tuple", "Tuple"):
+            if len(args) == 1 and isinstance(args[0], ast.Tuple) and not args[0].elts:
+                return {"type": "array", "maxItems": 0}
+            if (
+                len(args) == 2
+                and isinstance(args[1], ast.Constant)
+                and args[1].value is Ellipsis
+            ):
+                return {"type": "array", "items": _ast_node_to_json_schema(args[0], field_label)}
+            pfx = [_ast_node_to_json_schema(a, field_label) for a in args]
+            return {
+                "type": "array",
+                "prefixItems": pfx,
+                "minItems": len(pfx),
+                "maxItems": len(pfx),
+            }
+        if base_name == "Literal":
+            vals: list[Any] = []
+            for a in args:
+                if isinstance(a, ast.Constant) and isinstance(
+                    a.value, (str, int, float, bool, type(None))
+                ):
+                    vals.append(a.value)
+                elif (
+                    isinstance(a, ast.UnaryOp)
+                    and isinstance(a.op, ast.USub)
+                    and isinstance(a.operand, ast.Constant)
+                    and isinstance(a.operand.value, (int, float))
+                ):
+                    vals.append(-a.operand.value)
+                else:
+                    raise TypeError(f"unsupported Literal entry on '{field_label}'")
+            return {"enum": vals}
+
+    raise TypeError(f"unsupported dataclass field annotation '{ast.unparse(node)}' on '{field_label}'")
+
+
+def _annotation_to_json_schema(tp: Any, field_label: str) -> dict[str, Any]:
+    if tp is Any:
+        return {}
+    if tp is None or tp is types.NoneType:
+        return {"type": "null"}
+    if tp is str:
+        return {"type": "string"}
+    if tp is int:
+        return {"type": "integer"}
+    if tp is float:
+        return {"type": "number"}
+    if tp is bool:
+        return {"type": "boolean"}
+    if tp is list:
+        return {"type": "array"}
+    if tp is dict:
+        return {"type": "object"}
+
+    if isinstance(tp, str):
+        try:
+            parsed_ast = ast.parse(tp, mode="eval").body
+        except SyntaxError as exc:
+            raise TypeError(
+                f"invalid string annotation {tp!r} on '{field_label}'"
+            ) from exc
+        return _ast_node_to_json_schema(parsed_ast, field_label)
+
+    if isinstance(tp, type):
+        if issubclass(tp, enum.Enum):
+            return {"enum": [member.value for member in tp]}
+        if dataclasses.is_dataclass(tp):
+            return _dataclass_to_json_schema(tp)
+        if hasattr(tp, "model_json_schema"):
+            return dict(tp.model_json_schema())
+        if hasattr(tp, "schema"):
+            return dict(tp.schema())
+
+    origin = get_origin(tp)
+    args = get_args(tp)
+    if origin in (Union, types.UnionType):
+        return {"anyOf": [_annotation_to_json_schema(a, field_label) for a in args]}
+    if origin is Literal:
+        for a in args:
+            if not isinstance(a, (str, int, float, bool, type(None))):
+                raise TypeError(f"unsupported Literal value {a!r} on '{field_label}'")
+        return {"enum": list(args)}
+    if origin in (list, Sequence):
+        if not args:
+            return {"type": "array"}
+        return {"type": "array", "items": _annotation_to_json_schema(args[0], field_label)}
+    if origin is tuple:
+        if not args:
+            return {"type": "array"}
+        if len(args) == 1 and args[0] == ():
+            return {"type": "array", "maxItems": 0}
+        if len(args) == 2 and args[1] is Ellipsis:
+            return {"type": "array", "items": _annotation_to_json_schema(args[0], field_label)}
+        pfx = [_annotation_to_json_schema(a, field_label) for a in args]
+        return {
+            "type": "array",
+            "prefixItems": pfx,
+            "minItems": len(pfx),
+            "maxItems": len(pfx),
+        }
+    if origin in (dict, Mapping):
+        if not args:
+            return {"type": "object"}
+        if args[0] is not str:
+            raise TypeError(
+                f"JSON object keys in '{field_label}' must be 'str', got {args[0]!r}"
+            )
+        return {
+            "type": "object",
+            "additionalProperties": _annotation_to_json_schema(args[1], field_label),
+        }
+
+    raise TypeError(f"unsupported dataclass field annotation {tp!r} on '{field_label}'")
+
+
+def _resolve_dataclass_field_types(dc_cls: type[Any]) -> dict[str, Any]:
+    mod_ns = getattr(sys.modules.get(dc_cls.__module__), "__dict__", None)
+    try:
+        return typing.get_type_hints(dc_cls, globalns=mod_ns)
+    except Exception:
+        out: dict[str, Any] = {}
+        for f in dataclasses.fields(dc_cls):
+            if isinstance(f.type, str) and mod_ns is not None:
+                try:
+                    out[f.name] = eval(f.type, mod_ns)  # noqa: S307
+                    continue
+                except Exception:
+                    pass
+            out[f.name] = f.type
+        return out
+
+
 def _dataclass_to_json_schema(dc_cls: type[Any]) -> dict[str, Any]:
-    type_map: dict[Any, dict[str, Any]] = {
-        str: {"type": "string"},
-        "str": {"type": "string"},
-        int: {"type": "integer"},
-        "int": {"type": "integer"},
-        float: {"type": "number"},
-        "float": {"type": "number"},
-        bool: {"type": "boolean"},
-        "bool": {"type": "boolean"},
-    }
+    resolved_types = _resolve_dataclass_field_types(dc_cls)
     props: dict[str, Any] = {}
     required: list[str] = []
     for f in dataclasses.fields(dc_cls):
-        py_t = f.type
-        props[f.name] = type_map.get(py_t, {"type": "string"})
+        py_t = resolved_types.get(f.name, f.type)
+        props[f.name] = _annotation_to_json_schema(py_t, f"{dc_cls.__name__}.{f.name}")
         if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:
             required.append(f.name)
     return {
@@ -257,6 +454,50 @@ def _dataclass_to_json_schema(dc_cls: type[Any]) -> dict[str, Any]:
         "required": required,
         "additionalProperties": False,
     }
+
+
+def _coerce_value_for_type(val: Any, tp: Any) -> Any:
+    if val is None or isinstance(tp, str):
+        return val
+    if isinstance(tp, type):
+        if issubclass(tp, enum.Enum):
+            return tp(val)
+        if dataclasses.is_dataclass(tp) and isinstance(val, Mapping):
+            return _instantiate_dataclass(tp, val)
+        return val
+    origin = get_origin(tp)
+    args = get_args(tp)
+    if origin in (Union, types.UnionType):
+        for branch in args:
+            if branch is types.NoneType and val is None:
+                return None
+            try:
+                return _coerce_value_for_type(val, branch)
+            except Exception:
+                continue
+        return val
+    if origin in (list, Sequence) and args and isinstance(val, list):
+        return [_coerce_value_for_type(v, args[0]) for v in val]
+    if origin is tuple and isinstance(val, list):
+        if len(args) == 2 and args[1] is Ellipsis:
+            return tuple(_coerce_value_for_type(v, args[0]) for v in val)
+        if args and len(args) == len(val):
+            return tuple(_coerce_value_for_type(v, a) for v, a in zip(val, args, strict=True))
+        return tuple(val)
+    if origin in (dict, Mapping) and len(args) == 2 and isinstance(val, Mapping):
+        return {k: _coerce_value_for_type(v, args[1]) for k, v in val.items()}
+    return val
+
+
+def _instantiate_dataclass(dc_cls: type[Any], data: Mapping[str, Any]) -> Any:
+    resolved_types = _resolve_dataclass_field_types(dc_cls)
+    kwargs: dict[str, Any] = {}
+    for k, v in data.items():
+        if k in resolved_types:
+            kwargs[k] = _coerce_value_for_type(v, resolved_types[k])
+        else:
+            kwargs[k] = v
+    return dc_cls(**kwargs)
 
 
 def _compile_response_format(response_format: Any) -> tuple[str | None, Any]:
@@ -311,7 +552,7 @@ def _parse_structured_text(raw_text: str, parser_target: Any) -> Any:
     if isinstance(parser_target, type) and dataclasses.is_dataclass(parser_target):
         if not isinstance(data, Mapping):
             raise ValueError("expected JSON object for dataclass response_format")
-        return parser_target(**data)
+        return _instantiate_dataclass(parser_target, data)
     return data
 
 
@@ -329,14 +570,12 @@ class ChatCompletionStream(Iterator[ChatCompletionChunk]):
     def __init__(
         self,
         token_stream: Any,
-        owner_model: Any,
         req_id: str,
         created: int,
         model_id: str,
         structured_json: bool,
     ) -> None:
         self._stream = token_stream
-        self._owner_model = owner_model
         self._id = req_id
         self._created = created
         self._model_id = model_id
@@ -439,7 +678,7 @@ class ChatCompletionStream(Iterator[ChatCompletionChunk]):
                 self._finished = True
                 if self._tag_parser is not None:
                     self._enqueue_deltas(self._tag_parser.flush())
-                summary = self._owner_model.last_summary
+                summary = getattr(self._stream, "summary", None)
                 raw_reason = summary["finish_reason"] if summary else "stop"
                 if self._tag_parser is not None and self._tag_parser.has_tool_calls:
                     finish_reason = "tool_calls"
@@ -493,7 +732,14 @@ class ChatCompletionStream(Iterator[ChatCompletionChunk]):
             except StopIteration:
                 return False, None
 
-        has_item, chunk = await asyncio.to_thread(_step)
+        try:
+            has_item, chunk = await asyncio.to_thread(_step)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.to_thread(self.close)
+            except asyncio.CancelledError:
+                self.close()
+            raise
         if not has_item or chunk is None:
             raise StopAsyncIteration
         return chunk
@@ -520,13 +766,11 @@ class CompletionStream(Iterator[Completion]):
     def __init__(
         self,
         token_stream: Any,
-        owner_model: Any,
         req_id: str,
         created: int,
         model_id: str,
     ) -> None:
         self._stream = token_stream
-        self._owner_model = owner_model
         self._id = req_id
         self._created = created
         self._model_id = model_id
@@ -564,7 +808,7 @@ class CompletionStream(Iterator[Completion]):
             )
         except StopIteration:
             self._finished = True
-            summary = self._owner_model.last_summary
+            summary = getattr(self._stream, "summary", None)
             reason = summary["finish_reason"] if summary else "stop"
             return Completion(
                 id=self._id,
@@ -584,10 +828,29 @@ class CompletionStream(Iterator[Completion]):
             except StopIteration:
                 return False, None
 
-        has_item, item = await asyncio.to_thread(_step)
+        try:
+            has_item, item = await asyncio.to_thread(_step)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.to_thread(self.close)
+            except asyncio.CancelledError:
+                self.close()
+            raise
         if not has_item or item is None:
             raise StopAsyncIteration
         return item
+
+    async def __aenter__(self) -> CompletionStream:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_val: BaseException | None = None,
+        exc_tb: TracebackType | None = None,
+    ) -> bool:
+        await self.aclose()
+        return False
 
     async def aclose(self) -> None:
         await asyncio.to_thread(self.close)
@@ -718,29 +981,44 @@ class _ChatCompletionsResource:
             )
             return ChatCompletionStream(
                 tok_stream,
-                eng,
                 req_id,
                 created,
                 model_id,
                 structured_json=grammar is not None,
             )
 
-        raw = eng.chat(
-            messages,
-            max_tokens=eff_max,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            seed=seed,
-            stop=stop,
-            stream=False,
-            tools=tools,
-            grammar=grammar,
-            ngram_speculation=ngram_speculation,
-            max_draft_tokens=max_draft_tokens,
-        )
+        if hasattr(eng, "_chat_with_summary"):
+            raw, summary = eng._chat_with_summary(
+                messages,
+                max_tokens=eff_max,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                seed=seed,
+                stop=stop,
+                tools=tools,
+                grammar=grammar,
+                ngram_speculation=ngram_speculation,
+                max_draft_tokens=max_draft_tokens,
+            )
+        else:
+            raw = eng.chat(
+                messages,
+                max_tokens=eff_max,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                seed=seed,
+                stop=stop,
+                stream=False,
+                tools=tools,
+                grammar=grammar,
+                ngram_speculation=ngram_speculation,
+                max_draft_tokens=max_draft_tokens,
+            )
+            summary = getattr(eng, "last_summary", None)
+
         assert isinstance(raw, str)
-        summary = eng.last_summary
         raw_reason = summary["finish_reason"] if summary else "stop"
 
         if grammar is not None:
@@ -865,24 +1143,40 @@ class _CompletionsResource:
                 ngram_speculation=ngram_speculation,
                 max_draft_tokens=max_draft_tokens,
             )
-            return CompletionStream(tok_stream, eng, req_id, created, model_id)
+            return CompletionStream(tok_stream, req_id, created, model_id)
 
-        text = eng.generate(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            seed=seed,
-            stop=stop,
-            stream=False,
-            grammar=grammar,
-            json_schema=json_schema,
-            ngram_speculation=ngram_speculation,
-            max_draft_tokens=max_draft_tokens,
-        )
+        if hasattr(eng, "_generate_with_summary"):
+            text, summary = eng._generate_with_summary(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                seed=seed,
+                stop=stop,
+                grammar=grammar,
+                json_schema=json_schema,
+                ngram_speculation=ngram_speculation,
+                max_draft_tokens=max_draft_tokens,
+            )
+        else:
+            text = eng.generate(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                seed=seed,
+                stop=stop,
+                stream=False,
+                grammar=grammar,
+                json_schema=json_schema,
+                ngram_speculation=ngram_speculation,
+                max_draft_tokens=max_draft_tokens,
+            )
+            summary = getattr(eng, "last_summary", None)
+
         assert isinstance(text, str)
-        summary = eng.last_summary
         reason = summary["finish_reason"] if summary else "stop"
         return Completion(
             id=req_id,
@@ -1007,5 +1301,5 @@ class AsyncOpenAI:
         exc_val: BaseException | None = None,
         exc_tb: TracebackType | None = None,
     ) -> bool:
-        await self.aclose()
+        await self.unload()
         return False

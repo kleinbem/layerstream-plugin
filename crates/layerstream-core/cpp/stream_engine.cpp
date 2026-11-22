@@ -2684,15 +2684,48 @@ int32_t ls_engine_apply_chat_template(
     if (!eng || !eng->model || (!messages && n_messages > 0)) {
         return -1;
     }
+    const char * tmpl = llama_model_chat_template(eng->model, nullptr);
+    bool has_tool_role = false;
+    for (size_t i = 0; i < n_messages; ++i) {
+        if (messages[i].role && std::strcmp(messages[i].role, "tool") == 0) {
+            has_tool_role = true;
+            break;
+        }
+    }
+
+    // Check whether the model's embedded template natively preserves `role == "tool"`;
+    // if a non-tool template silently drops `tool` turns, fall back to `"user"` with an
+    // explicit `<tool_response>` wrapper so tool results are never lost or confused with user text.
+    bool map_tool_to_tagged_user = false;
+    if (has_tool_role && tmpl) {
+        const char * marker = "__ls_tool_probe_7f3a__";
+        llama_chat_message probe_msg{"tool", marker};
+        char probe_buf[512];
+        int32_t pn = llama_chat_apply_template(tmpl, &probe_msg, 1, false, probe_buf, sizeof(probe_buf));
+        if (pn >= 0 && pn < static_cast<int32_t>(sizeof(probe_buf))) {
+            std::string rendered_probe(probe_buf, static_cast<size_t>(pn));
+            if (rendered_probe.find(marker) == std::string::npos) {
+                map_tool_to_tagged_user = true;
+            }
+        }
+    }
+
+    std::vector<std::string> wrapped_contents;
     std::vector<llama_chat_message> msgs;
     msgs.reserve(n_messages);
-    for (size_t i = 0; i < n_messages; ++i) {
-        msgs.push_back(llama_chat_message{
-            messages[i].role ? messages[i].role : "user",
-            messages[i].content ? messages[i].content : "",
-        });
+    if (map_tool_to_tagged_user) {
+        wrapped_contents.reserve(n_messages);
     }
-    const char * tmpl = llama_model_chat_template(eng->model, nullptr);
+    for (size_t i = 0; i < n_messages; ++i) {
+        const char * role = messages[i].role ? messages[i].role : "user";
+        const char * content = messages[i].content ? messages[i].content : "";
+        if (map_tool_to_tagged_user && std::strcmp(role, "tool") == 0) {
+            wrapped_contents.push_back(std::string("<tool_response>\n") + content + "\n</tool_response>");
+            msgs.push_back(llama_chat_message{"user", wrapped_contents.back().c_str()});
+        } else {
+            msgs.push_back(llama_chat_message{role, content});
+        }
+    }
     int32_t needed = llama_chat_apply_template(
         tmpl,
         msgs.data(),
@@ -2702,11 +2735,19 @@ int32_t ls_engine_apply_chat_template(
         out_cap
     );
     if (needed < 0) {
-        // Fallback to ChatML if model uses an unrecognized custom Jinja template.
+        // Fallback to ChatML (which natively formats `<|im_start|>tool\n...`) if unrecognized.
+        std::vector<llama_chat_message> raw_msgs;
+        raw_msgs.reserve(n_messages);
+        for (size_t i = 0; i < n_messages; ++i) {
+            raw_msgs.push_back(llama_chat_message{
+                messages[i].role ? messages[i].role : "user",
+                messages[i].content ? messages[i].content : "",
+            });
+        }
         needed = llama_chat_apply_template(
             "chatml",
-            msgs.data(),
-            msgs.size(),
+            raw_msgs.data(),
+            raw_msgs.size(),
             add_assistant_prompt,
             out_buf,
             out_cap
@@ -3272,6 +3313,24 @@ struct SamplerGuard {
     }
 };
 
+struct BatchGuard {
+    llama_batch batch{};
+    bool active = false;
+    explicit BatchGuard(int32_t n_tokens)
+        : batch(llama_batch_init(n_tokens, 0, 1)), active(true) {}
+    BatchGuard(const BatchGuard &) = delete;
+    BatchGuard & operator=(const BatchGuard &) = delete;
+    void free_now() {
+        if (active) {
+            llama_batch_free(batch);
+            active = false;
+        }
+    }
+    ~BatchGuard() {
+        free_now();
+    }
+};
+
 static bool build_grammar_candidates(
     llama_sampler * smpl,
     const float * logits,
@@ -3479,46 +3538,46 @@ int ls_engine_eval_with_grammar(
         return -1;
     }
 
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = pos_start + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
-    }
-
-    using Clock = std::chrono::steady_clock;
-    auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
-    eng->prepare_decode_pass();
-    if (eng->eval_failed) {
-        llama_batch_free(batch);
-        return report_eval_failure(eng, -2, "layer prefetch failed before grammar llama_decode", err_buf, err_cap);
-    }
-
-    const int rc = llama_decode(eng->ctx, batch);
-    llama_batch_free(batch);
-    if (eng->profile_enabled) {
-        eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
-        eng->prof_decode_total_us.fetch_add(
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
-            std::memory_order_relaxed
-        );
-    }
-
-    if (rc != 0 || eng->eval_failed) {
-        return report_eval_failure(eng, rc, "grammar llama_decode failed", err_buf, err_cap);
-    }
-
-    const float * logits = llama_get_logits_ith(eng->ctx, n_tokens - 1);
-    if (!logits) {
-        set_error(err_buf, err_cap, "llama_get_logits_ith returned null");
-        return -4;
-    }
-
-    const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
     try {
+        BatchGuard bg(n_tokens);
+        bg.batch.n_tokens = n_tokens;
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            bg.batch.token[i] = tokens[i];
+            bg.batch.pos[i] = pos_start + i;
+            bg.batch.n_seq_id[i] = 1;
+            bg.batch.seq_id[i][0] = 0;
+            bg.batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
+        }
+
+        using Clock = std::chrono::steady_clock;
+        auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
+        eng->prepare_decode_pass();
+        if (eng->eval_failed) {
+            bg.free_now();
+            return report_eval_failure(eng, -2, "layer prefetch failed before grammar llama_decode", err_buf, err_cap);
+        }
+
+        const int rc = llama_decode(eng->ctx, bg.batch);
+        bg.free_now();
+        if (eng->profile_enabled) {
+            eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
+            eng->prof_decode_total_us.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
+                std::memory_order_relaxed
+            );
+        }
+
+        if (rc != 0 || eng->eval_failed) {
+            return report_eval_failure(eng, rc, "grammar llama_decode failed", err_buf, err_cap);
+        }
+
+        const float * logits = llama_get_logits_ith(eng->ctx, n_tokens - 1);
+        if (!logits) {
+            set_error(err_buf, err_cap, "llama_get_logits_ith returned null");
+            return -4;
+        }
+
+        const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
         std::vector<llama_token_data> cand_buf;
         llama_token_data_array cur_p{};
         if (!build_grammar_candidates(grammar->smpl, logits, n_vocab, cand_buf, cur_p)) {
@@ -3541,10 +3600,10 @@ int ls_engine_eval_with_grammar(
         }
         return 0;
     } catch (const std::exception & e) {
-        set_error(err_buf, err_cap, std::string("grammar sampling failed: ") + e.what());
+        set_error(err_buf, err_cap, std::string("grammar eval failed: ") + e.what());
         return -6;
     } catch (...) {
-        set_error(err_buf, err_cap, "unknown grammar sampling exception");
+        set_error(err_buf, err_cap, "unknown grammar eval exception");
         return -6;
     }
 }
@@ -3566,44 +3625,44 @@ int ls_engine_eval_verify_with_grammar(
         return -1;
     }
 
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = pos_start + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = 1;
-    }
-
-    using Clock = std::chrono::steady_clock;
-    auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
-    eng->prepare_decode_pass();
-    if (eng->eval_failed) {
-        llama_batch_free(batch);
-        return report_eval_failure(eng, -2, "layer prefetch failed before grammar verify llama_decode", err_buf, err_cap);
-    }
-
-    const int rc = llama_decode(eng->ctx, batch);
-    llama_batch_free(batch);
-    if (eng->profile_enabled) {
-        eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
-        eng->prof_decode_total_us.fetch_add(
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
-            std::memory_order_relaxed
-        );
-    }
-
-    if (rc != 0 || eng->eval_failed) {
-        return report_eval_failure(eng, rc, "grammar verify llama_decode failed", err_buf, err_cap);
-    }
-
-    const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
-    const int32_t k = n_tokens - 1;
-    const int32_t * draft_tokens = tokens + 1;
-    const bool is_greedy = (!sample_params || sample_params->temperature <= 0.0f);
-
     try {
+        BatchGuard bg(n_tokens);
+        bg.batch.n_tokens = n_tokens;
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            bg.batch.token[i] = tokens[i];
+            bg.batch.pos[i] = pos_start + i;
+            bg.batch.n_seq_id[i] = 1;
+            bg.batch.seq_id[i][0] = 0;
+            bg.batch.logits[i] = 1;
+        }
+
+        using Clock = std::chrono::steady_clock;
+        auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
+        eng->prepare_decode_pass();
+        if (eng->eval_failed) {
+            bg.free_now();
+            return report_eval_failure(eng, -2, "layer prefetch failed before grammar verify llama_decode", err_buf, err_cap);
+        }
+
+        const int rc = llama_decode(eng->ctx, bg.batch);
+        bg.free_now();
+        if (eng->profile_enabled) {
+            eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
+            eng->prof_decode_total_us.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
+                std::memory_order_relaxed
+            );
+        }
+
+        if (rc != 0 || eng->eval_failed) {
+            return report_eval_failure(eng, rc, "grammar verify llama_decode failed", err_buf, err_cap);
+        }
+
+        const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
+        const int32_t k = n_tokens - 1;
+        const int32_t * draft_tokens = tokens + 1;
+        const bool is_greedy = (!sample_params || sample_params->temperature <= 0.0f);
+
         SamplerGuard step_guard{llama_sampler_clone(grammar->smpl)};
         if (!step_guard.smpl) {
             set_error(err_buf, err_cap, "failed to clone grammar sampler for speculative verification");

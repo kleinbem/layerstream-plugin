@@ -2,9 +2,10 @@
 
 Running `StreamEngine` inside a dedicated child process guarantees the parent Python
 process (e.g., PyTorch, Jupyter, FastAPI) never initializes CUDA/Vulkan/Metal drivers.
-Calling `.unload()` (or exiting `with AutoModel.from_pretrained(..., isolated_worker=True):`)
-terminates and reaps the worker subprocess so the OS kernel immediately reclaims 100% of
-VRAM/UMA, CUDA primary driver contexts (~300-524 MiB), and C++ heap arenas.
+Calling `.unload()` (or exiting `with AutoModel.from_pretrained(..., isolated_worker=True):`,
+or discarding the `AutoModel` and its streams) terminates and reaps the worker subprocess
+so the OS kernel immediately reclaims 100% of VRAM/UMA, CUDA primary driver contexts
+(~300-524 MiB), and C++ heap arenas.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import socket
 import subprocess
 import sys
 import threading
+import weakref
 from collections.abc import Iterator, Mapping, Sequence
 from os import PathLike
 from types import TracebackType
@@ -45,6 +47,114 @@ def _file_not_found_or_runtime(err_type: str, msg: str) -> BaseException:
     return RuntimeError(msg)
 
 
+def _reap_proc(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=3.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=2.0)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=2.0)
+    except Exception:
+        pass
+
+
+class _WorkerState:
+    """Low-level IPC & subprocess state owned via `weakref.finalize` on `_IsolatedWorkerClient`."""
+
+    def __init__(
+        self,
+        proc: subprocess.Popen[bytes],
+        sock: socket.socket,
+    ) -> None:
+        self.proc: subprocess.Popen[bytes] | None = proc
+        self.sock: socket.socket | None = sock
+        self.send_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.next_id = 1
+        self.pending_rpc: dict[int, queue.Queue[dict[str, Any]]] = {}
+        self.active_streams: dict[int, queue.Queue[dict[str, Any]]] = {}
+        self.loaded = False
+        self.model_path: str | None = None
+        self.last_summary: dict[str, Any] | None = None
+
+
+def _shutdown_worker_state(state: _WorkerState) -> None:
+    with state.state_lock:
+        state.loaded = False
+        state.model_path = None
+        sock = state.sock
+        state.sock = None
+        proc = state.proc
+        state.proc = None
+
+    if sock is not None:
+        try:
+            _send_json_line(sock, state.send_lock, {"id": 0, "op": "shutdown", "params": {}})
+        except Exception:
+            pass
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    if proc is not None:
+        _reap_proc(proc)
+
+
+def _reader_loop(state: _WorkerState, reader_file: Any) -> None:
+    try:
+        for line in reader_file:
+            if not line:
+                break
+            msg = json.loads(line)
+            req_id = int(msg["id"])
+            with state.state_lock:
+                stream_q = state.active_streams.get(req_id)
+                rpc_q = state.pending_rpc.get(req_id)
+            if stream_q is not None:
+                stream_q.put(msg)
+            elif rpc_q is not None:
+                rpc_q.put(msg)
+    except Exception:
+        pass
+    finally:
+        try:
+            reader_file.close()
+        except Exception:
+            pass
+        with state.state_lock:
+            state.loaded = False
+            eof_msg = {
+                "ok": False,
+                "event": "error",
+                "err_type": "RuntimeError",
+                "message": "isolated worker exited",
+            }
+            for q in state.pending_rpc.values():
+                q.put(eof_msg)
+            for q in state.active_streams.values():
+                q.put(eof_msg)
+            state.pending_rpc.clear()
+            state.active_streams.clear()
+
+
 class WorkerTokenStream(Iterator[str]):
     """Streaming token iterator backed by an isolated worker subprocess."""
 
@@ -54,10 +164,11 @@ class WorkerTokenStream(Iterator[str]):
         req_id: int,
         ev_queue: queue.Queue[dict[str, Any]],
     ) -> None:
-        self._client = client
+        self._client: _IsolatedWorkerClient | None = client
         self._req_id = req_id
         self._queue = ev_queue
         self._done = False
+        self._summary: dict[str, Any] | None = None
         self._lock = threading.Lock()
 
     def __iter__(self) -> WorkerTokenStream:
@@ -75,12 +186,25 @@ class WorkerTokenStream(Iterator[str]):
         self.close()
         return False
 
+    @property
+    def summary(self) -> dict[str, Any] | None:
+        with self._lock:
+            return dict(self._summary) if self._summary is not None else None
+
     def close(self) -> None:
         with self._lock:
             if self._done:
+                client = self._client
+                self._client = None
                 return
             self._done = True
-        self._client._cancel_stream(self._req_id, self._queue)
+            client = self._client
+            self._client = None
+        if client is not None:
+            sum_out = client._cancel_stream(self._req_id, self._queue)
+            if sum_out is not None:
+                with self._lock:
+                    self._summary = sum_out
 
     def __del__(self) -> None:
         try:
@@ -93,27 +217,38 @@ class WorkerTokenStream(Iterator[str]):
             with self._lock:
                 if self._done:
                     raise StopIteration
+                client = self._client
+            if client is None:
+                raise StopIteration
             try:
                 msg = self._queue.get(timeout=0.05)
             except queue.Empty:
-                if not self._client.is_loaded:
+                if not client.is_loaded:
                     with self._lock:
                         self._done = True
+                        self._client = None
                     raise StopIteration from None
                 continue
+            except KeyboardInterrupt:
+                self.close()
+                raise
 
             kind = msg.get("event")
             if kind == "chunk":
                 return str(msg["text"])
             if kind == "done":
+                summary = msg.get("summary")
                 with self._lock:
                     self._done = True
-                self._client._finish_stream(self._req_id, msg.get("summary"))
+                    self._summary = dict(summary) if isinstance(summary, Mapping) else None
+                    self._client = None
+                client._finish_stream(self._req_id, summary)
                 raise StopIteration
             if kind == "error":
                 with self._lock:
                     self._done = True
-                self._client._finish_stream(self._req_id, None)
+                    self._client = None
+                client._finish_stream(self._req_id, None)
                 raise _file_not_found_or_runtime(
                     str(msg.get("err_type", "RuntimeError")),
                     str(msg.get("message", "worker generation failed")),
@@ -163,24 +298,19 @@ class _IsolatedWorkerClient:
             if conn is not None:
                 conn.close()
             if proc is not None:
-                self._reap_proc(proc)
+                _reap_proc(proc)
             raise RuntimeError(f"failed to start isolated layerstream worker: {exc}") from exc
         finally:
             srv.close()
 
-        self._proc: subprocess.Popen[bytes] | None = proc
-        self._sock: socket.socket | None = conn
-        self._send_lock = threading.Lock()
-        self._state_lock = threading.Lock()
-        self._next_id = 1
-        self._pending_rpc: dict[int, queue.Queue[dict[str, Any]]] = {}
-        self._active_streams: dict[int, queue.Queue[dict[str, Any]]] = {}
-        self._loaded = False
-        self._model_path: str | None = None
-        self._last_summary: dict[str, Any] | None = None
+        state = _WorkerState(proc, conn)
+        self._state = state
+        # Register weakref finalizer BEFORE starting the reader thread (which only captures
+        # `state`, never `self`), so discarding `AutoModel` and its `WorkerTokenStream`s
+        # deterministically shuts down IPC and reaps the child process even without `.unload()`.
+        self._finalizer = weakref.finalize(self, _shutdown_worker_state, state)
 
         reader_file = conn.makefile("r", encoding="utf-8")
-        # Verify auth handshake from child first.
         hello_line = reader_file.readline()
         if not hello_line:
             self.unload()
@@ -191,75 +321,47 @@ class _IsolatedWorkerClient:
             raise RuntimeError("isolated layerstream worker failed authentication handshake")
 
         self._reader_thread = threading.Thread(
-            target=self._reader_loop,
-            args=(reader_file,),
+            target=_reader_loop,
+            args=(state, reader_file),
             name="layerstream-worker-ipc",
             daemon=True,
         )
         self._reader_thread.start()
 
         try:
-            resp = self._rpc("open", open_kwargs)
-            self._loaded = True
-            self._model_path = resp.get("model_path")
+            resp, _ = self._rpc_with_summary("open", open_kwargs)
+            with state.state_lock:
+                state.loaded = True
+                state.model_path = resp.get("model_path")
         except BaseException:
             self.unload()
             raise
 
-    def _reader_loop(self, reader_file: Any) -> None:
-        try:
-            for line in reader_file:
-                if not line:
-                    break
-                msg = json.loads(line)
-                req_id = int(msg["id"])
-                with self._state_lock:
-                    stream_q = self._active_streams.get(req_id)
-                    rpc_q = self._pending_rpc.get(req_id)
-                if stream_q is not None:
-                    stream_q.put(msg)
-                elif rpc_q is not None:
-                    rpc_q.put(msg)
-        except Exception:
-            pass
-        finally:
-            try:
-                reader_file.close()
-            except Exception:
-                pass
-            with self._state_lock:
-                self._loaded = False
-                eof_msg = {
-                    "ok": False,
-                    "event": "error",
-                    "err_type": "RuntimeError",
-                    "message": "isolated worker exited",
-                }
-                for q in self._pending_rpc.values():
-                    q.put(eof_msg)
-                for q in self._active_streams.values():
-                    q.put(eof_msg)
-                self._pending_rpc.clear()
-                self._active_streams.clear()
-
     def _alloc_id(self) -> int:
-        with self._state_lock:
-            rid = self._next_id
-            self._next_id += 1
+        with self._state.state_lock:
+            rid = self._state.next_id
+            self._state.next_id += 1
             return rid
 
     def _rpc(self, op: str, params: dict[str, Any]) -> dict[str, Any]:
-        with self._state_lock:
-            sock = self._sock
-            if sock is None or (op != "open" and not self._loaded):
+        res, _ = self._rpc_with_summary(op, params)
+        return res
+
+    def _rpc_with_summary(
+        self, op: str, params: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        state = self._state
+        with state.state_lock:
+            sock = state.sock
+            if sock is None or (op != "open" and not state.loaded):
                 raise RuntimeError("model has been unloaded")
-            req_id = self._next_id
-            self._next_id += 1
+            req_id = state.next_id
+            state.next_id += 1
             q: queue.Queue[dict[str, Any]] = queue.Queue()
-            self._pending_rpc[req_id] = q
+            state.pending_rpc[req_id] = q
 
         try:
-            _send_json_line(sock, self._send_lock, {"id": req_id, "op": op, "params": params})
+            _send_json_line(sock, state.send_lock, {"id": req_id, "op": op, "params": params})
             while True:
                 try:
                     resp = q.get(timeout=0.05)
@@ -270,10 +372,9 @@ class _IsolatedWorkerClient:
             try:
                 _send_json_line(
                     sock,
-                    self._send_lock,
+                    state.send_lock,
                     {"id": req_id, "op": "cancel", "params": {"target_id": req_id}},
                 )
-                # Wait briefly for worker acknowledgement so lock is clean for the next call.
                 try:
                     q.get(timeout=2.0)
                 except queue.Empty:
@@ -282,47 +383,54 @@ class _IsolatedWorkerClient:
                 pass
             raise
         finally:
-            with self._state_lock:
-                self._pending_rpc.pop(req_id, None)
+            with state.state_lock:
+                state.pending_rpc.pop(req_id, None)
 
         if not resp.get("ok", False):
             raise _file_not_found_or_runtime(
                 str(resp.get("err_type", "RuntimeError")),
                 str(resp.get("message", "worker request failed")),
             )
-        if "summary" in resp and resp["summary"] is not None:
-            with self._state_lock:
-                self._last_summary = resp["summary"]
-        return resp["result"]
+        raw_sum = resp.get("summary")
+        sum_copy = dict(raw_sum) if isinstance(raw_sum, Mapping) else None
+        if sum_copy is not None:
+            with state.state_lock:
+                state.last_summary = dict(sum_copy)
+        return resp["result"], sum_copy
 
     def start_stream(self, op: str, params: dict[str, Any]) -> WorkerTokenStream:
-        with self._state_lock:
-            sock = self._sock
-            if sock is None or not self._loaded:
+        state = self._state
+        with state.state_lock:
+            sock = state.sock
+            if sock is None or not state.loaded:
                 raise RuntimeError("model has been unloaded")
-            req_id = self._next_id
-            self._next_id += 1
+            req_id = state.next_id
+            state.next_id += 1
             ev_q: queue.Queue[dict[str, Any]] = queue.Queue()
-            self._active_streams[req_id] = ev_q
+            state.active_streams[req_id] = ev_q
 
         try:
-            _send_json_line(sock, self._send_lock, {"id": req_id, "op": op, "params": params})
+            _send_json_line(sock, state.send_lock, {"id": req_id, "op": op, "params": params})
         except Exception:
-            with self._state_lock:
-                self._active_streams.pop(req_id, None)
+            with state.state_lock:
+                state.active_streams.pop(req_id, None)
             raise
         return WorkerTokenStream(self, req_id, ev_q)
 
-    def _cancel_stream(self, req_id: int, ev_q: queue.Queue[dict[str, Any]]) -> None:
-        with self._state_lock:
-            sock = self._sock
-            still_active = req_id in self._active_streams
+    def _cancel_stream(
+        self, req_id: int, ev_q: queue.Queue[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        state = self._state
+        with state.state_lock:
+            sock = state.sock
+            still_active = req_id in state.active_streams
         if not still_active or sock is None:
-            return
+            return None
+        captured_summary: dict[str, Any] | None = None
         try:
             _send_json_line(
                 sock,
-                self._send_lock,
+                state.send_lock,
                 {"id": self._alloc_id(), "op": "cancel", "params": {"target_id": req_id}},
             )
             while True:
@@ -331,41 +439,48 @@ class _IsolatedWorkerClient:
                 except queue.Empty:
                     break
                 if msg.get("event") in ("done", "error"):
-                    self._finish_stream(req_id, msg.get("summary"))
+                    raw_sum = msg.get("summary")
+                    captured_summary = dict(raw_sum) if isinstance(raw_sum, Mapping) else None
+                    self._finish_stream(req_id, captured_summary)
                     break
         except Exception:
             pass
         finally:
-            with self._state_lock:
-                self._active_streams.pop(req_id, None)
+            with state.state_lock:
+                state.active_streams.pop(req_id, None)
+        return captured_summary
 
-    def _finish_stream(self, req_id: int, summary: dict[str, Any] | None) -> None:
-        with self._state_lock:
-            self._active_streams.pop(req_id, None)
+    def _finish_stream(self, req_id: int, summary: Mapping[str, Any] | None) -> None:
+        with self._state.state_lock:
+            self._state.active_streams.pop(req_id, None)
             if summary is not None:
-                self._last_summary = summary
+                self._state.last_summary = dict(summary)
 
     @property
     def is_loaded(self) -> bool:
-        with self._state_lock:
-            return self._loaded and self._proc is not None and self._proc.poll() is None
+        with self._state.state_lock:
+            return (
+                self._state.loaded
+                and self._state.proc is not None
+                and self._state.proc.poll() is None
+            )
 
     @property
     def worker_pid(self) -> int | None:
-        with self._state_lock:
-            if self._proc is not None and self._proc.poll() is None:
-                return self._proc.pid
+        with self._state.state_lock:
+            if self._state.proc is not None and self._state.proc.poll() is None:
+                return self._state.proc.pid
             return None
 
     @property
     def model_path(self) -> str | None:
-        with self._state_lock:
-            return self._model_path if self._loaded else None
+        with self._state.state_lock:
+            return self._state.model_path if self._state.loaded else None
 
     @property
     def last_summary(self) -> dict[str, Any] | None:
-        with self._state_lock:
-            return dict(self._last_summary) if self._last_summary is not None else None
+        with self._state.state_lock:
+            return dict(self._state.last_summary) if self._state.last_summary is not None else None
 
     def stats(self) -> dict[str, Any]:
         if not self.is_loaded:
@@ -376,54 +491,7 @@ class _IsolatedWorkerClient:
         return st
 
     def unload(self) -> None:
-        with self._state_lock:
-            self._loaded = False
-            self._model_path = None
-            sock = self._sock
-            self._sock = None
-            proc = self._proc
-            self._proc = None
-
-        if sock is not None:
-            try:
-                _send_json_line(sock, self._send_lock, {"id": 0, "op": "shutdown", "params": {}})
-            except Exception:
-                pass
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            try:
-                sock.close()
-            except Exception:
-                pass
-
-        if proc is not None:
-            self._reap_proc(proc)
-
-    @staticmethod
-    def _reap_proc(proc: subprocess.Popen[bytes]) -> None:
-        try:
-            if proc.stdin is not None:
-                proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=3.0)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            proc.terminate()
-            proc.wait(timeout=2.0)
-            return
-        except Exception:
-            pass
-        try:
-            proc.kill()
-            proc.wait(timeout=2.0)
-        except Exception:
-            pass
+        self._finalizer()
 
 
 def normalize_open_kwargs(
@@ -500,6 +568,19 @@ def serialize_schema_arg(json_schema: Any) -> str | None:
     return json_schema_to_gbnf(json_schema)
 
 
+def validate_tools_arg(tools: Sequence[Mapping[str, Any]] | None) -> list[dict[str, Any]] | None:
+    if tools is None:
+        return None
+    if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes)):
+        raise TypeError("tools must be a sequence of tool dicts")
+    out: list[dict[str, Any]] = []
+    for item in tools:
+        if not isinstance(item, Mapping):
+            raise TypeError("each entry in 'tools' must be a dict/mapping")
+        out.append(dict(item))
+    return out
+
+
 def serialize_messages_arg(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
         raise TypeError("messages must be an iterable of {'role': str, 'content': str} dicts")
@@ -517,6 +598,10 @@ def serialize_messages_arg(messages: Sequence[Mapping[str, Any]]) -> list[dict[s
         d: dict[str, Any] = {"role": role, "content": item.get("content")}
         if "tool_calls" in item and item["tool_calls"] is not None:
             d["tool_calls"] = list(item["tool_calls"])
+        if "name" in item and item["name"] is not None:
+            d["name"] = str(item["name"])
+        if "tool_call_id" in item and item["tool_call_id"] is not None:
+            d["tool_call_id"] = str(item["tool_call_id"])
         out.append(d)
     if not out:
         raise ValueError("messages must not be empty")
@@ -655,6 +740,9 @@ def _run_worker_main(port: int) -> int:
                         )
                     with cancel_lock:
                         active_stream_holder[req_id] = stream_iter
+                        cancelled_before_reg = req_id in cancelled_ids
+                    if cancelled_before_reg:
+                        stream_iter.close()
                     chunks: list[str] = []
                     try:
                         for piece in stream_iter:
@@ -674,6 +762,7 @@ def _run_worker_main(port: int) -> int:
                         result_payload = {"parsed": parse_assistant_output(text_out)}
                     else:
                         result_payload = {"text": text_out}
+                    req_summary = stream_iter.summary or model.last_summary
                     _send_json_line(
                         sock,
                         send_lock,
@@ -681,7 +770,7 @@ def _run_worker_main(port: int) -> int:
                             "id": req_id,
                             "ok": True,
                             "result": result_payload,
-                            "summary": model.last_summary,
+                            "summary": req_summary,
                         },
                     )
                 elif op in ("generate_stream", "chat_stream"):
@@ -695,6 +784,9 @@ def _run_worker_main(port: int) -> int:
                         )
                     with cancel_lock:
                         active_stream_holder[req_id] = stream_iter
+                        cancelled_before_reg = req_id in cancelled_ids
+                    if cancelled_before_reg:
+                        stream_iter.close()
                     try:
                         for piece in stream_iter:
                             with cancel_lock:
@@ -711,10 +803,11 @@ def _run_worker_main(port: int) -> int:
                             active_stream_holder.pop(req_id, None)
                             cancelled_ids.discard(req_id)
                         stream_iter.close()
+                    req_summary = stream_iter.summary or model.last_summary
                     _send_json_line(
                         sock,
                         send_lock,
-                        {"id": req_id, "event": "done", "summary": model.last_summary},
+                        {"id": req_id, "event": "done", "summary": req_summary},
                     )
                 else:
                     raise ValueError(f"unknown worker op '{op}'")

@@ -29,6 +29,7 @@ from ._worker import (
     normalize_open_kwargs as _normalize_open_kwargs,
     serialize_messages_arg as _serialize_messages_arg,
     serialize_schema_arg as _serialize_schema_arg,
+    validate_tools_arg as _validate_tools_arg,
 )
 from .openai import AsyncOpenAI, OpenAI
 
@@ -60,6 +61,10 @@ class TokenStream(Iterator[str], AsyncIterator[str]):
     def close(self) -> None:
         self._inner.close()
 
+    @property
+    def summary(self) -> dict[str, Any] | None:
+        return self._inner.summary
+
     def __aiter__(self) -> TokenStream:
         return self
 
@@ -70,7 +75,14 @@ class TokenStream(Iterator[str], AsyncIterator[str]):
             except StopIteration:
                 return False, None
 
-        has_item, chunk = await asyncio.to_thread(_step)
+        try:
+            has_item, chunk = await asyncio.to_thread(_step)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.to_thread(self.close)
+            except asyncio.CancelledError:
+                self.close()
+            raise
         if not has_item or chunk is None:
             raise StopAsyncIteration
         return chunk
@@ -176,6 +188,94 @@ class AutoModel:
         worker = _IsolatedWorkerClient(open_kwargs)
         return cls(worker, isolated_worker=True)
 
+    def _prepare_generate_worker_params(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        seed: int,
+        stop: str | Sequence[str] | None,
+        ngram_speculation: bool,
+        max_draft_tokens: int | None,
+        grammar: str | None,
+        json_schema: Any,
+    ) -> dict[str, Any]:
+        if grammar is not None and json_schema is not None:
+            raise ValueError("pass at most one of 'grammar' or 'json_schema', not both")
+        if stop is not None and not isinstance(stop, str):
+            if not isinstance(stop, Sequence) or not all(isinstance(s, str) for s in stop):
+                raise TypeError("stop must be None, a string, or a sequence of strings")
+            stop_val: str | list[str] | None = list(stop)
+        else:
+            stop_val = stop
+
+        eff_grammar = grammar if grammar is not None else _serialize_schema_arg(json_schema)
+        if eff_grammar is not None and not eff_grammar.strip():
+            raise ValueError("grammar must not be empty")
+
+        return {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "seed": seed,
+            "stop": stop_val,
+            "ngram_speculation": ngram_speculation,
+            "max_draft_tokens": max_draft_tokens,
+            "grammar": eff_grammar,
+        }
+
+    def _prepare_chat_worker_params(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        seed: int,
+        stop: str | Sequence[str] | None,
+        add_generation_prompt: bool,
+        ngram_speculation: bool,
+        max_draft_tokens: int | None,
+        tools: Sequence[Mapping[str, Any]] | None,
+        grammar: str | None,
+        json_schema: Any,
+    ) -> dict[str, Any]:
+        if grammar is not None and json_schema is not None:
+            raise ValueError("pass at most one of 'grammar' or 'json_schema', not both")
+        if stop is not None and not isinstance(stop, str):
+            if not isinstance(stop, Sequence) or not all(isinstance(s, str) for s in stop):
+                raise TypeError("stop must be None, a string, or a sequence of strings")
+            stop_val: str | list[str] | None = list(stop)
+        else:
+            stop_val = stop
+
+        clean_msgs = _serialize_messages_arg(messages)
+        clean_tools = _validate_tools_arg(tools)
+        eff_grammar = grammar if grammar is not None else _serialize_schema_arg(json_schema)
+        if eff_grammar is not None and not eff_grammar.strip():
+            raise ValueError("grammar must not be empty")
+
+        return {
+            "messages": clean_msgs,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "seed": seed,
+            "stop": stop_val,
+            "add_generation_prompt": add_generation_prompt,
+            "ngram_speculation": ngram_speculation,
+            "max_draft_tokens": max_draft_tokens,
+            "tools": clean_tools,
+            "grammar": eff_grammar,
+        }
+
     def generate(
         self,
         prompt: str,
@@ -211,35 +311,72 @@ class AutoModel:
             return TokenStream(res) if stream else res
 
         assert isinstance(self._backend, _IsolatedWorkerClient)
-        if grammar is not None and json_schema is not None:
-            raise ValueError("pass at most one of 'grammar' or 'json_schema', not both")
-        if stop is not None and not isinstance(stop, str):
-            if not isinstance(stop, Sequence) or not all(isinstance(s, str) for s in stop):
-                raise TypeError("stop must be None, a string, or a sequence of strings")
-            stop_val: str | list[str] | None = list(stop)
-        else:
-            stop_val = stop
-
-        eff_grammar = grammar if grammar is not None else _serialize_schema_arg(json_schema)
-        if eff_grammar is not None and not eff_grammar.strip():
-            raise ValueError("grammar must not be empty")
-
-        params: dict[str, Any] = {
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "seed": seed,
-            "stop": stop_val,
-            "ngram_speculation": ngram_speculation,
-            "max_draft_tokens": max_draft_tokens,
-            "grammar": eff_grammar,
-        }
+        params = self._prepare_generate_worker_params(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            stop=stop,
+            ngram_speculation=ngram_speculation,
+            max_draft_tokens=max_draft_tokens,
+            grammar=grammar,
+            json_schema=json_schema,
+        )
         if stream:
             return TokenStream(self._backend.start_stream("generate_stream", params))
         out = self._backend._rpc("generate", params)
         return str(out["text"])
+
+    def _generate_with_summary(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 256,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        top_k: int = 40,
+        seed: int = 42,
+        stop: str | Sequence[str] | None = None,
+        ngram_speculation: bool = True,
+        max_draft_tokens: int | None = None,
+        grammar: str | None = None,
+        json_schema: Any = None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        if not self._isolated:
+            assert isinstance(self._backend, _NativeAutoModel)
+            text, summary = self._backend.generate_with_summary(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                seed=seed,
+                stop=stop,
+                ngram_speculation=ngram_speculation,
+                max_draft_tokens=max_draft_tokens,
+                grammar=grammar,
+                json_schema=json_schema,
+            )
+            return str(text), summary
+
+        assert isinstance(self._backend, _IsolatedWorkerClient)
+        params = self._prepare_generate_worker_params(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            stop=stop,
+            ngram_speculation=ngram_speculation,
+            max_draft_tokens=max_draft_tokens,
+            grammar=grammar,
+            json_schema=json_schema,
+        )
+        out, summary = self._backend._rpc_with_summary("generate", params)
+        return str(out["text"]), summary
 
     def chat(
         self,
@@ -287,39 +424,85 @@ class AutoModel:
                 "parse_output=True cannot be combined with stream=True "
                 "(use StreamTagParser or layerstream.OpenAI)"
             )
-        if grammar is not None and json_schema is not None:
-            raise ValueError("pass at most one of 'grammar' or 'json_schema', not both")
-        if stop is not None and not isinstance(stop, str):
-            if not isinstance(stop, Sequence) or not all(isinstance(s, str) for s in stop):
-                raise TypeError("stop must be None, a string, or a sequence of strings")
-            stop_val: str | list[str] | None = list(stop)
-        else:
-            stop_val = stop
-
-        clean_msgs = _serialize_messages_arg(messages)
-        eff_grammar = grammar if grammar is not None else _serialize_schema_arg(json_schema)
-        if eff_grammar is not None and not eff_grammar.strip():
-            raise ValueError("grammar must not be empty")
-
-        params: dict[str, Any] = {
-            "messages": clean_msgs,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "seed": seed,
-            "stop": stop_val,
-            "add_generation_prompt": add_generation_prompt,
-            "ngram_speculation": ngram_speculation,
-            "max_draft_tokens": max_draft_tokens,
-            "tools": list(tools) if tools is not None else None,
-            "grammar": eff_grammar,
-        }
+        params = self._prepare_chat_worker_params(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            stop=stop,
+            add_generation_prompt=add_generation_prompt,
+            ngram_speculation=ngram_speculation,
+            max_draft_tokens=max_draft_tokens,
+            tools=tools,
+            grammar=grammar,
+            json_schema=json_schema,
+        )
         if stream:
             return TokenStream(self._backend.start_stream("chat_stream", params))
         params["parse_output"] = parse_output
         out = self._backend._rpc("chat", params)
         return out["parsed"] if parse_output else str(out["text"])
+
+    def _chat_with_summary(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        max_tokens: int = 256,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        top_k: int = 40,
+        seed: int = 42,
+        stop: str | Sequence[str] | None = None,
+        add_generation_prompt: bool = True,
+        ngram_speculation: bool = True,
+        max_draft_tokens: int | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        grammar: str | None = None,
+        json_schema: Any = None,
+        parse_output: bool = False,
+    ) -> tuple[str | dict[str, Any], dict[str, Any] | None]:
+        if not self._isolated:
+            assert isinstance(self._backend, _NativeAutoModel)
+            payload, summary = self._backend.chat_with_summary(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                seed=seed,
+                stop=stop,
+                add_generation_prompt=add_generation_prompt,
+                ngram_speculation=ngram_speculation,
+                max_draft_tokens=max_draft_tokens,
+                tools=tools,
+                grammar=grammar,
+                json_schema=json_schema,
+                parse_output=parse_output,
+            )
+            return payload, summary
+
+        assert isinstance(self._backend, _IsolatedWorkerClient)
+        params = self._prepare_chat_worker_params(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            stop=stop,
+            add_generation_prompt=add_generation_prompt,
+            ngram_speculation=ngram_speculation,
+            max_draft_tokens=max_draft_tokens,
+            tools=tools,
+            grammar=grammar,
+            json_schema=json_schema,
+        )
+        params["parse_output"] = parse_output
+        out, summary = self._backend._rpc_with_summary("chat", params)
+        payload = out["parsed"] if parse_output else str(out["text"])
+        return payload, summary
 
     def tokenize(
         self,
@@ -362,12 +545,13 @@ class AutoModel:
             )
         assert isinstance(self._backend, _IsolatedWorkerClient)
         clean_msgs = _serialize_messages_arg(messages)
+        clean_tools = _validate_tools_arg(tools)
         res = self._backend._rpc(
             "apply_chat_template",
             {
                 "messages": clean_msgs,
                 "add_generation_prompt": add_generation_prompt,
-                "tools": list(tools) if tools is not None else None,
+                "tools": clean_tools,
             },
         )
         return str(res["prompt"])

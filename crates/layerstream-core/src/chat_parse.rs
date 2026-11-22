@@ -109,10 +109,101 @@ enum TagState {
     InToolCall,
 }
 
+#[derive(Debug, Default, Clone)]
+struct ToolScanState {
+    pos: usize,
+    started_json: Option<bool>,
+    in_string: bool,
+    escape: bool,
+    json_invalid: bool,
+}
+
+impl ToolScanState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Incrementally scans `buf` from `self.pos` for the closing `</tool_call>` tag outside
+    /// valid JSON string literals. Recovers immediately at `</tool_call>` if a raw control
+    /// character (such as `\n` or `\r`) or invalid escape breaks a quoted JSON string.
+    fn find_close(&mut self, buf: &str) -> Option<usize> {
+        const CLOSE: &[u8] = b"</tool_call>";
+        let bytes = buf.as_bytes();
+
+        while self.pos < bytes.len() {
+            let b = bytes[self.pos];
+
+            if self.started_json.is_none() {
+                if b.is_ascii_whitespace() {
+                    self.pos += 1;
+                    continue;
+                }
+                self.started_json = Some(b == b'{');
+            }
+
+            let plain_scan = self.started_json == Some(false) || self.json_invalid;
+            if !plain_scan && self.in_string {
+                if self.escape {
+                    self.escape = false;
+                    if !matches!(
+                        b,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u'
+                    ) {
+                        self.json_invalid = true;
+                        self.in_string = false;
+                        continue;
+                    }
+                    self.pos += 1;
+                    continue;
+                }
+                if b == b'\\' {
+                    self.escape = true;
+                    self.pos += 1;
+                    continue;
+                }
+                if b == b'"' {
+                    self.in_string = false;
+                    self.pos += 1;
+                    continue;
+                }
+                // RFC 8259: raw control characters (< 0x20, including \n and \r) are illegal in
+                // JSON strings; mark JSON prefix invalid so `</tool_call>` can recover cleanly.
+                if b < 0x20 {
+                    self.json_invalid = true;
+                    self.in_string = false;
+                    continue;
+                }
+                self.pos += 1;
+                continue;
+            }
+
+            if !plain_scan && b == b'"' {
+                self.in_string = true;
+                self.pos += 1;
+                continue;
+            }
+
+            if b == b'<' {
+                let rem = &bytes[self.pos..];
+                if rem.starts_with(CLOSE) {
+                    return Some(self.pos);
+                }
+                if CLOSE.starts_with(rem) {
+                    // Partial `</tool_call>` suffix at end of buffer; resume from `self.pos` on next push.
+                    return None;
+                }
+            }
+            self.pos += 1;
+        }
+        None
+    }
+}
+
 pub struct StreamTagParser {
     state: TagState,
     pending: String,
     tool_buf: String,
+    tool_scan: ToolScanState,
     tool_call_count: usize,
 }
 
@@ -128,6 +219,7 @@ impl StreamTagParser {
             state: TagState::Normal,
             pending: String::new(),
             tool_buf: String::new(),
+            tool_scan: ToolScanState::default(),
             tool_call_count: 0,
         }
     }
@@ -138,106 +230,149 @@ impl StreamTagParser {
 
     pub fn push(&mut self, piece: &str) -> Vec<StreamDelta> {
         let mut out = Vec::new();
-        self.pending.push_str(piece);
+        if !piece.is_empty() {
+            self.pending.push_str(piece);
+        }
+
+        // Advance `cursor` forward through `self.pending` and compact once at the end of `push`,
+        // caching the next `<think>` and `<tool_call>` offsets so multi-tag inputs never rescan.
+        let mut cursor = 0usize;
+        let mut cached_think: Option<Option<usize>> = None;
+        let mut cached_tool: Option<Option<usize>> = None;
 
         loop {
             match self.state {
                 TagState::Normal => {
-                    let think_pos = self.pending.find("<think>");
-                    let tool_pos = self.pending.find("<tool_call>");
+                    let slice = &self.pending[cursor..];
+                    let think_pos = match cached_think {
+                        Some(Some(abs)) if abs >= cursor => Some(abs - cursor),
+                        Some(None) => None,
+                        _ => {
+                            let found = slice.find("<think>").map(|rel| cursor + rel);
+                            cached_think = Some(found);
+                            found.map(|abs| abs - cursor)
+                        }
+                    };
+                    let tool_pos = match cached_tool {
+                        Some(Some(abs)) if abs >= cursor => Some(abs - cursor),
+                        Some(None) => None,
+                        _ => {
+                            let found = slice.find("<tool_call>").map(|rel| cursor + rel);
+                            cached_tool = Some(found);
+                            found.map(|abs| abs - cursor)
+                        }
+                    };
+
                     match (think_pos, tool_pos) {
                         (Some(t), Some(c)) if t <= c => {
                             if t > 0 {
-                                out.push(StreamDelta::Content(self.pending[..t].to_string()));
+                                out.push(StreamDelta::Content(slice[..t].to_string()));
                             }
-                            self.pending.drain(..t + "<think>".len());
+                            cursor += t + "<think>".len();
                             self.state = TagState::InThink;
                         }
                         (Some(t), None) => {
                             if t > 0 {
-                                out.push(StreamDelta::Content(self.pending[..t].to_string()));
+                                out.push(StreamDelta::Content(slice[..t].to_string()));
                             }
-                            self.pending.drain(..t + "<think>".len());
+                            cursor += t + "<think>".len();
                             self.state = TagState::InThink;
                         }
                         (_, Some(c)) => {
                             if c > 0 {
-                                out.push(StreamDelta::Content(self.pending[..c].to_string()));
+                                out.push(StreamDelta::Content(slice[..c].to_string()));
                             }
-                            self.pending.drain(..c + "<tool_call>".len());
+                            cursor += c + "<tool_call>".len();
                             self.tool_buf.clear();
+                            self.tool_scan.reset();
                             self.state = TagState::InToolCall;
                         }
                         (None, None) => {
-                            let hold =
-                                partial_tag_suffix(&self.pending, &["<think>", "<tool_call>"]);
-                            let emit_len = self.pending.len() - hold;
+                            let hold = partial_tag_suffix(slice, &["<think>", "<tool_call>"]);
+                            let emit_len = slice.len() - hold;
                             if emit_len > 0 {
-                                out.push(StreamDelta::Content(
-                                    self.pending[..emit_len].to_string(),
-                                ));
-                                self.pending.drain(..emit_len);
+                                out.push(StreamDelta::Content(slice[..emit_len].to_string()));
+                                cursor += emit_len;
                             }
                             break;
                         }
                     }
                 }
                 TagState::InThink => {
-                    if let Some(end) = self.pending.find("</think>") {
+                    let slice = &self.pending[cursor..];
+                    if let Some(end) = slice.find("</think>") {
                         if end > 0 {
-                            out.push(StreamDelta::Reasoning(self.pending[..end].to_string()));
+                            out.push(StreamDelta::Reasoning(slice[..end].to_string()));
                         }
-                        self.pending.drain(..end + "</think>".len());
+                        cursor += end + "</think>".len();
                         self.state = TagState::Normal;
                     } else {
-                        let hold = partial_tag_suffix(&self.pending, &["</think>"]);
-                        let emit_len = self.pending.len() - hold;
+                        let hold = partial_tag_suffix(slice, &["</think>"]);
+                        let emit_len = slice.len() - hold;
                         if emit_len > 0 {
-                            out.push(StreamDelta::Reasoning(self.pending[..emit_len].to_string()));
-                            self.pending.drain(..emit_len);
+                            out.push(StreamDelta::Reasoning(slice[..emit_len].to_string()));
+                            cursor += emit_len;
                         }
                         break;
                     }
                 }
                 TagState::InToolCall => {
-                    if !self.pending.is_empty() {
-                        self.tool_buf.push_str(&self.pending);
-                        self.pending.clear();
+                    if cursor < self.pending.len() {
+                        self.tool_buf.push_str(&self.pending[cursor..]);
+                        cursor = self.pending.len();
                     }
-                    if let Some(end) = find_tool_call_close(&self.tool_buf) {
-                        let body = self.tool_buf[..end].trim().to_string();
-                        let rest = self.tool_buf[end + "</tool_call>".len()..].to_string();
-                        self.tool_buf.clear();
-                        self.pending = rest;
-                        self.state = TagState::Normal;
-                        if let Ok(val) = serde_json::from_str::<Value>(&body)
-                            && let Some(name) = val.get("name").and_then(Value::as_str)
-                        {
-                            let args_val = val
-                                .get("arguments")
-                                .cloned()
-                                .unwrap_or_else(|| Value::Object(Default::default()));
-                            let arguments = match args_val {
-                                Value::String(s) => s,
-                                other => other.to_string(),
-                            };
+                    if let Some(end) = self.tool_scan.find_close(&self.tool_buf) {
+                        let raw_body = &self.tool_buf[..end];
+                        let trimmed_body = raw_body.trim();
+                        let decoded =
+                            serde_json::from_str::<Value>(trimmed_body)
+                                .ok()
+                                .and_then(|val| {
+                                    let name = val.get("name").and_then(Value::as_str)?.to_string();
+                                    let args_val = val
+                                        .get("arguments")
+                                        .cloned()
+                                        .unwrap_or_else(|| Value::Object(Default::default()));
+                                    let arguments = match args_val {
+                                        Value::String(s) => s,
+                                        other => other.to_string(),
+                                    };
+                                    Some((name, arguments))
+                                });
+                        if let Some((name, arguments)) = decoded {
                             let idx = self.tool_call_count;
                             self.tool_call_count += 1;
                             out.push(StreamDelta::ToolCall {
                                 index: idx,
                                 id: format!("call_ls_{}", idx + 1),
-                                name: name.to_string(),
+                                name,
                                 arguments,
                             });
-                        } else if !body.is_empty() {
+                        } else {
                             out.push(StreamDelta::Content(format!(
-                                "<tool_call>{body}</tool_call>"
+                                "<tool_call>{raw_body}</tool_call>"
                             )));
                         }
+                        let rest = self.tool_buf[end + "</tool_call>".len()..].to_string();
+                        self.tool_buf.clear();
+                        self.tool_scan.reset();
+                        self.pending = rest;
+                        cursor = 0;
+                        cached_think = None;
+                        cached_tool = None;
+                        self.state = TagState::Normal;
                     } else {
                         break;
                     }
                 }
+            }
+        }
+
+        if cursor > 0 {
+            if cursor >= self.pending.len() {
+                self.pending.clear();
+            } else {
+                self.pending.drain(..cursor);
             }
         }
 
@@ -260,60 +395,18 @@ impl StreamTagParser {
             }
             TagState::InToolCall => {
                 let mut unclosed = std::mem::take(&mut self.tool_buf);
+                self.tool_scan.reset();
                 unclosed.push_str(&rem);
                 if !unclosed.is_empty() {
                     out.push(StreamDelta::Content(format!("<tool_call>{unclosed}")));
+                } else {
+                    out.push(StreamDelta::Content("<tool_call>".to_string()));
                 }
             }
         }
         self.state = TagState::Normal;
         out
     }
-}
-
-/// Finds the closing `</tool_call>` tag outside of JSON string literals so that a
-/// `"</tool_call>"` substring inside a tool argument value does not truncate the call.
-fn find_tool_call_close(buf: &str) -> Option<usize> {
-    const CLOSE: &[u8] = b"</tool_call>";
-    let bytes = buf.as_bytes();
-    let trimmed_start = bytes
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    if trimmed_start >= bytes.len() {
-        return None;
-    }
-    if bytes[trimmed_start] != b'{' {
-        return buf.find("</tool_call>");
-    }
-
-    let mut in_string = false;
-    let mut escape = false;
-    let mut i = trimmed_start;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            if escape {
-                escape = false;
-            } else if b == b'\\' {
-                escape = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        if b == b'"' {
-            in_string = true;
-            i += 1;
-            continue;
-        }
-        if b == b'<' && bytes[i..].starts_with(CLOSE) {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Returns the byte length of the longest suffix of `s` that is a proper prefix of any tag.
@@ -440,13 +533,23 @@ mod tests {
     }
 
     #[test]
-    fn malformed_tool_call_is_preserved_in_content() {
-        let raw = "before <tool_call>{not valid json</tool_call> after";
+    fn malformed_tool_call_preserves_exact_whitespace_and_recovers_after_newline_in_string() {
+        let raw = "before <tool_call> {not valid json} </tool_call> mid <tool_call>   </tool_call>";
         let parsed = parse_assistant_output(raw);
         assert!(parsed.tool_calls.is_empty());
         assert_eq!(
             parsed.content,
-            "before <tool_call>{not valid json</tool_call> after"
+            "before <tool_call> {not valid json} </tool_call> mid <tool_call>   </tool_call>"
+        );
+
+        // Raw newline inside an unclosed JSON string invalidates the JSON prefix; scanner recovers
+        // at `</tool_call>` so the trailing `<think>` block is extracted as reasoning.
+        let broken_then_think = "<tool_call>{\"name\":\"x\",\"arguments\":\"unclosed\n</tool_call><think>plan</think>answer";
+        let p2 = parse_assistant_output(broken_then_think);
+        assert_eq!(p2.reasoning_content.as_deref(), Some("plan"));
+        assert_eq!(
+            p2.content,
+            "<tool_call>{\"name\":\"x\",\"arguments\":\"unclosed\n</tool_call>answer"
         );
     }
 }

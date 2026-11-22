@@ -738,9 +738,12 @@ def test_grammar_and_json_schema_constrained_decoding(synthetic_json_gguf: Path)
             json_schema=schema,
         )
         parsed = json.loads(raw_greedy)
+        assert set(parsed.keys()) == {"mode", "n", "meta"}
         assert parsed["mode"] in ("fast", "safe")
-        assert isinstance(parsed["n"], int)
-        assert isinstance(parsed["meta"]["ok"], bool)
+        assert type(parsed["n"]) is int
+        assert isinstance(parsed["meta"], dict)
+        assert set(parsed["meta"].keys()) == {"ok"}
+        assert type(parsed["meta"]["ok"]) is bool
 
         # 2. Sampled (temperature=0.8) + streaming JSON schema constraint
         raw_sampled = "".join(
@@ -754,11 +757,37 @@ def test_grammar_and_json_schema_constrained_decoding(synthetic_json_gguf: Path)
             )
         )
         parsed_sampled = json.loads(raw_sampled)
+        assert set(parsed_sampled.keys()) == {"mode", "n", "meta"}
         assert parsed_sampled["mode"] in ("fast", "safe")
-        assert isinstance(parsed_sampled["n"], int)
-        assert isinstance(parsed_sampled["meta"]["ok"], bool)
+        assert type(parsed_sampled["n"]) is int
+        assert isinstance(parsed_sampled["meta"], dict)
+        assert set(parsed_sampled["meta"].keys()) == {"ok"}
+        assert type(parsed_sampled["meta"]["ok"]) is bool
 
-        # 3. Invalid grammar fails closed with RuntimeError
+        # 3. Verify llama.cpp GBNF parser accepts additionalProperties key-exclusion & oneOf(number, integer)
+        addl_schema = {
+            "type": "object",
+            "properties": {"count": {"type": "integer"}, "opt": {"type": "boolean"}},
+            "additionalProperties": {"type": "boolean"},
+        }
+        raw_addl = model.generate("a b", max_tokens=64, temperature=0.0, json_schema=addl_schema)
+        parsed_addl = json.loads(raw_addl)
+        assert isinstance(parsed_addl, dict)
+        if "count" in parsed_addl:
+            assert type(parsed_addl["count"]) is int
+
+        oneof_num_schema = {
+            "type": "object",
+            "properties": {"v": {"oneOf": [{"type": "number"}, {"type": "integer"}]}},
+            "required": ["v"],
+            "additionalProperties": False,
+        }
+        raw_oneof = model.generate("a b", max_tokens=64, temperature=0.0, json_schema=oneof_num_schema)
+        parsed_oneof = json.loads(raw_oneof)
+        assert isinstance(parsed_oneof["v"], float)
+        assert parsed_oneof["v"] % 1.0 != 0.0
+
+        # 4. Invalid grammar fails closed with RuntimeError
         with pytest.raises(RuntimeError, match="grammar"):
             model.generate("a b", max_tokens=8, grammar="not valid gbnf ===")
 
@@ -779,7 +808,11 @@ def test_in_process_openai_and_async_openai_clients(synthetic_json_gguf: Path) -
     @dataclass
     class VerdictSchema:
         ok: bool
-        code: int
+        counts: list[int]
+
+    @dataclass
+    class UnsupportedSchema:
+        bad: set[int]
 
     class MockPydanticV2Model:
         def __init__(self, mode: str, flag: bool) -> None:
@@ -828,6 +861,8 @@ def test_in_process_openai_and_async_openai_clients(synthetic_json_gguf: Path) -
         }
     ]
     assert "lookup" in format_tools_system_prompt(tools_spec)
+    with pytest.raises(TypeError, match="tools"):
+        format_tools_system_prompt([1])  # type: ignore[list-item]
 
     with OpenAI(
         str(synthetic_json_gguf),
@@ -863,7 +898,7 @@ def test_in_process_openai_and_async_openai_clients(synthetic_json_gguf: Path) -
         assert inst.mode in ("alpha", "beta")
         assert isinstance(inst.flag, bool)
 
-        # Structured `.parse(...)` with dataclass
+        # Structured `.parse(...)` with dataclass (including list[int] collection)
         dc_resp = client.chat.completions.parse(
             messages=[{"role": "user", "content": "a b"}],
             response_format=VerdictSchema,
@@ -871,8 +906,17 @@ def test_in_process_openai_and_async_openai_clients(synthetic_json_gguf: Path) -
             temperature=0.0,
         )
         assert isinstance(dc_resp.choices[0].message.parsed, VerdictSchema)
-        assert isinstance(dc_resp.choices[0].message.parsed.ok, bool)
-        assert isinstance(dc_resp.choices[0].message.parsed.code, int)
+        assert type(dc_resp.choices[0].message.parsed.ok) is bool
+        assert isinstance(dc_resp.choices[0].message.parsed.counts, list)
+        assert all(type(x) is int for x in dc_resp.choices[0].message.parsed.counts)
+
+        # Unsupported dataclass field annotations fail closed with TypeError
+        with pytest.raises(TypeError, match="unsupported dataclass field annotation"):
+            client.chat.completions.parse(
+                messages=[{"role": "user", "content": "a b"}],
+                response_format=UnsupportedSchema,
+                max_tokens=16,
+            )
 
         # Streaming chat completion chunks
         stream_chunks = list(
@@ -929,7 +973,57 @@ def test_in_process_openai_and_async_openai_clients(synthetic_json_gguf: Path) -
                         collected.append(ch.choices[0].delta.content)
             assert len(collected) > 0
 
+            cstream = await aclient.completions.create(
+                prompt="a b",
+                max_tokens=4,
+                stream=True,
+            )
+            comp_parts: list[str] = []
+            async with cstream as cs:
+                async for item in cs:
+                    comp_parts.append(item.choices[0].text)
+            assert len(comp_parts) > 0
+
     asyncio.run(_run_async())
+
+    # Verify isolated worker is reaped when AutoModel is garbage-collected without `.unload()`
+    import gc
+    import os
+    import time
+
+    from layerstream import AutoModel
+
+    leaked = AutoModel.from_pretrained(
+        str(synthetic_json_gguf),
+        use_gpu=False,
+        ctx_size=256,
+        batch_size=32,
+        vram_budget_mb=0,
+        prefer_direct_io=False,
+        isolated_worker=True,
+    )
+    tmpl_rendered = leaked.apply_chat_template(
+        [
+            {"role": "user", "content": "run"},
+            {"role": "tool", "name": "lookup", "tool_call_id": "call_1", "content": "42"},
+        ]
+    )
+    assert "tool" in tmpl_rendered
+    assert "42" in tmpl_rendered
+    pid = leaked.worker_pid
+    assert pid is not None
+    del leaked
+    gc.collect()
+    deadline = time.monotonic() + 5.0
+    still_alive = True
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            still_alive = False
+            break
+        time.sleep(0.05)
+    assert not still_alive, f"isolated worker {pid} still alive after GC"
 
 
 def test_advisor_check_recommend_pull_and_inspect(

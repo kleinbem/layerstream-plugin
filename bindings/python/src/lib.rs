@@ -36,7 +36,7 @@ struct LoadedEngine {
 
 enum StreamEvent {
     Chunk(String),
-    Done,
+    Done(GenerateSummary),
     Err(String),
 }
 
@@ -44,6 +44,7 @@ struct StreamState {
     rx: Option<mpsc::Receiver<StreamEvent>>,
     worker: Option<JoinHandle<()>>,
     done: bool,
+    summary: Option<GenerateSummary>,
 }
 
 /// Streaming token iterator returned by `AutoModel.generate(..., stream=True)` and
@@ -113,6 +114,20 @@ impl TokenStream {
         Ok(())
     }
 
+    #[getter]
+    fn summary<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let sum = self
+            .state
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("stream lock poisoned"))?
+            .summary
+            .clone();
+        match sum {
+            Some(s) => Ok(Some(summary_to_pydict(py, &s)?)),
+            None => Ok(None),
+        }
+    }
+
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<String>> {
         loop {
             if let Err(err) = py.check_signals() {
@@ -123,18 +138,25 @@ impl TokenStream {
             let recv_result = py.detach(|| {
                 let st = self.state.lock().ok()?;
                 if st.done {
-                    return Some(Ok(StreamEvent::Done));
+                    return None;
                 }
                 let rx = st.rx.as_ref()?;
                 match rx.recv_timeout(Duration::from_millis(25)) {
                     Ok(ev) => Some(Ok(ev)),
                     Err(RecvTimeoutError::Timeout) => Some(Err(true)),
-                    Err(RecvTimeoutError::Disconnected) => Some(Ok(StreamEvent::Done)),
+                    Err(RecvTimeoutError::Disconnected) => None,
                 }
             });
 
             match recv_result {
-                None | Some(Ok(StreamEvent::Done)) => {
+                None => {
+                    self.finish_stream(py);
+                    return Ok(None);
+                }
+                Some(Ok(StreamEvent::Done(summary))) => {
+                    if let Ok(mut st) = self.state.lock() {
+                        st.summary = Some(summary);
+                    }
                     self.finish_stream(py);
                     return Ok(None);
                 }
@@ -505,15 +527,27 @@ fn parse_chat_messages(messages: &Bound<'_, PyAny>) -> PyResult<Vec<ChatMessage>
             }
         }
 
-        let mapped_role = if role == "tool" {
-            "user".to_string()
-        } else {
-            role
-        };
-        out.push(ChatMessage {
-            role: mapped_role,
-            content,
-        });
+        if role == "tool" {
+            let mut prefix = String::new();
+            if let Ok(name_obj) = item.get_item("name")
+                && !name_obj.is_none()
+                && let Ok(name_str) = name_obj.extract::<String>()
+                && !name_str.is_empty()
+            {
+                prefix.push_str(&format!("tool={name_str} "));
+            }
+            if let Ok(id_obj) = item.get_item("tool_call_id")
+                && !id_obj.is_none()
+                && let Ok(id_str) = id_obj.extract::<String>()
+                && !id_str.is_empty()
+            {
+                prefix.push_str(&format!("call_id={id_str}: "));
+            }
+            if !prefix.is_empty() {
+                content = format!("{prefix}{content}");
+            }
+        }
+        out.push(ChatMessage { role, content });
     }
     if out.is_empty() {
         return Err(PyValueError::new_err("messages must not be empty"));
@@ -530,7 +564,16 @@ fn parse_tools_arg(tools: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<JsonValue>>
     }
     let val = pyany_to_json_value(t_obj, 0)?;
     match val {
-        JsonValue::Array(items) => Ok(items),
+        JsonValue::Array(items) => {
+            for item in &items {
+                if !item.is_object() {
+                    return Err(PyTypeError::new_err(
+                        "each entry in 'tools' must be a dict/mapping",
+                    ));
+                }
+            }
+            Ok(items)
+        }
         _ => Err(PyTypeError::new_err(
             "tools must be a sequence of tool dicts",
         )),
@@ -801,7 +844,55 @@ impl AutoModel {
             max_draft_tokens: max_draft_tokens.unwrap_or(0),
             grammar: resolved_grammar,
         };
-        self.run_generation(py, prompt.to_string(), opts, stream, false)
+        self.run_generation(py, prompt.to_string(), opts, stream, false, false)
+    }
+
+    #[pyo3(signature = (
+        prompt,
+        *,
+        max_tokens=256,
+        temperature=0.0,
+        top_p=0.95,
+        top_k=40,
+        seed=42,
+        stop=None,
+        ngram_speculation=true,
+        max_draft_tokens=None,
+        grammar=None,
+        json_schema=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn generate_with_summary(
+        &self,
+        py: Python<'_>,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: i32,
+        seed: u32,
+        stop: Option<&Bound<'_, PyAny>>,
+        ngram_speculation: bool,
+        max_draft_tokens: Option<usize>,
+        grammar: Option<&str>,
+        json_schema: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let stop_seqs = parse_stop_sequences(stop)?;
+        let resolved_grammar = resolve_grammar_arg(grammar, json_schema)?;
+        let opts = GenerateOptions {
+            max_tokens,
+            sample: LsSampleParams {
+                temperature,
+                top_p,
+                top_k,
+                seed,
+            },
+            stop: stop_seqs,
+            enable_ngram_speculation: ngram_speculation,
+            max_draft_tokens: max_draft_tokens.unwrap_or(0),
+            grammar: resolved_grammar,
+        };
+        self.run_generation(py, prompt.to_string(), opts, false, false, true)
     }
 
     /// Apply the model's embedded chat template to `messages` (`[{"role": ..., "content": ...}]`)
@@ -879,7 +970,75 @@ impl AutoModel {
             max_draft_tokens: max_draft_tokens.unwrap_or(0),
             grammar: resolved_grammar,
         };
-        self.run_generation(py, prompt, opts, stream, parse_output)
+        self.run_generation(py, prompt, opts, stream, parse_output, false)
+    }
+
+    #[pyo3(signature = (
+        messages,
+        *,
+        max_tokens=256,
+        temperature=0.0,
+        top_p=0.95,
+        top_k=40,
+        seed=42,
+        stop=None,
+        add_generation_prompt=true,
+        ngram_speculation=true,
+        max_draft_tokens=None,
+        tools=None,
+        grammar=None,
+        json_schema=None,
+        parse_output=false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn chat_with_summary(
+        &self,
+        py: Python<'_>,
+        messages: &Bound<'_, PyAny>,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: i32,
+        seed: u32,
+        stop: Option<&Bound<'_, PyAny>>,
+        add_generation_prompt: bool,
+        ngram_speculation: bool,
+        max_draft_tokens: Option<usize>,
+        tools: Option<&Bound<'_, PyAny>>,
+        grammar: Option<&str>,
+        json_schema: Option<&Bound<'_, PyAny>>,
+        parse_output: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let mut parsed_messages = parse_chat_messages(messages)?;
+        let parsed_tools = parse_tools_arg(tools)?;
+        inject_tools_into_messages(&mut parsed_messages, &parsed_tools);
+
+        let stop_seqs = parse_stop_sequences(stop)?;
+        let resolved_grammar = resolve_grammar_arg(grammar, json_schema)?;
+
+        let prompt = with_engine_checking_signals(py, &self.inner, |guard| {
+            let loaded = guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("model has been unloaded"))?;
+            loaded
+                .engine
+                .apply_chat_template(&parsed_messages, add_generation_prompt)
+        })?;
+
+        let opts = GenerateOptions {
+            max_tokens,
+            sample: LsSampleParams {
+                temperature,
+                top_p,
+                top_k,
+                seed,
+            },
+            stop: stop_seqs,
+            enable_ngram_speculation: ngram_speculation,
+            max_draft_tokens: max_draft_tokens.unwrap_or(0),
+            grammar: resolved_grammar,
+        };
+        self.run_generation(py, prompt, opts, false, parse_output, true)
     }
 
     /// Tokenize `text` into vocabulary token IDs using the loaded model's tokenizer.
@@ -1178,18 +1337,27 @@ impl AutoModel {
         mut opts: GenerateOptions,
         stream: bool,
         parse_output: bool,
+        return_summary: bool,
     ) -> PyResult<Py<PyAny>> {
         if !stream {
             let inner = self.inner.clone();
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_cancel = cancel.clone();
-            let (tx, rx) = mpsc::sync_channel::<anyhow::Result<String>>(1);
+            let (tx, rx) = mpsc::sync_channel::<anyhow::Result<(String, GenerateSummary)>>(1);
             let rx = Mutex::new(rx);
 
             let worker = std::thread::spawn(move || {
-                let res = (|| -> anyhow::Result<String> {
+                let res = (|| -> anyhow::Result<(String, GenerateSummary)> {
                     let Some(mut guard) = lock_engine_with_cancel(&inner, &worker_cancel)? else {
-                        return Ok(String::new());
+                        return Ok((
+                            String::new(),
+                            GenerateSummary {
+                                prompt_tokens: 0,
+                                completion_tokens: 0,
+                                finish_reason: "cancelled".to_string(),
+                                speculation: Default::default(),
+                            },
+                        ));
                     };
                     let loaded = guard
                         .as_mut()
@@ -1211,8 +1379,8 @@ impl AutoModel {
                             true
                         },
                     )?;
-                    loaded.last_summary = Some(summary);
-                    Ok(out)
+                    loaded.last_summary = Some(summary.clone());
+                    Ok((out, summary))
                 })();
                 let _ = tx.send(res);
             });
@@ -1245,12 +1413,22 @@ impl AutoModel {
                     }
                 }
             };
-            let output = result.map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
-            if parse_output {
+            let (output, summary) =
+                result.map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+            let payload_obj = if parse_output {
                 let parsed = parse_assistant_output(&output);
-                return Ok(parsed_output_to_pydict(py, &parsed)?.into_any().unbind());
+                parsed_output_to_pydict(py, &parsed)?.into_any()
+            } else {
+                PyString::new(py, &output).into_any()
+            };
+            if return_summary {
+                let sum_dict = summary_to_pydict(py, &summary)?;
+                return Ok((payload_obj, sum_dict)
+                    .into_pyobject(py)?
+                    .into_any()
+                    .unbind());
             }
-            return Ok(PyString::new(py, &output).into_any().unbind());
+            return Ok(payload_obj.unbind());
         }
 
         // Fail fast if already unloaded before spawning a stream worker thread.
@@ -1264,9 +1442,9 @@ impl AutoModel {
         let inner = self.inner.clone();
 
         let worker = std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<()> {
+            let res = (|| -> anyhow::Result<Option<GenerateSummary>> {
                 let Some(mut guard) = lock_engine_with_cancel(&inner, &worker_cancel)? else {
-                    return Ok(());
+                    return Ok(None);
                 };
                 let loaded = guard
                     .as_mut()
@@ -1289,14 +1467,15 @@ impl AutoModel {
                         tx.send(StreamEvent::Chunk(piece.to_string())).is_ok()
                     },
                 )?;
-                loaded.last_summary = Some(summary);
-                Ok(())
+                loaded.last_summary = Some(summary.clone());
+                Ok(Some(summary))
             })();
 
             match res {
-                Ok(()) => {
-                    let _ = tx.send(StreamEvent::Done);
+                Ok(Some(summary)) => {
+                    let _ = tx.send(StreamEvent::Done(summary));
                 }
+                Ok(None) => {}
                 Err(e) => {
                     let _ = tx.send(StreamEvent::Err(format!("{e:#}")));
                 }
@@ -1308,6 +1487,7 @@ impl AutoModel {
                 rx: Some(rx),
                 worker: Some(worker),
                 done: false,
+                summary: None,
             }),
             cancel,
         };
@@ -1527,7 +1707,7 @@ fn check<'py>(
             let resolved_target = resolve_pretrained_model(&model_owned, &resolve_opts)?;
             let idx = GgufIndex::open(&resolved_target.local_path)?;
 
-            let draft_path = if let Some(d_spec) = draft_owned {
+            let (draft_path, draft_reserve) = if let Some(d_spec) = draft_owned {
                 let d_opts = PretrainedResolveOptions {
                     revision: rev_owned,
                     quant: None,
@@ -1539,9 +1719,14 @@ fn check<'py>(
                 let resolved_draft = resolve_pretrained_model(&d_spec, &d_opts)?;
                 check_gguf_draft_compatible(&resolved_target.local_path, &resolved_draft.local_path)
                     .map_err(|e| anyhow::anyhow!("incompatible draft_model tokenizer: {e}"))?;
-                Some(resolved_draft.local_path)
+                let draft_idx = GgufIndex::open(&resolved_draft.local_path)?;
+                let reserve = draft_idx
+                    .meta
+                    .total_file_bytes
+                    .saturating_add(64 * 1024 * 1024);
+                (Some(resolved_draft.local_path), reserve)
             } else {
-                None
+                (None, 0u64)
             };
 
             let gpu_mem = if use_gpu {
@@ -1557,29 +1742,47 @@ fn check<'py>(
             let size_bytes = idx.meta.total_file_bytes;
             let size_gib = size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
             let fits_in_vram = gpu_mem
-                .map(|(free_b, _)| size_bytes.saturating_add(768 * 1024 * 1024) < free_b)
+                .map(|(free_b, _)| {
+                    size_bytes
+                        .saturating_add(draft_reserve)
+                        .saturating_add(768 * 1024 * 1024)
+                        < free_b
+                })
                 .unwrap_or(false);
 
             let probe_res = probe_storage_mib_per_s(&resolved_target.local_path, true).ok();
             let (mib_s, direct_ok) = probe_res.unwrap_or((0.0, false));
             let is_oversize = size_bytes >= OVERSIZE_GUARD_BYTES && !fits_in_vram;
 
-            if is_oversize
-                && use_gpu
-                && probe_res.is_some()
-                && mib_s > 0.0
-                && mib_s < MIN_STREAMING_STORAGE_MIB_S
-                && !allow_slow
-            {
-                anyhow::bail!(
-                    "storage for '{}' ({size_gib:.1} GiB) measured only {mib_s:.0} MiB/s \
-                     (minimum recommended {MIN_STREAMING_STORAGE_MIB_S:.0} MiB/s NVMe). \
-                     Move the GGUF to local NVMe or pass allow_slow=True.",
-                    resolved_target.local_path.display()
-                );
+            if is_oversize && use_gpu && !allow_slow {
+                if probe_res.is_none() || !mib_s.is_finite() || mib_s <= 0.0 {
+                    anyhow::bail!(
+                        "could not measure storage throughput for '{}' ({size_gib:.1} GiB) \
+                         required for out-of-core GPU streaming; pass allow_slow=True to bypass preflight.",
+                        resolved_target.local_path.display()
+                    );
+                }
+                if !direct_ok {
+                    anyhow::bail!(
+                        "storage throughput for '{}' ({size_gib:.1} GiB) is unverified because \
+                         direct I/O (O_DIRECT/F_NOCACHE) was unavailable (measured {mib_s:.0} MiB/s from page cache). \
+                         Move the GGUF to a direct-I/O filesystem or pass allow_slow=True.",
+                        resolved_target.local_path.display()
+                    );
+                }
+                if mib_s < MIN_STREAMING_STORAGE_MIB_S {
+                    anyhow::bail!(
+                        "storage for '{}' ({size_gib:.1} GiB) measured only {mib_s:.0} MiB/s \
+                         (minimum recommended {MIN_STREAMING_STORAGE_MIB_S:.0} MiB/s NVMe). \
+                         Move the GGUF to local NVMe or pass allow_slow=True.",
+                        resolved_target.local_path.display()
+                    );
+                }
             }
 
-            let pinned_mib = gpu_mem.map_or(0.0, |(f, _)| (f as f64 * 0.45) / (1024.0 * 1024.0));
+            let pinned_mib = gpu_mem.map_or(0.0, |(f, _)| {
+                (f.saturating_sub(draft_reserve) as f64 * 0.45) / (1024.0 * 1024.0)
+            });
             let est_stream_mib = ((size_bytes as f64 / (1024.0 * 1024.0)) - pinned_mib).max(0.0);
             let base_tps = if est_stream_mib > 1.0 && mib_s > 1.0 {
                 mib_s / est_stream_mib
