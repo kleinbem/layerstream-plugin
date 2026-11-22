@@ -414,13 +414,13 @@
         <h1>⚡ layerstream-plugin — Edge Out-of-Core LLM Benchmarks</h1>
         <p>
           Bare-metal 4-engine comparison on an <strong>8 GB NVIDIA Jetson Orin Nano</strong> (7.3 GiB RAM, CUDA <code>sm_87</code>, LUKS2 NVMe, INA3221 hardware power rail):
-          <strong>layerstream-plugin</strong> (R2–R8 throughput measured on <code>v0.1.0</code>; latest <strong><code>v0.2.0</code></strong> adds isolated GPU worker subprocesses for <strong>0 MB post-eviction VRAM/CUDA context</strong> — <code>524 MiB → 33.1 MiB</code> RSS on Orin Nano — plus dynamic CUDA/Vulkan backends) vs. <strong>stock llama.cpp</strong> (Ollama/LM Studio runtime), <strong>Hugging Face accelerate</strong>, and <strong>AirLLM 4.0.0</strong>.
+          <strong>layerstream-plugin</strong> (R2–R8 on <code>v0.1.0</code>, R9 MoE on <strong><code>v0.2.1</code></strong> — isolated GPU worker with <strong>0 MB post-eviction CUDA context</strong> and parallel <code>FADV_RANDOM+DONTNEED</code> sparse MoE reads beating stock <code>llama.cpp</code> on <code>Qwen3-30B-A3B</code> at <strong>1.45 tok/s</strong>) vs. <strong>stock llama.cpp</strong> (Ollama/LM Studio runtime), <strong>Hugging Face accelerate</strong>, and <strong>AirLLM 4.0.0</strong>.
         </p>
       </div>
       <nav class="pill-links" aria-label="Project links">
         <a class="pill" href="https://github.com/kleinbem/layerstream-plugin" target="_blank" rel="noopener">GitHub Repo</a>
-        <a class="pill" href="https://github.com/kleinbem/layerstream-plugin/releases/tag/v0.2.0" target="_blank" rel="noopener">v0.2.0 Release</a>
-        <a class="pill" href="https://huggingface.co/datasets/kleinbem/layerstream-orin-nano-benchmarks" target="_blank" rel="noopener">HF Dataset (130 runs)</a>
+        <a class="pill" href="https://github.com/kleinbem/layerstream-plugin/releases/tag/v0.2.1" target="_blank" rel="noopener">v0.2.1 Release</a>
+        <a class="pill" href="https://huggingface.co/datasets/kleinbem/layerstream-orin-nano-benchmarks" target="_blank" rel="noopener">HF Dataset (135 runs)</a>
       </nav>
     </header>
 
@@ -451,7 +451,7 @@
       <button class="tab-btn" role="tab" id="tab-compare" aria-controls="panel-compare" aria-selected="true">1. 4-Engine Comparison</button>
       <button class="tab-btn" role="tab" id="tab-tuning" aria-controls="panel-tuning" aria-selected="false">2. Tuning Story (R2 → R8)</button>
       <button class="tab-btn" role="tab" id="tab-estimator" aria-controls="panel-estimator" aria-selected="false">3. Hardware Estimator</button>
-      <button class="tab-btn" role="tab" id="tab-raw" aria-controls="panel-raw" aria-selected="false">4. Raw Dataset (130 Runs)</button>
+      <button class="tab-btn" role="tab" id="tab-raw" aria-controls="panel-raw" aria-selected="false">4. Raw Dataset (135 Runs)</button>
     </div>
 
     <!-- PANEL 1: 4-ENGINE COMPARISON -->
@@ -558,7 +558,7 @@
     <!-- PANEL 4: RAW DATASET -->
     <section id="panel-raw" class="panel" role="tabpanel" aria-labelledby="tab-raw">
       <div class="card">
-        <h2>Normalized Benchmark Records (<span id="raw-count">0</span> / 130 rows)</h2>
+        <h2>Normalized Benchmark Records (<span id="raw-count">0</span> / 135 rows)</h2>
         <p class="desc">Loaded directly from <code>kleinbem/layerstream-orin-nano-benchmarks</code> (Parquet / JSON). Use keyboard or horizontal scroll to inspect all telemetry columns.</p>
         <div class="controls">
           <div class="ctrl">
@@ -664,14 +664,17 @@
       }
       if (modelKey === "olmoe") {
         return [
-          { label: "layerstream-plugin R=0 Sparse + TinyLFU", sub: "98–100% cache hit · reps=3 · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_olmoe_r0_sparse_cached" && r.workload === workload) },
+          { label: "layerstream-plugin R=0 Sparse + TinyLFU (v0.2.1)", sub: "98–100% cache hit · reps=3 · 0 MiB swap · parallel FADV_RANDOM+DONTNEED", row: findOne(r => r.round === "round9_v021" && r.mode === "r9_olmoe_r0_sparse_cached" && r.workload === workload) },
+          { label: "layerstream-plugin R=0 Sparse + TinyLFU (v0.1.0)", sub: "98–100% cache hit · reps=3 · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_olmoe_r0_sparse_cached" && r.workload === workload) },
           { label: "layerstream-plugin R=0 Full-Layer Stream", sub: "Baseline without sparse MoE / TinyLFU", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_olmoe_r0_full") },
         ].filter(x => x.row);
       }
       return [
-        { label: "Stock llama.cpp CPU mmap (-ngl 0 -dev none -b 512)", sub: "Wins on Orin! Linux page cache avoids nvme1 IRQ stalls (+248 MiB swap)", row: findOne(r => r.round === "competitors" && r.mode === "llama_cpp_qwen3_30b_cpu_mmap_b512") },
-        { label: "layerstream-plugin R=0 Sparse + TinyLFU + 0.6B (open_ended)", sub: "3.97 GiB RSS · 0 MiB swap · 11.2 s TTFT", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_qwen3_30b_a3b_r0_draft06b" && r.workload === "open_ended") },
-        { label: "layerstream-plugin R=0 Sparse + TinyLFU + 0.6B (code_edit)", sub: "Hit 30 s Orin Tegra nvme1 IRQ stall · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_qwen3_30b_a3b_r0_draft06b" && r.workload === "code_edit") },
+        { label: "layerstream-plugin v0.2.1 Sparse + 0.6B (open_ended)", sub: "Wins! 1.45 tok/s · 4.05 GiB RSS · 1,266 MiB/s · 0 NVMe stalls · 11.55 J/tok", row: findOne(r => r.round === "round9_v021" && r.mode === "r9_qwen3_30b_a3b_r0_draft06b" && r.workload === "open_ended") },
+        { label: "Stock llama.cpp CPU mmap (-ngl 0 -dev none -b 512)", sub: "1.27 tok/s · 6.07 GiB RSS · +248 MiB swap · 25.3 s load · 15.26 J/tok", row: findOne(r => r.round === "competitors" && r.mode === "llama_cpp_qwen3_30b_cpu_mmap_b512") },
+        { label: "layerstream-plugin v0.2.1 Sparse + 0.6B (code_edit)", sub: "0.95 tok/s (8.4× vs v0.1.0) · 4.09 GiB RSS · 1,261 MiB/s · 0 NVMe stalls", row: findOne(r => r.round === "round9_v021" && r.mode === "r9_qwen3_30b_a3b_r0_draft06b" && r.workload === "code_edit") },
+        { label: "layerstream-plugin v0.1.0 Sparse + 0.6B (open_ended)", sub: "Before fix: O_DIRECT Tegra nvme1 stalls · 3.97 GiB RSS · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_qwen3_30b_a3b_r0_draft06b" && r.workload === "open_ended") },
+        { label: "layerstream-plugin v0.1.0 Sparse + 0.6B (code_edit)", sub: "Before fix: hit 30 s Orin Tegra nvme1 IRQ stalls · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_qwen3_30b_a3b_r0_draft06b" && r.workload === "code_edit") },
         { label: "Stock llama.cpp GPU MoE offload (-ot exps=CPU)", sub: "OOM rc=1 · +12.34 GiB swap", row: findOne(r => r.round === "competitors" && r.mode === "llama_cpp_qwen3_30b_gpu_moe_offload") },
       ].filter(x => x.row);
     }

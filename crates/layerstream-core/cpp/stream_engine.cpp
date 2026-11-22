@@ -922,13 +922,11 @@ struct ls_engine {
             }
         }
 
-        // Sequential full-layer O_DIRECT bandwidth (~2,000+ MiB/s) is typically 3-4x higher than
-        // scattered small-slice random reads (~650 MiB/s) on encrypted NVMe. Switch to a single
-        // sequential full-layer read once > 25% of a layer's experts are missing (e.g., prefill
-        // or multi-token speculative verification batches), while keeping 1-token decode sparse
-        // (including 2/8 Mixtral, 8/64 OLMoE, and 8/128 Qwen3-30B-A3B).
+        // Switch to a single sequential full-layer read once > 50% of a layer's experts are
+        // missing (e.g., long prompt prefills), while keeping 1-token decode and multi-token
+        // speculative verification batches on the sparse + TinyLFU hot-expert cache path.
         const bool load_full = force_full ||
-            (missing_experts.size() * 4 > static_cast<size_t>(plan.n_experts)) ||
+            (missing_experts.size() * 2 > static_cast<size_t>(plan.n_experts)) ||
             (load_slices_cb == nullptr);
 
         using Clock = std::chrono::steady_clock;

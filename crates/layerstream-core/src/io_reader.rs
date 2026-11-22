@@ -31,12 +31,25 @@ const PARALLEL_READ_MIN_BYTES: usize = 4 * 1024 * 1024;
 /// Override with `LAYERSTREAM_IO_CHUNK_MB` (e.g. `16`, `64`, `256`).
 const DEFAULT_SCRATCH_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_IO_THREADS: usize = 1;
-// Linux dm-crypt/LUKS2 contends across multi-threaded O_DIRECT reads on the same file,
-// whereas macOS Apple Silicon's hardware NVMe AES controller benefits from parallel queue depth.
-#[cfg(target_os = "macos")]
-const DEFAULT_MOE_IO_THREADS: usize = 4;
-#[cfg(not(target_os = "macos"))]
-const DEFAULT_MOE_IO_THREADS: usize = 1;
+/// Sparse MoE slices are small (~0.5–1 MiB) and scattered across tens of GiB.
+/// Parallel workers keep the NVMe submission queue and Linux dm-crypt/kcryptd
+/// workers saturated.
+fn default_moe_io_threads() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        4
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 6))
+            .unwrap_or(4)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        1
+    }
+}
 
 /// Page-aligned (4096-byte) owned byte buffer suitable for Linux `O_DIRECT` / Windows unbuffered I/O.
 pub struct AlignedBuf {
@@ -88,6 +101,8 @@ impl Drop for AlignedBuf {
 struct ShardHandle {
     direct: Option<File>,
     buffered: File,
+    #[cfg(target_os = "linux")]
+    sparse_buffered: File,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -350,6 +365,7 @@ pub struct LayerIoPool {
     index: GgufIndex,
     shards: Vec<ShardHandle>,
     direct_io_active: bool,
+    sparse_direct_io: bool,
     io_threads: usize,
     moe_io_threads: usize,
     max_chunk_bytes: usize,
@@ -377,6 +393,9 @@ impl LayerIoPool {
         for path in &index.shards {
             let buffered = File::open(path)
                 .with_context(|| format!("failed to open shard {}", path.display()))?;
+            #[cfg(target_os = "linux")]
+            let sparse_buffered = open_sparse_buffered(path)
+                .with_context(|| format!("failed to open sparse shard {}", path.display()))?;
             let direct = if prefer_direct_io {
                 open_direct(path)
             } else {
@@ -385,7 +404,12 @@ impl LayerIoPool {
             if direct.is_none() {
                 all_direct = false;
             }
-            shards.push(ShardHandle { direct, buffered });
+            shards.push(ShardHandle {
+                direct,
+                buffered,
+                #[cfg(target_os = "linux")]
+                sparse_buffered,
+            });
         }
 
         if prefer_direct_io && !all_direct {
@@ -405,7 +429,22 @@ impl LayerIoPool {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(|n| n.clamp(1, 8))
-            .unwrap_or(DEFAULT_MOE_IO_THREADS);
+            .unwrap_or_else(default_moe_io_threads);
+
+        // On Linux, scattered sub-MiB O_DIRECT reads can trigger NVMe MSI-X IRQ
+        // timeouts on embedded PCIe controllers (e.g. Tegra Orin + Crucial T500)
+        // while buffered `POSIX_FADV_RANDOM` + immediate `POSIX_FADV_DONTNEED`
+        // sustains ~1,150+ MiB/s with < 10 ms tail latency and ~0 MiB page-cache
+        // growth. Keep full-layer sequential reads on O_DIRECT and allow forcing
+        // O_DIRECT on sparse MoE reads via `LAYERSTREAM_SPARSE_DIRECT_IO=1`.
+        #[cfg(target_os = "linux")]
+        let default_sparse_direct = false;
+        #[cfg(not(target_os = "linux"))]
+        let default_sparse_direct = true;
+        let sparse_direct_io = std::env::var("LAYERSTREAM_SPARSE_DIRECT_IO")
+            .ok()
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(default_sparse_direct);
 
         let max_chunk_bytes = std::env::var("LAYERSTREAM_IO_CHUNK_MB")
             .ok()
@@ -426,6 +465,7 @@ impl LayerIoPool {
             index,
             shards,
             direct_io_active: all_direct,
+            sparse_direct_io,
             io_threads,
             moe_io_threads,
             max_chunk_bytes,
@@ -768,9 +808,17 @@ impl LayerIoPool {
                 Some(buf) => buf,
                 None => scratch_guard.insert(AlignedBuf::new(4 * 1024 * 1024)?),
             };
+            let t_wall = std::time::Instant::now();
+            let mut batch_bytes = 0u64;
             for span in &spans {
-                self.read_span_into(span, scratch, dst)?;
+                batch_bytes = batch_bytes.saturating_add(self.read_sparse_span_into_disjoint_ptr(
+                    span,
+                    scratch,
+                    dst.as_mut_ptr(),
+                    dst.len(),
+                )?);
             }
+            self.record_io_sample(batch_bytes, t_wall.elapsed().as_micros() as u64);
         } else {
             // Verify all destination ranges are in-bounds and mutually disjoint before
             // parallelizing copies into `dst`.
@@ -827,30 +875,45 @@ impl LayerIoPool {
             let dst_ptr = SendDstPtr(dst.as_mut_ptr(), dst.len());
             let chunk_len = spans.len().div_ceil(n_workers);
             let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+            let batch_bytes = AtomicU64::new(0);
+            let t_wall = std::time::Instant::now();
             std::thread::scope(|s| {
                 for (span_chunk, scratch_buf) in spans
                     .chunks(chunk_len)
                     .zip(scratches.iter_mut().take(n_workers))
                 {
                     let err_slot = &first_err;
+                    let bytes_acc = &batch_bytes;
                     let dst_send = dst_ptr;
                     s.spawn(move || {
                         let (base, len) = dst_send.parts();
+                        let mut local_bytes = 0u64;
                         for span in span_chunk {
-                            if let Err(e) =
-                                self.read_span_into_disjoint_ptr(span, scratch_buf, base, len)
-                            {
-                                if let Ok(mut g) = err_slot.lock()
-                                    && g.is_none()
-                                {
-                                    *g = Some(e);
+                            match self.read_sparse_span_into_disjoint_ptr(
+                                span,
+                                scratch_buf,
+                                base,
+                                len,
+                            ) {
+                                Ok(n) => local_bytes = local_bytes.saturating_add(n),
+                                Err(e) => {
+                                    if let Ok(mut g) = err_slot.lock()
+                                        && g.is_none()
+                                    {
+                                        *g = Some(e);
+                                    }
+                                    return;
                                 }
-                                return;
                             }
                         }
+                        bytes_acc.fetch_add(local_bytes, Ordering::Relaxed);
                     });
                 }
             });
+            self.record_io_sample(
+                batch_bytes.load(Ordering::Relaxed),
+                t_wall.elapsed().as_micros() as u64,
+            );
 
             if let Some(e) = first_err.into_inner().ok().flatten() {
                 return Err(e);
@@ -870,18 +933,51 @@ impl LayerIoPool {
         Ok(())
     }
 
-    /// Internal helper for parallel disjoint slice writes (caller must verify disjointness and bounds).
-    fn read_span_into_disjoint_ptr(
+    /// Internal helper for sparse MoE disjoint slice reads (caller must verify
+    /// disjointness and bounds). Returns the number of bytes read from storage.
+    fn read_sparse_span_into_disjoint_ptr(
         &self,
         span: &CoalescedSpan,
         scratch: &mut AlignedBuf,
         dst_base: *mut u8,
         dst_len: usize,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let handle = &self.shards[span.shard_idx];
+
+        #[cfg(target_os = "linux")]
+        if !self.sparse_direct_io {
+            // Single-slice fast path: pread straight into `dst` (zero scratch copy)
+            // using `POSIX_FADV_RANDOM` + immediate `POSIX_FADV_DONTNEED`.
+            if let [slice] = span.slices.as_slice() {
+                let dst_end = slice
+                    .dst_offset
+                    .checked_add(slice.len)
+                    .context("sparse slice dst_offset overflow")?;
+                if dst_end > dst_len {
+                    bail!(
+                        "sparse slice dst range [{}..{dst_end}) exceeds dst_cap {dst_len}",
+                        slice.dst_offset
+                    );
+                }
+                let file_off = span.aligned_offset + slice.span_offset as u64;
+                let dst_slice = unsafe {
+                    std::slice::from_raw_parts_mut(dst_base.add(slice.dst_offset), slice.len)
+                };
+                pread_all(&handle.sparse_buffered, dst_slice, file_off)?;
+                evict_page_cache_range(
+                    &handle.sparse_buffered,
+                    span.aligned_offset,
+                    span.valid_len,
+                );
+                self.span_reads.fetch_add(1, Ordering::Relaxed);
+                return Ok(slice.len as u64);
+            }
+        }
+
         let max_chunk = span.aligned_len.min(self.max_chunk_bytes);
         scratch.ensure_capacity(max_chunk)?;
 
+        let mut total_bytes = 0u64;
         let mut chunk_rel = 0usize;
         while chunk_rel < span.valid_len {
             let chunk_valid = (span.valid_len - chunk_rel).min(self.max_chunk_bytes);
@@ -889,15 +985,28 @@ impl LayerIoPool {
             let file_off = span.aligned_offset + chunk_rel as u64;
             let read_buf = scratch.as_mut_slice(chunk_aligned);
 
-            let t_pread = std::time::Instant::now();
             let mut used_direct = false;
-            if let Some(direct_file) = &handle.direct {
+            if self.sparse_direct_io
+                && let Some(direct_file) = &handle.direct
+            {
                 used_direct = matches!(pread_exact_or_eof(direct_file, read_buf, file_off), Ok(n) if n >= chunk_valid);
             }
             if !used_direct {
-                pread_all(&handle.buffered, &mut read_buf[..chunk_valid], file_off)?;
+                #[cfg(target_os = "linux")]
+                {
+                    pread_all(
+                        &handle.sparse_buffered,
+                        &mut read_buf[..chunk_valid],
+                        file_off,
+                    )?;
+                    evict_page_cache_range(&handle.sparse_buffered, file_off, chunk_valid);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    pread_all(&handle.buffered, &mut read_buf[..chunk_valid], file_off)?;
+                }
             }
-            self.record_io_sample(chunk_valid as u64, t_pread.elapsed().as_micros() as u64);
+            total_bytes = total_bytes.saturating_add(chunk_valid as u64);
             self.span_reads.fetch_add(1, Ordering::Relaxed);
 
             let t_copy = self.profile_enabled.then(std::time::Instant::now);
@@ -926,7 +1035,7 @@ impl LayerIoPool {
             }
             chunk_rel += chunk_valid;
         }
-        Ok(())
+        Ok(total_bytes)
     }
 
     fn read_span_into(
@@ -1054,11 +1163,13 @@ impl Drop for LayerIoPool {
                 };
                 eprintln!(
                     "[layerstream-io-profile] read={mib:.1}MiB chunks={reads} zc_loads={zc} \
-                     chunk_cap={}MiB threads={} direct={} pread={pread_ms:.1}ms ({bw:.0} MiB/s) \
+                     chunk_cap={}MiB threads={} moe_threads={} direct={} sparse_direct={} pread={pread_ms:.1}ms ({bw:.0} MiB/s) \
                      memcpy={copy_ms:.1}ms expert_cache={hits}/{} ({hit_pct:.1}% hit, {cached_mib:.1}MiB saved)",
                     self.max_chunk_bytes / (1024 * 1024),
                     self.io_threads,
+                    self.moe_io_threads,
                     self.direct_io_active,
+                    self.sparse_direct_io,
                     hits + misses
                 );
             }
@@ -1074,6 +1185,31 @@ fn open_direct(path: &std::path::Path) -> Option<File> {
         .custom_flags(libc::O_DIRECT)
         .open(path)
         .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn open_sparse_buffered(path: &std::path::Path) -> std::io::Result<File> {
+    use std::os::unix::io::AsRawFd;
+    let file = File::open(path)?;
+    // Disable kernel sequential read-ahead on this handle so scattered MoE expert
+    // reads don't fetch unused adjacent experts or pollute the OS page cache.
+    unsafe {
+        let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn evict_page_cache_range(file: &File, offset: u64, len: usize) {
+    use std::os::unix::io::AsRawFd;
+    if len == 0 {
+        return;
+    }
+    if let (Ok(off), Ok(n)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len)) {
+        unsafe {
+            let _ = libc::posix_fadvise(file.as_raw_fd(), off, n, libc::POSIX_FADV_DONTNEED);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1288,5 +1424,122 @@ mod tests {
         lru.insert(k, b"TEST");
         assert_eq!(lru.used_bytes, 0);
         assert_eq!(lru.get_and_touch(k), None);
+    }
+
+    #[test]
+    fn load_slices_into_reads_single_and_coalesced_spans_parallel_and_serial() {
+        use crate::gguf_index::{ModelMeta, TensorLocation};
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shard_path = dir.path().join("synthetic.gguf");
+        // 512 KiB synthetic shard with unique byte values per 4 KiB page.
+        let mut payload = vec![0u8; 512 * 1024];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i / 251) ^ (i % 251)) as u8;
+        }
+        std::fs::File::create(&shard_path)
+            .unwrap()
+            .write_all(&payload)
+            .unwrap();
+
+        let mut tensors = HashMap::new();
+        // t0 and t1 are 8 KiB apart (< 64 KiB merge gap -> coalesced multi-slice span).
+        tensors.insert(
+            "t0".to_string(),
+            TensorLocation {
+                name: "t0".to_string(),
+                shard_idx: 0,
+                abs_offset: 4096,
+                ggml_type: 0,
+                dims: vec![8192],
+            },
+        );
+        tensors.insert(
+            "t1".to_string(),
+            TensorLocation {
+                name: "t1".to_string(),
+                shard_idx: 0,
+                abs_offset: 16384,
+                ggml_type: 0,
+                dims: vec![8192],
+            },
+        );
+        // t2 and t3 are > 128 KiB apart (-> single-slice direct-to-dst fast path).
+        tensors.insert(
+            "t2".to_string(),
+            TensorLocation {
+                name: "t2".to_string(),
+                shard_idx: 0,
+                abs_offset: 160 * 1024,
+                ggml_type: 0,
+                dims: vec![12288],
+            },
+        );
+        tensors.insert(
+            "t3".to_string(),
+            TensorLocation {
+                name: "t3".to_string(),
+                shard_idx: 0,
+                abs_offset: 384 * 1024,
+                ggml_type: 0,
+                dims: vec![12288],
+            },
+        );
+
+        let index = GgufIndex {
+            meta: ModelMeta {
+                architecture: "qwen3moe".to_string(),
+                name: None,
+                n_layers: 1,
+                context_length: Some(2048),
+                total_file_bytes: payload.len() as u64,
+            },
+            shards: vec![shard_path],
+            shard_sizes: vec![payload.len() as u64],
+            tensors,
+        };
+
+        let mut pool = LayerIoPool::new(index, false).unwrap();
+        pool.sparse_direct_io = false;
+
+        let reqs = [
+            ("t0", 128u64, 0usize, 4096usize, 0u32),
+            ("t1", 256u64, 4096usize, 4096usize, 1u32),
+            ("t2", 512u64, 8192usize, 8192usize, 2u32),
+            ("t3", 0u64, 16384usize, 8192usize, 3u32),
+        ];
+
+        for threads in [1usize, 4usize] {
+            pool.moe_io_threads = threads;
+            pool.clear_expert_cache();
+            let mut dst = vec![0u8; 24576];
+            pool.load_slices_into(&reqs, &mut dst).unwrap();
+
+            assert_eq!(&dst[0..4096], &payload[4096 + 128..4096 + 128 + 4096]);
+            assert_eq!(&dst[4096..8192], &payload[16384 + 256..16384 + 256 + 4096]);
+            assert_eq!(
+                &dst[8192..16384],
+                &payload[160 * 1024 + 512..160 * 1024 + 512 + 8192]
+            );
+            assert_eq!(&dst[16384..24576], &payload[384 * 1024..384 * 1024 + 8192]);
+
+            // Second read with warm expert cache serves all 4 slices from RAM.
+            let before = pool.stats();
+            let mut dst2 = vec![0u8; 24576];
+            pool.load_slices_into(&reqs, &mut dst2).unwrap();
+            let after = pool.stats();
+            assert_eq!(dst2, dst);
+            assert_eq!(after.cache_hits - before.cache_hits, 4);
+            assert_eq!(after.bytes_read, before.bytes_read);
+        }
+
+        // Overlapping destination ranges must still fail closed.
+        let bad = [
+            ("t0", 0u64, 0usize, 4096usize, 0u32),
+            ("t1", 0u64, 2048usize, 4096usize, 1u32),
+        ];
+        let mut dst = vec![0u8; 8192];
+        assert!(pool.load_slices_into(&bad, &mut dst).is_err());
     }
 }
