@@ -41,7 +41,7 @@ impl Default for ManagedStartupConfig {
             plans: Vec::new(),
             config_error: None,
             default_draft_model: None,
-            cache_root: crate::hf::default_cache_dir(),
+            cache_root: layerstream_core::hf::default_cache_dir(),
             use_gpu: false,
             allow_slow: false,
         }

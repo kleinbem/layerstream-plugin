@@ -5,6 +5,7 @@ members = [
     "crates/layerstream-server",
     "crates/layerstream-plugin",
 ]
+exclude = ["bindings/python"]
 
 [workspace.package]
 version = "0.3.0"

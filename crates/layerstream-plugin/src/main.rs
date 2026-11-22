@@ -1,5 +1,4 @@
 mod config;
-mod hf;
 mod managed_models;
 mod mesh_adapter;
 mod worker;
@@ -8,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use layerstream_core::{hf, probe_dir_storage_mib_per_s};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -278,56 +278,4 @@ async fn run_plugin_mode(engine: EngineArgs) -> Result<()> {
         managed_startup,
     )
     .await
-}
-
-fn find_existing_probe_file(dir: &std::path::Path, depth: usize) -> Option<std::path::PathBuf> {
-    const MIN_PROBE_BYTES: u64 = 16 * 1024 * 1024;
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Ok(meta) = entry.metadata() {
-            if meta.is_file() && meta.len() >= MIN_PROBE_BYTES {
-                return Some(path);
-            }
-            if meta.is_dir()
-                && depth > 0
-                && let Some(found) = find_existing_probe_file(&path, depth - 1)
-            {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn probe_dir_storage_mib_per_s(dir: &std::path::Path) -> Option<f64> {
-    if let Some(existing) = find_existing_probe_file(dir, 2)
-        && let Ok((mib_s, _)) = layerstream_core::probe_storage_mib_per_s(&existing, true)
-        && mib_s >= 10.0
-    {
-        return Some(mib_s);
-    }
-
-    struct TempCleanup(std::path::PathBuf);
-    impl Drop for TempCleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
-    let tmp_path = dir.join(format!(".layerstream-probe-{}.tmp", std::process::id()));
-    let _cleanup = TempCleanup(tmp_path.clone());
-    let mut f = std::fs::File::create(&tmp_path).ok()?;
-    let chunk = vec![0xA5u8; 1024 * 1024];
-    use std::io::Write;
-    for _ in 0..16 {
-        f.write_all(&chunk).ok()?;
-    }
-    f.sync_all().ok()?;
-    drop(f);
-
-    layerstream_core::probe_storage_mib_per_s(&tmp_path, true)
-        .ok()
-        .map(|(mib_s, _)| mib_s)
-        .filter(|&bw| bw >= 10.0)
 }

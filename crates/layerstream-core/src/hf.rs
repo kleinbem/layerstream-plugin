@@ -153,7 +153,7 @@ impl HfSpec {
 
 /// Expands multi-part GGUF filenames `*-00001-of-0000N.gguf` (or any shard index
 /// `*-XXXXX-of-0000N.gguf`) into all `N` ordered shard paths (`00001..=N`).
-pub(crate) fn expand_gguf_shard_filename(filename: &str) -> Vec<String> {
+pub fn expand_gguf_shard_filename(filename: &str) -> Vec<String> {
     let (dir_prefix, file_name) = match filename.rsplit_once('/') {
         Some((d, f)) => (Some(d), f),
         None => (None, filename),
@@ -1233,6 +1233,220 @@ pub fn recommend_candidates(
     recs
 }
 
+/// Options controlling `resolve_pretrained_model` resolution and hardware-aware quant selection.
+#[derive(Debug, Clone, Default)]
+pub struct PretrainedResolveOptions {
+    pub revision: Option<String>,
+    pub quant: Option<String>,
+    pub cache_dir: Option<PathBuf>,
+    pub vram_budget_bytes: Option<u64>,
+    pub use_gpu: bool,
+    pub has_draft: bool,
+}
+
+/// Result of resolving a local path, `hf://` URI, HF GGUF repo, or base HF repo to a local GGUF.
+#[derive(Debug, Clone)]
+pub struct ResolvedModel {
+    pub local_path: PathBuf,
+    pub source_uri: Option<String>,
+    pub resolved_repo: Option<String>,
+    pub selected_quant: Option<String>,
+}
+
+fn expand_tilde(path_str: &str) -> PathBuf {
+    if let Some(rest) = path_str.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(path_str)
+}
+
+fn looks_like_local_path(spec: &str) -> bool {
+    let trimmed = spec.trim();
+    if trimmed.starts_with(HF_PREFIX)
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
+    {
+        return false;
+    }
+    if trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with("~/")
+        || trimmed.contains('\\')
+    {
+        return true;
+    }
+    // Windows drive letter (e.g. `C:\...` or `C:/...`).
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    trimmed.to_ascii_lowercase().ends_with(".gguf")
+}
+
+fn select_candidate_for_repo<'a>(
+    recs: &'a [QuantRecommendation],
+    quant_filter: Option<&str>,
+    repo_id: &str,
+) -> Result<&'a QuantRecommendation> {
+    if let Some(wanted) = quant_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        let wanted_upper = wanted.to_ascii_uppercase();
+        if let Some(found) = recs.iter().find(|r| {
+            r.candidate.primary_file.eq_ignore_ascii_case(wanted)
+                || r.candidate
+                    .primary_file
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|f| f.eq_ignore_ascii_case(wanted))
+                || r.candidate.quant.eq_ignore_ascii_case(&wanted_upper)
+        }) {
+            return Ok(found);
+        }
+        let available: Vec<&str> = recs.iter().map(|r| r.candidate.quant.as_str()).collect();
+        bail!(
+            "quant '{wanted}' not found in '{repo_id}' (available: {})",
+            available.join(", ")
+        );
+    }
+    recs.iter()
+        .find(|r| r.recommended)
+        .or_else(|| recs.first())
+        .with_context(|| format!("no GGUF candidates available in '{repo_id}'"))
+}
+
+/// Resolves a model specification into a local `.gguf` file path, downloading if needed.
+///
+/// Supported inputs:
+/// 1. Local `.gguf` file path (`/path/to/model.gguf`, `./model.gguf`, `~/models/m.gguf`)
+/// 2. Explicit `hf://org/repo:file.gguf[@rev]` or `hf://org/repo/file.gguf[@rev]` URI
+/// 3. HF GGUF repository (`org/repo-GGUF[@rev]`, `hf://org/repo-GGUF`, HF URL) — picks `opts.quant`
+///    or auto-selects the hardware-recommended quant for probed GPU/VRAM + NVMe bandwidth
+/// 4. Base HF repository (`org/Model`) — when the repo contains no `.gguf` files, checks the
+///    official `{org}/{Model}-GGUF` sibling repository and otherwise returns actionable guidance.
+pub fn resolve_pretrained_model(
+    spec: &str,
+    opts: &PretrainedResolveOptions,
+) -> Result<ResolvedModel> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        bail!("model specification must not be empty");
+    }
+
+    // 1. Local file path.
+    let expanded = expand_tilde(trimmed);
+    if expanded.is_file() {
+        return Ok(ResolvedModel {
+            local_path: expanded,
+            source_uri: None,
+            resolved_repo: None,
+            selected_quant: None,
+        });
+    }
+    if looks_like_local_path(trimmed) {
+        bail!("local GGUF model not found: '{}'", expanded.display());
+    }
+
+    let cache_root = opts.cache_dir.clone().unwrap_or_else(default_cache_dir);
+
+    // 2. Explicit `hf://org/repo:file.gguf` or `hf://org/repo/file.gguf` URI.
+    if trimmed.starts_with(HF_PREFIX)
+        && let Ok(mut parsed) = HfSpec::parse(trimmed)
+    {
+        if let Some(rev) = opts.revision.as_deref().filter(|s| !s.trim().is_empty())
+            && !trimmed.contains('@')
+        {
+            parsed.revision = rev.to_string();
+        }
+        let uri = if parsed.revision == "main" {
+            format!("hf://{}:{}", parsed.repo_id, parsed.filename)
+        } else {
+            format!(
+                "hf://{}:{}@{}",
+                parsed.repo_id, parsed.filename, parsed.revision
+            )
+        };
+        let local_path = ensure_hf_downloaded(&uri, &cache_root)?;
+        let selected_quant = Some(extract_quant_label(&parsed.filename));
+        return Ok(ResolvedModel {
+            local_path,
+            source_uri: Some(uri),
+            resolved_repo: Some(parsed.repo_id),
+            selected_quant,
+        });
+    }
+
+    // 3. HF repo ID (or base HF repo -> official `{org}/{name}-GGUF` sibling).
+    let (repo_id, revision) = parse_repo_and_revision(trimmed, opts.revision.as_deref())?;
+    let mut effective_repo = repo_id.clone();
+    let mut candidates = list_hf_gguf_candidates(&repo_id, &revision)?;
+
+    if candidates.is_empty() {
+        if !repo_id.to_ascii_lowercase().ends_with("-gguf") {
+            let sibling = format!("{repo_id}-GGUF");
+            let model_name = repo_id.rsplit('/').next().unwrap_or(&repo_id);
+            match list_hf_gguf_candidates(&sibling, &revision) {
+                Ok(sib_cands) if !sib_cands.is_empty() => {
+                    tracing::info!(
+                        base_repo = %repo_id,
+                        gguf_repo = %sibling,
+                        candidates = sib_cands.len(),
+                        "resolved base Hugging Face repository to official -GGUF sibling"
+                    );
+                    effective_repo = sibling;
+                    candidates = sib_cands;
+                }
+                _ => {
+                    bail!(
+                        "repository '{repo_id}@{revision}' contains no .gguf files, and official \
+                         sibling '{sibling}@{revision}' has no GGUF checkpoints. Pass an explicit \
+                         GGUF repository (e.g. 'bartowski/{model_name}-GGUF' or \
+                         'unsloth/{model_name}-GGUF'), an 'hf://org/repo:file.gguf' URI, or a \
+                         local .gguf path"
+                    );
+                }
+            }
+        } else {
+            bail!("no .gguf files found in Hugging Face repository '{repo_id}@{revision}'");
+        }
+    }
+
+    let free_vram_bytes = opts
+        .vram_budget_bytes
+        .filter(|&b| b > 0)
+        .or_else(|| {
+            if opts.use_gpu {
+                crate::StreamEngine::probe_gpu_memory(true).map(|(free, _)| free)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(4 * 1024 * 1024 * 1024);
+
+    let _ = fs::create_dir_all(&cache_root);
+    let storage_bw = crate::probe_dir_storage_mib_per_s(&cache_root).unwrap_or(1500.0);
+
+    let recs = recommend_candidates(
+        &effective_repo,
+        &revision,
+        &candidates,
+        free_vram_bytes,
+        storage_bw,
+        opts.has_draft,
+    );
+    let chosen = select_candidate_for_repo(&recs, opts.quant.as_deref(), &effective_repo)?;
+    let local_path = ensure_hf_downloaded(&chosen.hf_uri, &cache_root)?;
+
+    Ok(ResolvedModel {
+        local_path,
+        source_uri: Some(chosen.hf_uri.clone()),
+        resolved_repo: Some(effective_repo),
+        selected_quant: Some(chosen.candidate.quant.clone()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1645,5 +1859,135 @@ mod tests {
         let local = res.expect("Xet redirect download must verify against Hub X-Linked-Etag");
         assert_eq!(fs::read(&local).unwrap(), payload);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_pretrained_local_file_and_missing_local_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf = tmp.path().join("tiny.gguf");
+        fs::write(&gguf, b"GGUF").unwrap();
+
+        let opts = PretrainedResolveOptions {
+            cache_dir: Some(tmp.path().join("cache")),
+            ..Default::default()
+        };
+        let resolved = resolve_pretrained_model(gguf.to_str().unwrap(), &opts).unwrap();
+        assert_eq!(resolved.local_path, gguf);
+        assert!(resolved.source_uri.is_none());
+
+        let missing = tmp.path().join("does-not-exist.gguf");
+        let err = resolve_pretrained_model(missing.to_str().unwrap(), &opts).unwrap_err();
+        assert!(
+            err.to_string().contains("local GGUF model not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_pretrained_gguf_repo_and_base_repo_sibling() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let payload = b"GGUF_MOCK_PAYLOAD_BYTES".to_vec();
+        let sha = to_hex_lower(&Sha256::digest(&payload));
+        let tree_gguf = format!(
+            r#"[
+              {{"type":"file","path":"Model-Q4_K_M.gguf","size":{},"lfs":{{"size":{}}}}},
+              {{"type":"file","path":"Model-Q8_0.gguf","size":{},"lfs":{{"size":{}}}}}
+            ]"#,
+            4 * 1024 * 1024 * 1024u64,
+            4 * 1024 * 1024 * 1024u64,
+            9 * 1024 * 1024 * 1024u64,
+            9 * 1024 * 1024 * 1024u64,
+        );
+        let tree_safetensors = r#"[{"type":"file","path":"model.safetensors","size":1000}]"#;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_payload = payload.clone();
+        let srv_sha = sha.clone();
+        let server = std::thread::spawn(move || {
+            // Handle 5 HTTP requests across the test cases.
+            for stream in listener.incoming().take(5) {
+                let Ok(mut sock) = stream else { break };
+                let mut reader = BufReader::new(sock.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let path = req_line.split_whitespace().nth(1).unwrap_or("");
+                if path == "/api/models/Org/BaseModel/tree/main?recursive=true" {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        tree_safetensors.len(),
+                        tree_safetensors
+                    );
+                    sock.write_all(resp.as_bytes()).unwrap();
+                } else if path == "/api/models/Org/BaseModel-GGUF/tree/main?recursive=true" {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        tree_gguf.len(),
+                        tree_gguf
+                    );
+                    sock.write_all(resp.as_bytes()).unwrap();
+                } else if path == "/Org/BaseModel-GGUF/resolve/main/Model-Q4_K_M.gguf" {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nETag: \"{srv_sha}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        srv_payload.len()
+                    );
+                    sock.write_all(header.as_bytes()).unwrap();
+                    sock.write_all(&srv_payload).unwrap();
+                } else if path == "/api/models/Org/NoGguf/tree/main?recursive=true" {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        tree_safetensors.len(),
+                        tree_safetensors
+                    );
+                    sock.write_all(resp.as_bytes()).unwrap();
+                } else {
+                    sock.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                }
+                let _ = sock.flush();
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HF_ENDPOINT", format!("http://{addr}")) };
+
+        let opts = PretrainedResolveOptions {
+            cache_dir: Some(tmp.path().to_path_buf()),
+            vram_budget_bytes: Some(6 * 1024 * 1024 * 1024),
+            use_gpu: false,
+            has_draft: false,
+            ..Default::default()
+        };
+
+        // 1. Base repo `Org/BaseModel` -> auto-resolves to `Org/BaseModel-GGUF` and picks Q4_K_M (3 requests).
+        let res = resolve_pretrained_model("Org/BaseModel", &opts).unwrap();
+        assert_eq!(res.resolved_repo.as_deref(), Some("Org/BaseModel-GGUF"));
+        assert_eq!(res.selected_quant.as_deref(), Some("Q4_K_M"));
+        assert_eq!(fs::read(&res.local_path).unwrap(), payload);
+
+        // 2. Base repo with no GGUFs and 404 sibling -> clear guidance error (2 requests).
+        let err = resolve_pretrained_model("Org/NoGguf", &opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Org/NoGguf-GGUF"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("bartowski/NoGguf-GGUF"),
+            "missing guidance: {msg}"
+        );
+
+        unsafe { std::env::remove_var("HF_ENDPOINT") };
+        server.join().unwrap();
     }
 }

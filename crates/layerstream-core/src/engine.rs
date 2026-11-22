@@ -57,6 +57,19 @@ pub enum KvCacheType {
     Q4_0 = 2,
 }
 
+impl std::str::FromStr for KvCacheType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "f16" => Ok(Self::F16),
+            "q8_0" => Ok(Self::Q8_0),
+            "q4_0" => Ok(Self::Q4_0),
+            other => bail!("invalid kv_cache_type '{other}' (expected f16, q8_0, or q4_0)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub model_path: PathBuf,

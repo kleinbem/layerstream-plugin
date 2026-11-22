@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "layerstream-py"
+version = "0.3.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Native Python bindings for layerstream-core (out-of-core GGUF layer-streaming LLM engine)"
+repository = "https://github.com/kleinbem/layerstream-plugin"
+
+[lib]
+name = "_layerstream"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+vulkan = ["layerstream-core/vulkan"]
+cuda = ["layerstream-core/cuda"]
+metal = ["layerstream-core/metal"]
+dynamic-backends = ["layerstream-core/dynamic-backends"]
+
+[dependencies]
+anyhow = "1"
+layerstream-core = { path = "../../crates/layerstream-core", features = ["hf"] }
+pyo3 = { version = "0.27", features = ["abi3-py39"] }

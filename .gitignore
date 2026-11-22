@@ -1,4 +1,5 @@
 /target
+/bindings/python/target
 /result
 /result-*
 *.gguf
@@ -6,3 +7,9 @@
 .envrc.local
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+dist/
+bindings/python/python/layerstream/*.so
+bindings/python/python/layerstream/*.pyd

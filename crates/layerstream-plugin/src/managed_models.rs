@@ -17,7 +17,7 @@ use mesh_llm_plugin::models::{
 };
 
 use crate::config::run_preflight_checks;
-use crate::hf;
+use layerstream_core::hf;
 
 const SUPPORTED_OPTIONS: &[&str] = &["file", "files", "alias", "draft_model", "draft_file"];
 

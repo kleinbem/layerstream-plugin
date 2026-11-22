@@ -3,10 +3,8 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::Args;
-use layerstream_core::{KvCacheType, StreamEngine, probe_storage_mib_per_s};
+use layerstream_core::{KvCacheType, StreamEngine, hf, probe_storage_mib_per_s};
 use layerstream_server::{ModelRegistry, ServerConfig};
-
-use crate::hf;
 
 const MIN_STREAMING_STORAGE_MIB_S: f64 = 150.0;
 const OVERSIZE_GUARD_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
@@ -161,12 +159,10 @@ impl EngineArgs {
             }
         });
 
-        let kv_cache_type = match self.kv_cache_type.as_str() {
-            "f16" => KvCacheType::F16,
-            "q8_0" => KvCacheType::Q8_0,
-            "q4_0" => KvCacheType::Q4_0,
-            other => bail!("invalid --kv-cache-type '{other}' (expected f16, q8_0, or q4_0)"),
-        };
+        let kv_cache_type: KvCacheType = self
+            .kv_cache_type
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --kv-cache-type: {e}"))?;
 
         let (vram_budget_auto, vram_budget_bytes) =
             if self.vram_budget_mb.eq_ignore_ascii_case("auto") {

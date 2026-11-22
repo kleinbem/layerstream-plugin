@@ -1,6 +1,8 @@
 pub mod engine;
 pub mod ffi;
 pub mod gguf_index;
+#[cfg(feature = "hf")]
+pub mod hf;
 pub mod io_reader;
 pub mod residency;
 pub mod speculator;
@@ -14,6 +16,6 @@ pub use gguf_index::{
     CoalescedSpan, GgufIndex, MAX_DRAFT_VOCAB_PAD_DELTA, ModelMeta, TensorLocation,
     check_gguf_draft_compatible, check_vocab_lists_compatible,
 };
-pub use io_reader::{IoStats, LayerIoPool, probe_storage_mib_per_s};
+pub use io_reader::{IoStats, LayerIoPool, probe_dir_storage_mib_per_s, probe_storage_mib_per_s};
 pub use residency::{AdmissionPermit, EngineLease, Residency};
 pub use speculator::{DraftModelProposer, NgramProposer, SpeculationStats};

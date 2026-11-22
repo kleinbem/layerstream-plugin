@@ -849,10 +849,12 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "ureq",
 ]
 
 [[package]]
@@ -874,7 +876,6 @@ dependencies = [
  "mesh-llm-plugin",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "tokio",
  "tokio-stream",
