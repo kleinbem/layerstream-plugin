@@ -414,12 +414,12 @@
         <h1>⚡ layerstream-plugin — Edge Out-of-Core LLM Benchmarks</h1>
         <p>
           Bare-metal 4-engine comparison on an <strong>8 GB NVIDIA Jetson Orin Nano</strong> (7.3 GiB RAM, CUDA <code>sm_87</code>, LUKS2 NVMe, INA3221 hardware power rail):
-          <strong>layerstream-plugin v0.1.0</strong> vs. <strong>stock llama.cpp</strong> (Ollama/LM Studio runtime), <strong>Hugging Face accelerate</strong>, and <strong>AirLLM 4.0.0</strong>.
+          <strong>layerstream-plugin</strong> (R2–R8 throughput measured on <code>v0.1.0</code>; latest <strong><code>v0.2.0</code></strong> adds isolated GPU worker subprocesses for <strong>0 MB post-eviction VRAM/CUDA context</strong> — <code>524 MiB → 33.1 MiB</code> RSS on Orin Nano — plus dynamic CUDA/Vulkan backends) vs. <strong>stock llama.cpp</strong> (Ollama/LM Studio runtime), <strong>Hugging Face accelerate</strong>, and <strong>AirLLM 4.0.0</strong>.
         </p>
       </div>
       <nav class="pill-links" aria-label="Project links">
         <a class="pill" href="https://github.com/kleinbem/layerstream-plugin" target="_blank" rel="noopener">GitHub Repo</a>
-        <a class="pill" href="https://github.com/kleinbem/layerstream-plugin/releases/tag/v0.1.0" target="_blank" rel="noopener">v0.1.0 Release</a>
+        <a class="pill" href="https://github.com/kleinbem/layerstream-plugin/releases/tag/v0.2.0" target="_blank" rel="noopener">v0.2.0 Release</a>
         <a class="pill" href="https://huggingface.co/datasets/kleinbem/layerstream-orin-nano-benchmarks" target="_blank" rel="noopener">HF Dataset (130 runs)</a>
       </nav>
     </header>
@@ -831,7 +831,7 @@
       document.getElementById("est-output").innerHTML = `
         <div class="kpi"><div class="label">Preflight Verdict</div><div class="val" style="font-size:1.1rem">${verdictBadge}</div><div class="sub">Mirrors <code>layerstream-plugin check</code></div></div>
         <div class="kpi"><div class="label">Pinned Layers (R)</div><div class="val">${Math.round(pinnedFrac * 100)}%</div><div class="sub">${streamedGib.toFixed(1)} GiB streamed per sweep</div></div>
-        <div class="kpi"><div class="label">Est. Cold Load</div><div class="val">${loadS.toFixed(1)} s</div><div class="sub">0 MB weights while idle</div></div>
+        <div class="kpi"><div class="label">Est. Cold Load</div><div class="val">${loadS.toFixed(1)} s</div><div class="sub">0 MB GPU/CUDA context while idle (v0.2.0 worker)</div></div>
         <div class="kpi"><div class="label">Est. Decode Speed</div><div class="val" style="color:var(--accent-2)">${fitsResident ? "12–45+" : `${lowTps.toFixed(2)}–${highTps.toFixed(2)}`} tok/s</div><div class="sub">${arch === "dense_draft" ? "prose → code_edit range" : arch === "moe_cached" ? "warm TinyLFU cache range" : "1 tok/sweep floor"}</div></div>
       `;
       const vEl = document.getElementById("est-verdict");
