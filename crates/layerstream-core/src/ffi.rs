@@ -157,6 +157,8 @@ unsafe extern "C" {
         out_total_bytes: *mut u64,
     ) -> bool;
 
+    pub fn ls_set_log_verbose(verbose: bool);
+
     pub fn ls_sample_from_logits(
         logits: *const f32,
         n_vocab: i32,

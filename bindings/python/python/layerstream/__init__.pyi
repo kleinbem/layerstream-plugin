@@ -90,6 +90,7 @@ class AutoModel:
         stream_head: bool = False,
         moe_active_streaming: bool = True,
         max_draft_tokens: int = 5,
+        verbose: bool = False,
     ) -> AutoModel: ...
 
     @overload

@@ -289,6 +289,7 @@ impl AutoModel {
         stream_head=false,
         moe_active_streaming=true,
         max_draft_tokens=5,
+        verbose=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_pretrained(
@@ -312,7 +313,9 @@ impl AutoModel {
         stream_head: bool,
         moe_active_streaming: bool,
         max_draft_tokens: usize,
+        verbose: bool,
     ) -> PyResult<Self> {
+        StreamEngine::set_log_verbose(verbose);
         let kv_type: KvCacheType = kv_cache_type
             .parse()
             .map_err(|e: anyhow::Error| PyValueError::new_err(e.to_string()))?;
@@ -795,6 +798,7 @@ fn probe_gpu_memory(py: Python<'_>, use_gpu: bool) -> Option<(u64, u64)> {
 
 #[pymodule]
 fn _layerstream(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    StreamEngine::set_log_verbose(false);
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<AutoModel>()?;
     m.add_class::<TokenStream>()?;

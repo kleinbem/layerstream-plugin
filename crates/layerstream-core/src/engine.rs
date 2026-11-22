@@ -12,7 +12,7 @@ use crate::ffi::{
     ls_engine_eval_sample, ls_engine_eval_verify_greedy, ls_engine_eval_verify_sample,
     ls_engine_free, ls_engine_get_stats, ls_engine_kv_clear, ls_engine_kv_trim, ls_engine_n_ctx,
     ls_engine_set_cancel_cb, ls_engine_token_is_eog, ls_engine_token_to_piece, ls_engine_tokenize,
-    ls_engine_vocab_size, ls_probe_gpu_memory,
+    ls_engine_vocab_size, ls_probe_gpu_memory, ls_set_log_verbose,
 };
 use crate::gguf_index::{GgufIndex, MAX_DRAFT_VOCAB_PAD_DELTA};
 use crate::io_reader::{IoStats, LayerIoPool};
@@ -283,6 +283,11 @@ impl StreamEngine {
         } else {
             None
         }
+    }
+
+    /// Configures `llama.cpp` / `ggml` stderr verbosity (`false` silences INFO/DEBUG logs).
+    pub fn set_log_verbose(verbose: bool) {
+        unsafe { ls_set_log_verbose(verbose) };
     }
 
     /// Verifies that a draft model shares the same base tokenizer vocabulary and token IDs

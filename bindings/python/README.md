@@ -37,13 +37,22 @@ with AutoModel.from_pretrained(
 3. **HF GGUF repo ID:** `"Qwen/Qwen2.5-14B-Instruct-GGUF"` (auto-selects the best quant for probed GPU/NVMe, or pass `quant="Q4_K_M"`)
 4. **Base HF repo ID:** `"Qwen/Qwen2.5-14B-Instruct"` (resolves the official `{org}/{name}-GGUF` sibling repository)
 
-## Building Locally
+## Building & Trying the Demos Locally
 
 ```bash
 nix develop .#python
 cd bindings/python
-maturin develop --release          # CPU (or add: --features vulkan / --features metal / --features cuda)
-pytest -v
+maturin build --locked --release --features vulkan --out dist   # or omit --features for CPU
+python3 -m zipfile -e dist/*.whl .wheel-local
+
+# 3-line Hugging Face quickstart (or pass --model /path/to/model.gguf):
+PYTHONPATH=.wheel-local python3 examples/quickstart.py
+
+# Multi-turn KV reuse & MoE/streaming telemetry demo:
+PYTHONPATH=.wheel-local python3 examples/streaming_benchmark.py /path/to/model.gguf --vram-budget-mb 2048
+
+# Unit & integration tests:
+PYTHONPATH=.wheel-local pytest -v
 ```
 
 See the root [README.md](../../README.md) for bare-metal benchmarks (vs AirLLM, HF `accelerate`, and stock `llama.cpp`) and Mesh-LLM plugin usage.

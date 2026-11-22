@@ -150,6 +150,8 @@ uint32_t ls_engine_n_ctx(const ls_engine * eng);
 void ls_engine_set_cancel(ls_engine * eng, bool cancel);
 void ls_engine_set_cancel_cb(ls_engine * eng, ls_cancel_check_cb cb, const void * user_data);
 bool ls_probe_gpu_memory(bool use_gpu, uint64_t * out_free_bytes, uint64_t * out_total_bytes);
+/** Controls llama.cpp/ggml stderr verbosity (false suppresses INFO/DEBUG logs while keeping WARN/ERROR). */
+void ls_set_log_verbose(bool verbose);
 
 /** Pure sampling helper shared by eval_sample and tests (exact top_k -> temp -> top_p). */
 int32_t ls_sample_from_logits(

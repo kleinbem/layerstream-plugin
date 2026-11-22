@@ -260,6 +260,20 @@ static std::string current_executable_dir() {
 }
 #endif
 
+static std::atomic<bool> g_log_verbose{true};
+
+static void ls_log_callback(ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (!text) {
+        return;
+    }
+    if (!g_log_verbose.load(std::memory_order_relaxed)) {
+        if (level != GGML_LOG_LEVEL_ERROR && level != GGML_LOG_LEVEL_WARN) {
+            return;
+        }
+    }
+    std::fputs(text, stderr);
+}
+
 static void ensure_llama_initialized() {
     std::call_once(g_llama_init_once, []() {
         // Prevent ggml-cuda from capturing 80 separate per-layer CUDA graphs
@@ -2618,6 +2632,12 @@ void ls_engine_set_cancel_cb(ls_engine * eng, ls_cancel_check_cb cb, const void 
     }
     eng->cancel_cb = cb;
     eng->cancel_cb_user_data = user_data;
+}
+
+void ls_set_log_verbose(bool verbose) {
+    g_log_verbose.store(verbose, std::memory_order_relaxed);
+    llama_log_set(ls_log_callback, nullptr);
+    ggml_log_set(ls_log_callback, nullptr);
 }
 
 bool ls_probe_gpu_memory(bool use_gpu, uint64_t * out_free_bytes, uint64_t * out_total_bytes) {
