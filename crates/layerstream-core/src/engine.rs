@@ -841,7 +841,15 @@ impl StreamEngine {
                 if draft.len() < 2
                     && let Some(dp) = draft_proposer.as_deref_mut()
                 {
-                    draft = dp.propose(&history, max_step_draft.min(adaptive_draft_k))?;
+                    draft = dp.propose_with_cancel(
+                        &history,
+                        max_step_draft.min(adaptive_draft_k),
+                        cancel,
+                    )?;
+                    if is_cancelled() {
+                        finish_reason = "cancelled".to_string();
+                        break;
+                    }
                 }
                 // Guard against padded-vocab draft models proposing an out-of-range token ID.
                 if let Some(bad_idx) = draft.iter().position(|&t| t < 0 || t >= target_vocab) {
@@ -1019,9 +1027,15 @@ impl StreamEngine {
     }
 }
 
-struct CancelCbGuard {
+pub(crate) struct CancelCbGuard {
     raw: NonNull<LsEngine>,
     installed: bool,
+}
+
+impl StreamEngine {
+    pub(crate) fn install_cancel_cb(&self, cancel: Option<&AtomicBool>) -> CancelCbGuard {
+        CancelCbGuard::install(self.raw, cancel)
+    }
 }
 
 impl CancelCbGuard {

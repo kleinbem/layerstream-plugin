@@ -3,6 +3,10 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -438,3 +442,177 @@ def test_input_validation_and_unload_idempotency(synthetic_gguf: Path) -> None:
         model.generate("a b", max_tokens=4, stream=True)
     with pytest.raises(RuntimeError, match="unloaded"):
         model.chat([{"role": "user", "content": "a b"}], max_tokens=4)
+
+
+def test_sigint_cancels_streaming_and_non_streaming_generation(
+    synthetic_gguf: Path,
+) -> None:
+    """SIGINT must interrupt both stream=False and stream=True and leave the model usable."""
+    with AutoModel.from_pretrained(
+        str(synthetic_gguf),
+        use_gpu=False,
+        ctx_size=256,
+        batch_size=64,
+        vram_budget_mb=0,
+        prefer_direct_io=False,
+    ) as model:
+        # 1. Non-streaming generation must honor SIGINT via py.check_signals().
+        timer = threading.Timer(0.02, signal.raise_signal, args=(signal.SIGINT,))
+        timer.start()
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                for _ in range(64):
+                    model.generate(
+                        "a b c d e f",
+                        max_tokens=192,
+                        temperature=0.0,
+                        ngram_speculation=False,
+                    )
+        finally:
+            timer.cancel()
+
+        # Model lock must be cleanly released right after KeyboardInterrupt.
+        recovered = model.generate("a b c d", max_tokens=4, temperature=0.0)
+        assert isinstance(recovered, str) and len(recovered) > 0
+
+        # 2. Streaming generation must honor SIGINT and join its worker cleanly.
+        timer = threading.Timer(0.02, signal.raise_signal, args=(signal.SIGINT,))
+        timer.start()
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                for _ in range(64):
+                    for _ in model.generate(
+                        "a b c d e f",
+                        max_tokens=192,
+                        temperature=0.0,
+                        stream=True,
+                        ngram_speculation=False,
+                    ):
+                        pass
+        finally:
+            timer.cancel()
+
+        recovered2 = model.generate("a b c d", max_tokens=4, temperature=0.0)
+        assert recovered2 == recovered
+
+        # 3. SIGINT must promptly interrupt both stream=False and stream=True while another
+        # retained stream holds the engine mutex (neither call can complete until SIGINT cancels).
+        held_stream = model.generate(
+            "a b c d e f",
+            max_tokens=192,
+            temperature=0.0,
+            stream=True,
+            ngram_speculation=False,
+        )
+        try:
+            assert isinstance(next(held_stream), str)
+            # Let the retained stream fill its 64-slot channel and hold the engine mutex.
+            time.sleep(0.2)
+
+            timer = threading.Timer(0.05, signal.raise_signal, args=(signal.SIGINT,))
+            started = time.monotonic()
+            timer.start()
+            try:
+                with pytest.raises(KeyboardInterrupt):
+                    model.generate(
+                        "a b c d e f",
+                        max_tokens=64,
+                        temperature=0.0,
+                        ngram_speculation=False,
+                    )
+            finally:
+                timer.cancel()
+            assert time.monotonic() - started < 2.0
+
+            blocked_stream = model.generate(
+                "a b c d e f",
+                max_tokens=64,
+                temperature=0.0,
+                stream=True,
+                ngram_speculation=False,
+            )
+            timer = threading.Timer(0.05, signal.raise_signal, args=(signal.SIGINT,))
+            started = time.monotonic()
+            timer.start()
+            try:
+                with pytest.raises(KeyboardInterrupt):
+                    next(blocked_stream)
+            finally:
+                timer.cancel()
+                blocked_stream.close()
+            assert time.monotonic() - started < 2.0
+        finally:
+            held_stream.close()
+
+        recovered3 = model.generate("a b c d", max_tokens=4, temperature=0.0)
+        assert recovered3 == recovered
+
+
+def test_interpreter_exit_with_live_model_and_stream(synthetic_gguf: Path) -> None:
+    """Exiting Python without calling .close() or .unload() must not crash or hang."""
+    script = (
+        "import time\n"
+        "from layerstream import AutoModel\n"
+        f"m = AutoModel.from_pretrained({str(synthetic_gguf)!r}, use_gpu=False, "
+        "ctx_size=256, batch_size=64, vram_budget_mb=0, prefer_direct_io=False)\n"
+        "s = m.generate('a b c d', max_tokens=192, temperature=0.0, stream=True, "
+        "ngram_speculation=False)\n"
+        "first = next(s)\n"
+        "assert isinstance(first, str)\n"
+        "# Give the worker time to fill the 64-slot channel and block on send.\n"
+        "time.sleep(0.25)\n"
+        "# Intentionally exit without closing s or unloading m.\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        f"subprocess exited with {proc.returncode}\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+
+
+def test_repeated_load_unload_releases_file_descriptors(synthetic_gguf: Path) -> None:
+    """Repeated load/generate/unload cycles must not leak OS file descriptors."""
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("/proc/self/fd not available on this platform")
+
+    def open_fd_count() -> int:
+        return len(os.listdir(fd_dir))
+
+    # Warm up once (e.g., backend init / dynamic library handles), then measure delta.
+    with AutoModel.from_pretrained(
+        str(synthetic_gguf),
+        use_gpu=False,
+        ctx_size=128,
+        batch_size=64,
+        threads=1,
+        vram_budget_mb=0,
+        prefer_direct_io=False,
+    ) as warm:
+        warm.generate("a b c", max_tokens=4, temperature=0.0)
+    gc.collect()
+    baseline_fds = open_fd_count()
+
+    for _ in range(8):
+        with AutoModel.from_pretrained(
+            str(synthetic_gguf),
+            use_gpu=False,
+            ctx_size=128,
+            batch_size=64,
+            threads=1,
+            vram_budget_mb=0,
+            prefer_direct_io=False,
+        ) as model:
+            out = model.generate("a b c", max_tokens=4, temperature=0.0)
+            assert len(out) > 0
+    gc.collect()
+    after_fds = open_fd_count()
+    assert after_fds <= baseline_fds + 1, (
+        f"file descriptor leak detected: baseline={baseline_fds}, after 8 cycles={after_fds}"
+    )
