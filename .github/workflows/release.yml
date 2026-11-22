@@ -36,16 +36,24 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Verify tag matches Cargo.toml and plugin.toml versions
+      - name: Verify tag matches workspace, plugin, Python, and Node versions
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           tag_ver="${GITHUB_REF_NAME#v}"
           cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)
           plugin_ver=$(awk -F'"' '/^version =/{print $2; exit}' plugin.toml)
-          echo "tag=${tag_ver} Cargo.toml=${cargo_ver} plugin.toml=${plugin_ver}"
+          py_cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python/Cargo.toml)
+          py_proj_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python/pyproject.toml)
+          node_cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/node/Cargo.toml)
+          node_pkg_ver=$(awk -F'"' '/"version"[[:space:]]*:/{print $4; exit}' bindings/node/package.json)
+          echo "tag=${tag_ver} Cargo=${cargo_ver} plugin=${plugin_ver} py=${py_proj_ver} node=${node_pkg_ver}"
           test "$tag_ver" = "$cargo_ver"
           test "$tag_ver" = "$plugin_ver"
+          test "$tag_ver" = "$py_cargo_ver"
+          test "$tag_ver" = "$py_proj_ver"
+          test "$tag_ver" = "$node_cargo_ver"
+          test "$tag_ver" = "$node_pkg_ver"
 
       - name: Checkout pinned llama.cpp
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -138,9 +146,172 @@ jobs:
             layerstream-*.zip
             layerstream-*.zip.sha256
 
+  build-wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+            args: "--locked --release --out dist"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
+            args: "--locked --release --out dist"
+          - os: macos-15
+            target: aarch64-apple-darwin
+            manylinux: ""
+            args: "--locked --release --out dist --features metal"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Checkout pinned llama.cpp
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 0693dbfb915f33233818373b5f6969396658d02c
+          path: third_party/llama.cpp
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        if: runner.os != 'Linux'
+
+      - name: Build PyPI-compatible abi3 wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: build
+          working-directory: bindings/python
+          manylinux: ${{ matrix.manylinux }}
+          before-script-linux: dnf install -y cmake ninja-build
+          args: ${{ matrix.args }}
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Verify PyPI wheel tag, metadata, pytest, and SHA-256
+        working-directory: bindings/python
+        run: |
+          python -m pip install --upgrade pip pytest twine
+          python -m twine check --strict dist/*.whl
+          for whl in dist/*.whl; do
+            case "$whl" in
+              *-linux_*.whl)
+                echo "ERROR: un-repaired linux_* wheel tag would be rejected by PyPI: $whl" >&2
+                exit 1
+                ;;
+            esac
+          done
+          python -m pip install --force-reinstall dist/*.whl
+          python -m pytest -v
+          (
+            cd dist
+            for f in *.whl; do
+              shasum -a 256 "$f" > "${f}.sha256"
+            done
+          )
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: layerstream-python-${{ matrix.target }}
+          path: |
+            bindings/python/dist/*.whl
+            bindings/python/dist/*.whl.sha256
+
+  build-node:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            napi_triple: linux-x64-gnu
+            features: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            napi_triple: linux-arm64-gnu
+            features: ""
+          - os: macos-15
+            target: aarch64-apple-darwin
+            napi_triple: darwin-arm64
+            features: "metal"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Checkout pinned llama.cpp
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 0693dbfb915f33233818373b5f6969396658d02c
+          path: third_party/llama.cpp
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Build native Node addon, run smoke tests, and record SHA-256
+        working-directory: bindings/node
+        env:
+          LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
+        run: |
+          extra_args=()
+          if [ -n "${{ matrix.features }}" ]; then
+            extra_args+=(--features "${{ matrix.features }}")
+          fi
+          node scripts/build-native.mjs --release --locked --triple "${{ matrix.napi_triple }}" "${extra_args[@]}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            codesign --force --sign - "layerstream.${{ matrix.napi_triple }}.node"
+            codesign --verify --strict "layerstream.${{ matrix.napi_triple }}.node"
+          fi
+          node --test test/layerstream.test.js
+          mkdir -p dist
+          cp "layerstream.${{ matrix.napi_triple }}.node" dist/
+          version=$(node -p 'require("./package.json").version')
+          npm pack --pack-destination dist
+          mv "dist/layerstream-${version}.tgz" "dist/layerstream-node-${version}-${{ matrix.napi_triple }}.tgz"
+          (
+            cd dist
+            for f in *.node *.tgz; do
+              [ -e "$f" ] || continue
+              shasum -a 256 "$f" > "${f}.sha256"
+            done
+          )
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: layerstream-node-release-${{ matrix.napi_triple }}
+          path: |
+            bindings/node/dist/*.node
+            bindings/node/dist/*.node.sha256
+            bindings/node/dist/*.tgz
+            bindings/node/dist/*.tgz.sha256
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs:
+      - build
+      - build-wheels
+      - build-node
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -154,10 +325,56 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          shopt -s nullglob
+          assets=(
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
+            artifacts/*.zip
+            artifacts/*.zip.sha256
+            artifacts/*.whl
+            artifacts/*.whl.sha256
+            artifacts/*.node
+            artifacts/*.node.sha256
+            artifacts/*.tgz
+            artifacts/*.tgz.sha256
+          )
+          test "${#assets[@]}" -gt 0
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
-            artifacts/*.tar.gz \
-            artifacts/*.tar.gz.sha256 \
-            artifacts/*.zip \
-            artifacts/*.zip.sha256 \
+            "${assets[@]}" \
             --generate-notes
+
+  publish-pypi:
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PYPI_PUBLISH == 'true'
+    needs:
+      - build-wheels
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: layerstream-python-*
+          path: pypi-dist
+          merge-multiple: true
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Publish wheels to PyPI via Trusted Publishing (OIDC)
+        run: |
+          python -m pip install --upgrade pip twine
+          python -m twine check --strict pypi-dist/*.whl
+          oidc_resp=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi")
+          oidc_jwt=$(python -c 'import json,sys; print(json.loads(sys.stdin.read())["value"])' <<<"$oidc_resp")
+          mint_resp=$(curl -sSf -X POST "https://pypi.org/_/oidc/mint-token" \
+            -H "Content-Type: application/json" \
+            -d "{\"token\":\"${oidc_jwt}\"}")
+          pypi_token=$(python -c 'import json,sys; print(json.loads(sys.stdin.read())["token"])' <<<"$mint_resp")
+          echo "::add-mask::${pypi_token}"
+          TWINE_USERNAME="__token__" TWINE_PASSWORD="${pypi_token}" \
+            python -m twine upload pypi-dist/*.whl

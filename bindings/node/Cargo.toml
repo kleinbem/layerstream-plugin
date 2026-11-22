@@ -1,0 +1,32 @@
+[workspace]
+
+[package]
+name = "layerstream-node"
+version = "0.3.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Native Node.js and TypeScript bindings for layerstream-core (out-of-core GGUF layer-streaming LLM engine)"
+repository = "https://github.com/kleinbem/layerstream-plugin"
+
+[lib]
+name = "layerstream_node"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+vulkan = ["layerstream-core/vulkan"]
+cuda = ["layerstream-core/cuda"]
+metal = ["layerstream-core/metal"]
+dynamic-backends = ["layerstream-core/dynamic-backends"]
+
+[dependencies]
+anyhow = "1"
+layerstream-core = { path = "../../crates/layerstream-core", features = ["hf"] }
+napi = { version = "3", default-features = false, features = ["napi8", "async", "serde-json"] }
+napi-derive = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+[build-dependencies]
+napi-build = "2"
