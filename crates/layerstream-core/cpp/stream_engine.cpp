@@ -3255,3 +3255,457 @@ int ls_engine_eval_verify_sample(
     );
     return 0;
 }
+
+struct ls_grammar {
+    llama_sampler * smpl = nullptr;
+    const llama_vocab * vocab = nullptr;
+};
+
+namespace {
+
+struct SamplerGuard {
+    llama_sampler * smpl = nullptr;
+    ~SamplerGuard() {
+        if (smpl) {
+            llama_sampler_free(smpl);
+        }
+    }
+};
+
+static bool build_grammar_candidates(
+    llama_sampler * smpl,
+    const float * logits,
+    int32_t n_vocab,
+    std::vector<llama_token_data> & buf,
+    llama_token_data_array & out_arr
+) {
+    if (!smpl || !logits || n_vocab <= 0) {
+        return false;
+    }
+    buf.resize(static_cast<size_t>(n_vocab));
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        buf[static_cast<size_t>(i)] = llama_token_data{i, logits[i], 0.0f};
+    }
+    out_arr = llama_token_data_array{buf.data(), buf.size(), -1, false};
+    llama_sampler_apply(smpl, &out_arr);
+    return out_arr.size > 0;
+}
+
+static bool pick_grammar_greedy(
+    const llama_token_data_array & arr,
+    int32_t & out_token
+) {
+    bool found = false;
+    int32_t best_id = 0;
+    float best_val = -1e30f;
+    for (size_t i = 0; i < arr.size; ++i) {
+        const auto & td = arr.data[i];
+        if (std::isfinite(td.logit) && td.logit > -1e29f && (!found || td.logit > best_val)) {
+            best_val = td.logit;
+            best_id = td.id;
+            found = true;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+    out_token = best_id;
+    return true;
+}
+
+static bool build_grammar_distribution(
+    const llama_token_data_array & arr,
+    const ls_sample_params * sp,
+    std::vector<ProbEntry> & out
+) {
+    out.clear();
+    out.reserve(std::min<size_t>(arr.size, 256));
+    for (size_t i = 0; i < arr.size; ++i) {
+        const auto & td = arr.data[i];
+        if (std::isfinite(td.logit) && td.logit > -1e29f) {
+            out.push_back(ProbEntry{td.id, td.logit});
+        }
+    }
+    if (out.empty()) {
+        return false;
+    }
+
+    const float temp = (sp && std::isfinite(sp->temperature) && sp->temperature > 0.0f)
+        ? std::max(sp->temperature, 1e-5f)
+        : 1.0f;
+    const int32_t top_k = (sp && sp->top_k > 0) ? sp->top_k : 0;
+
+    if (top_k > 0 && static_cast<size_t>(top_k) < out.size()) {
+        std::nth_element(
+            out.begin(),
+            out.begin() + top_k,
+            out.end(),
+            [](const ProbEntry & a, const ProbEntry & b) { return a.val > b.val; }
+        );
+        out.resize(static_cast<size_t>(top_k));
+    }
+
+    std::sort(
+        out.begin(),
+        out.end(),
+        [](const ProbEntry & a, const ProbEntry & b) { return a.val > b.val; }
+    );
+
+    const float max_l = out[0].val;
+    double sum = 0.0;
+    for (auto & e : out) {
+        const double p = std::exp(static_cast<double>(e.val - max_l) / static_cast<double>(temp));
+        e.val = static_cast<float>(p);
+        sum += p;
+    }
+    if (!std::isfinite(sum) || sum <= 0.0) {
+        out.resize(1);
+        out[0].val = 1.0f;
+        return true;
+    }
+    for (auto & e : out) {
+        e.val = static_cast<float>(static_cast<double>(e.val) / sum);
+    }
+
+    if (sp && sp->top_p > 0.0f && sp->top_p < 1.0f && out.size() > 1) {
+        double cum = 0.0;
+        size_t keep = 0;
+        for (size_t i = 0; i < out.size(); ++i) {
+            cum += static_cast<double>(out[i].val);
+            keep = i + 1;
+            if (cum >= static_cast<double>(sp->top_p)) {
+                break;
+            }
+        }
+        out.resize(keep);
+        if (cum > 0.0) {
+            for (auto & e : out) {
+                e.val = static_cast<float>(static_cast<double>(e.val) / cum);
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+ls_grammar * ls_grammar_create(
+    const ls_engine * eng,
+    const char * grammar_str,
+    const char * root_rule,
+    char * err_buf,
+    size_t err_cap
+) {
+    if (!eng || !eng->vocab || !grammar_str || grammar_str[0] == '\0') {
+        set_error(err_buf, err_cap, "grammar string must not be empty");
+        return nullptr;
+    }
+    const char * root = (root_rule && root_rule[0] != '\0') ? root_rule : "root";
+    try {
+        llama_sampler * smpl = llama_sampler_init_grammar(eng->vocab, grammar_str, root);
+        if (!smpl) {
+            set_error(err_buf, err_cap, "failed to parse GBNF grammar");
+            return nullptr;
+        }
+        auto * g = new (std::nothrow) ls_grammar();
+        if (!g) {
+            llama_sampler_free(smpl);
+            set_error(err_buf, err_cap, "out of memory allocating ls_grammar");
+            return nullptr;
+        }
+        g->smpl = smpl;
+        g->vocab = eng->vocab;
+        return g;
+    } catch (const std::exception & e) {
+        set_error(err_buf, err_cap, std::string("GBNF grammar init exception: ") + e.what());
+        return nullptr;
+    } catch (...) {
+        set_error(err_buf, err_cap, "unknown GBNF grammar init exception");
+        return nullptr;
+    }
+}
+
+void ls_grammar_free(ls_grammar * grammar) {
+    if (!grammar) {
+        return;
+    }
+    if (grammar->smpl) {
+        llama_sampler_free(grammar->smpl);
+        grammar->smpl = nullptr;
+    }
+    delete grammar;
+}
+
+int ls_grammar_accept(
+    ls_grammar * grammar,
+    int32_t token,
+    char * err_buf,
+    size_t err_cap
+) {
+    if (!grammar || !grammar->smpl) {
+        return 0;
+    }
+    try {
+        llama_sampler_accept(grammar->smpl, token);
+        return 0;
+    } catch (const std::exception & e) {
+        set_error(err_buf, err_cap, std::string("grammar accept failed: ") + e.what());
+        return -1;
+    } catch (...) {
+        set_error(err_buf, err_cap, "unknown grammar accept exception");
+        return -1;
+    }
+}
+
+int ls_engine_eval_with_grammar(
+    ls_engine * eng,
+    const int32_t * tokens,
+    int32_t n_tokens,
+    int32_t pos_start,
+    const ls_sample_params * sample_params,
+    ls_grammar * grammar,
+    int32_t * out_next_token,
+    char * err_buf,
+    size_t err_cap
+) {
+    if (!grammar || !grammar->smpl) {
+        if (!sample_params || sample_params->temperature <= 0.0f) {
+            return ls_engine_eval_greedy(eng, tokens, n_tokens, pos_start, out_next_token, err_buf, err_cap);
+        }
+        return ls_engine_eval_sample(eng, tokens, n_tokens, pos_start, sample_params, out_next_token, err_buf, err_cap);
+    }
+    if (!eng || !eng->ctx || !tokens || n_tokens <= 0 || !out_next_token) {
+        set_error(err_buf, err_cap, "invalid arguments to ls_engine_eval_with_grammar");
+        return -1;
+    }
+
+    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    batch.n_tokens = n_tokens;
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        batch.token[i] = tokens[i];
+        batch.pos[i] = pos_start + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
+    eng->prepare_decode_pass();
+    if (eng->eval_failed) {
+        llama_batch_free(batch);
+        return report_eval_failure(eng, -2, "layer prefetch failed before grammar llama_decode", err_buf, err_cap);
+    }
+
+    const int rc = llama_decode(eng->ctx, batch);
+    llama_batch_free(batch);
+    if (eng->profile_enabled) {
+        eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
+        eng->prof_decode_total_us.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
+            std::memory_order_relaxed
+        );
+    }
+
+    if (rc != 0 || eng->eval_failed) {
+        return report_eval_failure(eng, rc, "grammar llama_decode failed", err_buf, err_cap);
+    }
+
+    const float * logits = llama_get_logits_ith(eng->ctx, n_tokens - 1);
+    if (!logits) {
+        set_error(err_buf, err_cap, "llama_get_logits_ith returned null");
+        return -4;
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
+    try {
+        std::vector<llama_token_data> cand_buf;
+        llama_token_data_array cur_p{};
+        if (!build_grammar_candidates(grammar->smpl, logits, n_vocab, cand_buf, cur_p)) {
+            set_error(err_buf, err_cap, "grammar produced empty candidate array");
+            return -5;
+        }
+        if (!sample_params || sample_params->temperature <= 0.0f) {
+            if (!pick_grammar_greedy(cur_p, *out_next_token)) {
+                set_error(err_buf, err_cap, "grammar rejected all candidate tokens");
+                return -5;
+            }
+        } else {
+            std::vector<ProbEntry> dist;
+            if (!build_grammar_distribution(cur_p, sample_params, dist)) {
+                set_error(err_buf, err_cap, "grammar rejected all candidate tokens");
+                return -5;
+            }
+            std::mt19937 rng(sample_params->seed);
+            *out_next_token = sample_from_dist(dist, rng);
+        }
+        return 0;
+    } catch (const std::exception & e) {
+        set_error(err_buf, err_cap, std::string("grammar sampling failed: ") + e.what());
+        return -6;
+    } catch (...) {
+        set_error(err_buf, err_cap, "unknown grammar sampling exception");
+        return -6;
+    }
+}
+
+int ls_engine_eval_verify_with_grammar(
+    ls_engine * eng,
+    const int32_t * tokens,
+    int32_t n_tokens,
+    int32_t pos_start,
+    const ls_sample_params * sample_params,
+    ls_grammar * grammar,
+    int32_t * out_accepted_count,
+    int32_t * out_next_token,
+    char * err_buf,
+    size_t err_cap
+) {
+    if (!eng || !eng->ctx || !tokens || n_tokens <= 1 || !grammar || !grammar->smpl || !out_accepted_count || !out_next_token) {
+        set_error(err_buf, err_cap, "invalid arguments to ls_engine_eval_verify_with_grammar");
+        return -1;
+    }
+
+    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    batch.n_tokens = n_tokens;
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        batch.token[i] = tokens[i];
+        batch.pos[i] = pos_start + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = 1;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
+    eng->prepare_decode_pass();
+    if (eng->eval_failed) {
+        llama_batch_free(batch);
+        return report_eval_failure(eng, -2, "layer prefetch failed before grammar verify llama_decode", err_buf, err_cap);
+    }
+
+    const int rc = llama_decode(eng->ctx, batch);
+    llama_batch_free(batch);
+    if (eng->profile_enabled) {
+        eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
+        eng->prof_decode_total_us.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
+            std::memory_order_relaxed
+        );
+    }
+
+    if (rc != 0 || eng->eval_failed) {
+        return report_eval_failure(eng, rc, "grammar verify llama_decode failed", err_buf, err_cap);
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
+    const int32_t k = n_tokens - 1;
+    const int32_t * draft_tokens = tokens + 1;
+    const bool is_greedy = (!sample_params || sample_params->temperature <= 0.0f);
+
+    try {
+        SamplerGuard step_guard{llama_sampler_clone(grammar->smpl)};
+        if (!step_guard.smpl) {
+            set_error(err_buf, err_cap, "failed to clone grammar sampler for speculative verification");
+            return -5;
+        }
+
+        std::vector<llama_token_data> cand_buf;
+        std::vector<ProbEntry> dist;
+        std::mt19937 rng(sample_params ? sample_params->seed : 42u);
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+
+        for (int32_t i = 0; i < k; ++i) {
+            const float * logits = llama_get_logits_ith(eng->ctx, i);
+            if (!logits) {
+                set_error(err_buf, err_cap, "llama_get_logits_ith returned null during grammar verify");
+                return -4;
+            }
+            llama_token_data_array cur_p{};
+            if (!build_grammar_candidates(step_guard.smpl, logits, n_vocab, cand_buf, cur_p)) {
+                set_error(err_buf, err_cap, "grammar produced empty candidate array");
+                return -5;
+            }
+            const int32_t d_tok = draft_tokens[i];
+
+            if (is_greedy) {
+                int32_t best_id = 0;
+                if (!pick_grammar_greedy(cur_p, best_id)) {
+                    set_error(err_buf, err_cap, "grammar rejected all candidate tokens");
+                    return -5;
+                }
+                if (best_id != d_tok) {
+                    *out_accepted_count = i;
+                    *out_next_token = best_id;
+                    return 0;
+                }
+            } else {
+                if (!build_grammar_distribution(cur_p, sample_params, dist)) {
+                    set_error(err_buf, err_cap, "grammar rejected all candidate tokens");
+                    return -5;
+                }
+                double p_draft = 0.0;
+                size_t draft_pos = dist.size();
+                for (size_t j = 0; j < dist.size(); ++j) {
+                    if (dist[j].id == d_tok) {
+                        p_draft = static_cast<double>(dist[j].val);
+                        draft_pos = j;
+                        break;
+                    }
+                }
+                if (!(p_draft >= 1.0 - 1e-7 || uni(rng) < p_draft)) {
+                    if (draft_pos < dist.size()) {
+                        dist[draft_pos].val = 0.0f;
+                        const double rem = std::max(1e-12, 1.0 - p_draft);
+                        for (auto & e : dist) {
+                            e.val = static_cast<float>(static_cast<double>(e.val) / rem);
+                        }
+                    }
+                    *out_accepted_count = i;
+                    *out_next_token = sample_from_dist(dist, rng);
+                    return 0;
+                }
+            }
+
+            if (llama_vocab_is_eog(eng->vocab, d_tok)) {
+                *out_accepted_count = i + 1;
+                *out_next_token = d_tok;
+                return 0;
+            }
+            llama_sampler_accept(step_guard.smpl, d_tok);
+        }
+
+        const float * bonus_logits = llama_get_logits_ith(eng->ctx, k);
+        if (!bonus_logits) {
+            set_error(err_buf, err_cap, "llama_get_logits_ith returned null at bonus position");
+            return -4;
+        }
+        llama_token_data_array bonus_cur{};
+        if (!build_grammar_candidates(step_guard.smpl, bonus_logits, n_vocab, cand_buf, bonus_cur)) {
+            set_error(err_buf, err_cap, "grammar produced empty candidate array at bonus position");
+            return -5;
+        }
+        if (is_greedy) {
+            int32_t bonus_id = 0;
+            if (!pick_grammar_greedy(bonus_cur, bonus_id)) {
+                set_error(err_buf, err_cap, "grammar rejected all candidate tokens at bonus position");
+                return -5;
+            }
+            *out_next_token = bonus_id;
+        } else {
+            if (!build_grammar_distribution(bonus_cur, sample_params, dist)) {
+                set_error(err_buf, err_cap, "grammar rejected all candidate tokens at bonus position");
+                return -5;
+            }
+            *out_next_token = sample_from_dist(dist, rng);
+        }
+        *out_accepted_count = k;
+        return 0;
+    } catch (const std::exception & e) {
+        set_error(err_buf, err_cap, std::string("grammar verify failed: ") + e.what());
+        return -6;
+    } catch (...) {
+        set_error(err_buf, err_cap, "unknown grammar verify exception");
+        return -6;
+    }
+}

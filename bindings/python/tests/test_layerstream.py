@@ -616,3 +616,416 @@ def test_repeated_load_unload_releases_file_descriptors(synthetic_gguf: Path) ->
     assert after_fds <= baseline_fds + 1, (
         f"file descriptor leak detected: baseline={baseline_fds}, after 8 cycles={after_fds}"
     )
+
+
+def test_isolated_worker_parity_and_process_reap(synthetic_gguf: Path) -> None:
+    """Verify isolated_worker=True runs in a separate OS process, matches in-process output
+    bit-for-bit, supports tokenize/detokenize/kv_trim, and reaps the worker on unload."""
+    import os
+
+    with AutoModel.from_pretrained(
+        str(synthetic_gguf),
+        use_gpu=False,
+        ctx_size=128,
+        batch_size=64,
+        vram_budget_mb=0,
+        prefer_direct_io=False,
+    ) as inproc:
+        expected_gen = inproc.generate("a b c d e f", max_tokens=10, temperature=0.0)
+        expected_chat = inproc.chat(
+            [{"role": "user", "content": "a b c"}], max_tokens=8, temperature=0.0
+        )
+        expected_toks = inproc.tokenize("a b c")
+        expected_detok = inproc.detokenize(expected_toks)
+
+    with AutoModel.from_pretrained(
+        str(synthetic_gguf),
+        use_gpu=False,
+        ctx_size=128,
+        batch_size=64,
+        vram_budget_mb=0,
+        prefer_direct_io=False,
+        isolated_worker=True,
+    ) as iso:
+        assert iso.is_loaded
+        assert iso.isolated_worker is True
+        pid = iso.worker_pid
+        assert isinstance(pid, int) and pid > 0 and pid != os.getpid()
+
+        st = iso.stats()
+        assert st["loaded"] is True
+        assert st["isolated_worker"] is True
+        assert st["worker_pid"] == pid
+
+        assert iso.tokenize("a b c") == expected_toks
+        assert iso.detokenize(expected_toks) == expected_detok
+        assert iso.generate("a b c d e f", max_tokens=10, temperature=0.0) == expected_gen
+
+        streamed = "".join(
+            iso.generate("a b c d e f", max_tokens=10, temperature=0.0, stream=True)
+        )
+        assert streamed == expected_gen
+        assert iso.last_summary is not None
+        assert iso.last_summary["completion_tokens"] == 10
+
+        # Early break cancels worker stream cleanly without wedging the engine
+        for chunk in iso.generate(
+            "a b c d e f", max_tokens=24, temperature=0.0, stream=True
+        ):
+            assert isinstance(chunk, str)
+            break
+
+        assert (
+            iso.chat(
+                [{"role": "user", "content": "a b c"}], max_tokens=8, temperature=0.0
+            )
+            == expected_chat
+        )
+        assert iso.kv_trim(2) is True
+        iso.kv_clear()
+
+    # Worker process must be completely terminated and reaped after context exit!
+    assert not iso.is_loaded
+    assert iso.worker_pid is None
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_grammar_and_json_schema_constrained_decoding(synthetic_json_gguf: Path) -> None:
+    """Verify GBNF & JSON Schema constrained decoding (greedy, sampled, streaming, and
+    with draft_model speculative verification) always produces schema-valid JSON."""
+    from layerstream import json_object_gbnf, json_schema_to_gbnf
+
+    schema = {
+        "$defs": {
+            "Meta": {
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
+                },
+                "required": ["ok"],
+                "additionalProperties": False,
+            }
+        },
+        "type": "object",
+        "properties": {
+            "mode": {"type": "string", "enum": ["fast", "safe"]},
+            "n": {"type": "integer"},
+            "meta": {"$ref": "#/$defs/Meta"},
+        },
+        "required": ["mode", "n", "meta"],
+        "additionalProperties": False,
+    }
+    compiled = json_schema_to_gbnf(schema)
+    assert compiled.startswith("root ::= ws ")
+    assert json_object_gbnf().startswith("root ::= ws json-object")
+
+    with AutoModel.from_pretrained(
+        str(synthetic_json_gguf),
+        draft_model=str(synthetic_json_gguf),
+        max_draft_tokens=4,
+        use_gpu=False,
+        ctx_size=256,
+        batch_size=64,
+        vram_budget_mb=0,
+        prefer_direct_io=False,
+    ) as model:
+        # 1. Greedy JSON schema constraint (with draft speculation active)
+        raw_greedy = model.generate(
+            "a b c",
+            max_tokens=96,
+            temperature=0.0,
+            json_schema=schema,
+        )
+        parsed = json.loads(raw_greedy)
+        assert parsed["mode"] in ("fast", "safe")
+        assert isinstance(parsed["n"], int)
+        assert isinstance(parsed["meta"]["ok"], bool)
+
+        # 2. Sampled (temperature=0.8) + streaming JSON schema constraint
+        raw_sampled = "".join(
+            model.generate(
+                "a b c",
+                max_tokens=96,
+                temperature=0.8,
+                seed=777,
+                json_schema=schema,
+                stream=True,
+            )
+        )
+        parsed_sampled = json.loads(raw_sampled)
+        assert parsed_sampled["mode"] in ("fast", "safe")
+        assert isinstance(parsed_sampled["n"], int)
+        assert isinstance(parsed_sampled["meta"]["ok"], bool)
+
+        # 3. Invalid grammar fails closed with RuntimeError
+        with pytest.raises(RuntimeError, match="grammar"):
+            model.generate("a b", max_tokens=8, grammar="not valid gbnf ===")
+
+
+def test_in_process_openai_and_async_openai_clients(synthetic_json_gguf: Path) -> None:
+    """Verify drop-in OpenAI / AsyncOpenAI clients, .parse(), tools, and tag parsing."""
+    import asyncio
+    from dataclasses import dataclass
+
+    from layerstream import (
+        AsyncOpenAI,
+        OpenAI,
+        StreamTagParser,
+        format_tools_system_prompt,
+        parse_assistant_output,
+    )
+
+    @dataclass
+    class VerdictSchema:
+        ok: bool
+        code: int
+
+    class MockPydanticV2Model:
+        def __init__(self, mode: str, flag: bool) -> None:
+            self.mode = mode
+            self.flag = flag
+
+        @classmethod
+        def model_json_schema(cls) -> dict[str, object]:
+            return {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["alpha", "beta"]},
+                    "flag": {"type": "boolean"},
+                },
+                "required": ["mode", "flag"],
+                "additionalProperties": False,
+            }
+
+        @classmethod
+        def model_validate_json(cls, raw: str) -> MockPydanticV2Model:
+            d = json.loads(raw)
+            return cls(mode=d["mode"], flag=d["flag"])
+
+    # Verify Rust StreamTagParser & parse_assistant_output bindings directly
+    parsed_tags = parse_assistant_output(
+        '<think>step 1</think>Result <tool_call>{"name":"ping","arguments":{"x":1}}</tool_call>'
+    )
+    assert parsed_tags["reasoning_content"] == "step 1"
+    assert parsed_tags["content"] == "Result"
+    assert len(parsed_tags["tool_calls"]) == 1
+    assert parsed_tags["tool_calls"][0]["function"]["name"] == "ping"
+
+    parser = StreamTagParser()
+    evs: list[dict[str, object]] = []
+    for part in ["<thi", "nk>plan</think>ok <tool_", 'call>{"name":"f","arguments":{}}</tool_call>']:
+        evs.extend(parser.push(part))
+    evs.extend(parser.flush())
+    assert parser.has_tool_calls is True
+    assert any(e["type"] == "reasoning" and e["text"] == "plan" for e in evs)
+    assert any(e["type"] == "tool_call" and e["name"] == "f" for e in evs)
+
+    tools_spec = [
+        {
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}},
+        }
+    ]
+    assert "lookup" in format_tools_system_prompt(tools_spec)
+
+    with OpenAI(
+        str(synthetic_json_gguf),
+        use_gpu=False,
+        ctx_size=1024,
+        batch_size=64,
+        vram_budget_mb=0,
+        prefer_direct_io=False,
+    ) as client:
+        models_page = client.models.list()
+        assert len(models_page.data) == 1
+
+        # Standard chat completion with tools
+        resp = client.chat.completions.create(
+            messages=[{"role": "user", "content": "a b c"}],
+            tools=tools_spec,
+            max_tokens=8,
+            temperature=0.0,
+        )
+        assert resp.object == "chat.completion"
+        assert resp.usage is not None and resp.usage.total_tokens > 0
+        assert isinstance(resp.model_dump(), dict)
+
+        # Structured `.parse(...)` with Pydantic-v2-style model class
+        parsed_resp = client.chat.completions.parse(
+            messages=[{"role": "user", "content": "a b"}],
+            response_format=MockPydanticV2Model,
+            max_tokens=96,
+            temperature=0.0,
+        )
+        inst = parsed_resp.choices[0].message.parsed
+        assert isinstance(inst, MockPydanticV2Model)
+        assert inst.mode in ("alpha", "beta")
+        assert isinstance(inst.flag, bool)
+
+        # Structured `.parse(...)` with dataclass
+        dc_resp = client.chat.completions.parse(
+            messages=[{"role": "user", "content": "a b"}],
+            response_format=VerdictSchema,
+            max_tokens=96,
+            temperature=0.0,
+        )
+        assert isinstance(dc_resp.choices[0].message.parsed, VerdictSchema)
+        assert isinstance(dc_resp.choices[0].message.parsed.ok, bool)
+        assert isinstance(dc_resp.choices[0].message.parsed.code, int)
+
+        # Streaming chat completion chunks
+        stream_chunks = list(
+            client.chat.completions.create(
+                messages=[{"role": "user", "content": "a b"}],
+                max_tokens=6,
+                stream=True,
+            )
+        )
+        assert stream_chunks[0].choices[0].delta.role == "assistant"
+        assert stream_chunks[-1].choices[0].finish_reason in ("stop", "length", "tool_calls")
+
+    # AsyncOpenAI + async TokenStream
+    async def _run_async() -> None:
+        async with AsyncOpenAI(
+            str(synthetic_json_gguf),
+            use_gpu=False,
+            ctx_size=512,
+            batch_size=64,
+            vram_budget_mb=0,
+            prefer_direct_io=False,
+        ) as aclient:
+            aresp = await aclient.chat.completions.create(
+                messages=[{"role": "user", "content": "a b"}],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "tag": {"type": "string", "minLength": 2, "maxLength": 4},
+                                "ok": {"type": "boolean"},
+                            },
+                            "required": ["tag", "ok"],
+                            "additionalProperties": False,
+                        }
+                    },
+                },
+                max_tokens=64,
+            )
+            decoded = json.loads(aresp.choices[0].message.content or "")
+            assert decoded["ok"] in (True, False)
+            assert 2 <= len(decoded["tag"]) <= 4
+
+            astream = await aclient.chat.completions.create(
+                messages=[{"role": "user", "content": "a b"}],
+                max_tokens=6,
+                stream=True,
+            )
+            collected: list[str] = []
+            async with astream as s:
+                async for ch in s:
+                    if ch.choices[0].delta.content:
+                        collected.append(ch.choices[0].delta.content)
+            assert len(collected) > 0
+
+    asyncio.run(_run_async())
+
+
+def test_advisor_check_recommend_pull_and_inspect(
+    synthetic_gguf: Path,
+    incompatible_vocab_gguf: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify inspect_gguf, check, recommend, and pull bindings."""
+    from layerstream import check, inspect_gguf, pull, recommend
+
+    info = inspect_gguf(synthetic_gguf)
+    assert info["architecture"] == "ernie4_5-moe"
+    assert info["n_layers"] == 6
+    assert info["shard_count"] == 1
+    assert info["tensor_count"] > 0
+
+    report = check(
+        str(synthetic_gguf),
+        draft_model=str(synthetic_gguf),
+        use_gpu=False,
+    )
+    assert report["ok"] is True
+    assert report["verdict"] in ("GOOD", "OK")
+    assert report["n_layers"] == 6
+
+    # Incompatible draft must fail closed in preflight check() without loading full weights
+    with pytest.raises(RuntimeError, match="incompatible draft_model tokenizer"):
+        check(
+            str(synthetic_gguf),
+            draft_model=str(incompatible_vocab_gguf),
+            use_gpu=False,
+        )
+
+    # Mock HF server for recommend() + pull()
+    payload = synthetic_gguf.read_bytes()
+    sha = hashlib.sha256(payload).hexdigest()
+    gib = 1024 * 1024 * 1024
+    tree_gguf = json.dumps(
+        [
+            {"type": "file", "path": "Model-Q4_K_M.gguf", "size": 8 * gib, "lfs": {"size": 8 * gib}},
+            {"type": "file", "path": "Model-Q8_0.gguf", "size": 16 * gib, "lfs": {"size": 16 * gib}},
+            {"type": "file", "path": "Tiny.gguf", "size": len(payload), "lfs": {"size": len(payload)}},
+        ]
+    ).encode("utf-8")
+    tree_base = json.dumps([{"type": "file", "path": "model.safetensors", "size": 64}]).encode("utf-8")
+
+    class AdvisorHfHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            pass
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/api/models/AdvisorOrg/Model/tree/main?recursive=true":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(tree_base)))
+                self.end_headers()
+                self.wfile.write(tree_base)
+            elif self.path == "/api/models/AdvisorOrg/Model-GGUF/tree/main?recursive=true":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(tree_gguf)))
+                self.end_headers()
+                self.wfile.write(tree_gguf)
+            elif self.path == "/AdvisorOrg/Model-GGUF/resolve/main/Tiny.gguf":
+                self.send_response(200)
+                self.send_header("ETag", f'"{sha}"')
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+    server = HTTPServer(("127.0.0.1", 0), AdvisorHfHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("HF_ENDPOINT", f"http://127.0.0.1:{port}")
+        cache_dir = tmp_path / "advisor-cache"
+        recs = recommend(
+            "AdvisorOrg/Model",
+            free_ram_gb=5.2,
+            nvme_mib_s=2800.0,
+            has_draft=True,
+            cache_dir=cache_dir,
+            use_gpu=False,
+        )
+        assert len(recs) == 3
+        assert recs[0]["resolved_repo"] == "AdvisorOrg/Model-GGUF"
+        assert any(r["recommended"] for r in recs)
+
+        pulled_path = pull("hf://AdvisorOrg/Model-GGUF:Tiny.gguf", cache_dir=cache_dir)
+        assert Path(pulled_path).read_bytes() == payload
+    finally:
+        server.shutdown()
+        server.server_close()

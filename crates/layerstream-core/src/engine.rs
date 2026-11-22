@@ -7,12 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result, bail};
 
 use crate::ffi::{
-    LsChatMessage, LsEngine, LsEngineConfig, LsEngineStats, LsSampleParams, LsSpanSlice,
+    LsChatMessage, LsEngine, LsEngineConfig, LsEngineStats, LsGrammar, LsSampleParams, LsSpanSlice,
     LsTensorSliceReq, ls_engine_apply_chat_template, ls_engine_create, ls_engine_eval_greedy,
     ls_engine_eval_sample, ls_engine_eval_verify_greedy, ls_engine_eval_verify_sample,
-    ls_engine_free, ls_engine_get_stats, ls_engine_kv_clear, ls_engine_kv_trim, ls_engine_n_ctx,
+    ls_engine_eval_verify_with_grammar, ls_engine_eval_with_grammar, ls_engine_free,
+    ls_engine_get_stats, ls_engine_kv_clear, ls_engine_kv_trim, ls_engine_n_ctx,
     ls_engine_set_cancel_cb, ls_engine_token_is_eog, ls_engine_token_to_piece, ls_engine_tokenize,
-    ls_engine_vocab_size, ls_probe_gpu_memory, ls_set_log_verbose,
+    ls_engine_vocab_size, ls_grammar_accept, ls_grammar_create, ls_grammar_free,
+    ls_probe_gpu_memory, ls_set_log_verbose,
 };
 use crate::gguf_index::{GgufIndex, MAX_DRAFT_VOCAB_PAD_DELTA};
 use crate::io_reader::{IoStats, LayerIoPool};
@@ -138,6 +140,8 @@ pub struct GenerateOptions {
     pub stop: Vec<String>,
     pub enable_ngram_speculation: bool,
     pub max_draft_tokens: usize,
+    /// Optional GBNF grammar (with `root` start rule) constraining generated output.
+    pub grammar: Option<String>,
 }
 
 impl Default for GenerateOptions {
@@ -148,6 +152,7 @@ impl Default for GenerateOptions {
             stop: Vec::new(),
             enable_ngram_speculation: true,
             max_draft_tokens: 5,
+            grammar: None,
         }
     }
 }
@@ -466,6 +471,14 @@ impl StreamEngine {
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
+    pub fn detokenize(&self, tokens: &[i32]) -> Result<String> {
+        let mut out = String::with_capacity(tokens.len() * 4);
+        for &tok in tokens {
+            out.push_str(&self.token_to_piece(tok)?);
+        }
+        Ok(out)
+    }
+
     pub fn token_is_eog(&self, token: i32) -> bool {
         unsafe { ls_engine_token_is_eog(self.raw.as_ptr(), token) }
     }
@@ -603,6 +616,83 @@ impl StreamEngine {
         Ok((accepted.max(0) as usize, next_tok))
     }
 
+    fn eval_step_with_grammar(
+        &mut self,
+        tokens: &[i32],
+        pos_start: i32,
+        sample: &LsSampleParams,
+        grammar: Option<&GrammarHandle>,
+    ) -> Result<i32> {
+        let Some(g) = grammar else {
+            return if sample.temperature <= 0.0 {
+                self.eval_greedy(tokens, pos_start)
+            } else {
+                self.eval_sample(tokens, pos_start, sample)
+            };
+        };
+        let mut next = 0i32;
+        let mut err_buf = [0 as c_char; 512];
+        let rc = unsafe {
+            ls_engine_eval_with_grammar(
+                self.raw.as_ptr(),
+                tokens.as_ptr(),
+                tokens.len() as i32,
+                pos_start,
+                sample,
+                g.raw.as_ptr(),
+                &mut next,
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if rc == RC_CANCELLED {
+            return Err(CancelledError.into());
+        }
+        if rc != 0 {
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!("eval_with_grammar failed (rc={rc}): {msg}");
+        }
+        Ok(next)
+    }
+
+    fn eval_verify_with_grammar(
+        &mut self,
+        tokens: &[i32],
+        pos_start: i32,
+        sample: &LsSampleParams,
+        grammar: &GrammarHandle,
+    ) -> Result<(usize, i32)> {
+        let mut accepted = 0i32;
+        let mut next_tok = 0i32;
+        let mut err_buf = [0 as c_char; 512];
+        let rc = unsafe {
+            ls_engine_eval_verify_with_grammar(
+                self.raw.as_ptr(),
+                tokens.as_ptr(),
+                tokens.len() as i32,
+                pos_start,
+                sample,
+                grammar.raw.as_ptr(),
+                &mut accepted,
+                &mut next_tok,
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if rc == RC_CANCELLED {
+            return Err(CancelledError.into());
+        }
+        if rc != 0 {
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!("eval_verify_with_grammar failed (rc={rc}): {msg}");
+        }
+        Ok((accepted.max(0) as usize, next_tok))
+    }
+
     /// Runs chunked layer-major prefill followed by greedy decode (without speculation).
     pub fn generate_greedy(&mut self, prompt: &str, max_tokens: usize) -> Result<Vec<i32>> {
         let mut opts = GenerateOptions {
@@ -671,6 +761,11 @@ impl StreamEngine {
             .into());
         }
 
+        let mut grammar = match opts.grammar.as_deref().map(str::trim) {
+            Some(g_str) if !g_str.is_empty() => Some(GrammarHandle::create(self.raw, g_str)?),
+            _ => None,
+        };
+
         // Reuse longest matching KV prefix on multi-turn chat continuations
         // (avoids re-prefilling unchanged system prompts & prior turns off NVMe!).
         let can_reuse_kv = self.stats().can_speculate;
@@ -707,7 +802,9 @@ impl StreamEngine {
         let mut next_tok = 0i32;
         let mut spec_stats = SpeculationStats::default();
 
-        for chunk in prompt_tokens[common_prefix..].chunks(self.n_batch) {
+        let prefill_slice = &prompt_tokens[common_prefix..];
+        let total_prefill_chunks = prefill_slice.chunks(self.n_batch).len();
+        for (chunk_idx, chunk) in prefill_slice.chunks(self.n_batch).enumerate() {
             if is_cancelled() {
                 return Ok(GenerateSummary {
                     prompt_tokens: prompt_tokens.len(),
@@ -716,7 +813,10 @@ impl StreamEngine {
                     speculation: spec_stats,
                 });
             }
-            let eval_res = if opts.sample.temperature <= 0.0 {
+            let is_last_prefill = chunk_idx + 1 == total_prefill_chunks;
+            let eval_res = if is_last_prefill {
+                self.eval_step_with_grammar(chunk, pos, &opts.sample, grammar.as_ref())
+            } else if opts.sample.temperature <= 0.0 {
                 self.eval_greedy(chunk, pos)
             } else {
                 self.eval_sample(chunk, pos, &opts.sample)
@@ -780,6 +880,9 @@ impl StreamEngine {
             if self.token_is_eog(next_tok) {
                 finish_reason = "stop".to_string();
                 break;
+            }
+            if let Some(ref mut g) = grammar {
+                g.accept(next_tok)?;
             }
 
             // Emit `next_tok` BEFORE calling `draft_proposer.propose(...)` so draft latency
@@ -861,7 +964,16 @@ impl StreamEngine {
                     batch.push(next_tok);
                     batch.extend_from_slice(&draft);
 
-                    let verify_res = if opts.sample.temperature <= 0.0 {
+                    let mut step_sample = opts.sample;
+                    if step_sample.temperature > 0.0 {
+                        step_sample.seed = step_sample
+                            .seed
+                            .wrapping_add((completion_tokens as u32).wrapping_mul(2654435761));
+                    }
+
+                    let verify_res = if let Some(ref g) = grammar {
+                        self.eval_verify_with_grammar(&batch, pos, &step_sample, g)
+                    } else if step_sample.temperature <= 0.0 {
                         self.eval_verify_greedy(&batch, pos).map(|verified| {
                             let mut acc = 0usize;
                             let mut next_after = verified[draft.len()];
@@ -876,10 +988,6 @@ impl StreamEngine {
                             (acc, next_after)
                         })
                     } else {
-                        let mut step_sample = opts.sample;
-                        step_sample.seed = step_sample
-                            .seed
-                            .wrapping_add((completion_tokens as u32).wrapping_mul(2654435761));
                         self.eval_verify_sample(&batch, pos, &step_sample)
                     };
 
@@ -907,6 +1015,9 @@ impl StreamEngine {
                             finish_reason = "stop".to_string();
                             early_stop = true;
                             break;
+                        }
+                        if let Some(ref mut g) = grammar {
+                            g.accept(d_tok)?;
                         }
                         let d_piece = self.token_to_piece(d_tok)?;
                         completion_tokens += 1;
@@ -981,11 +1092,8 @@ impl StreamEngine {
             // Standard 1-token sweep fallback.
             let mut step_sample = opts.sample;
             step_sample.seed = step_sample.seed.wrapping_add(completion_tokens as u32);
-            let eval_res = if step_sample.temperature <= 0.0 {
-                self.eval_greedy(&[next_tok], pos)
-            } else {
-                self.eval_sample(&[next_tok], pos, &step_sample)
-            };
+            let eval_res =
+                self.eval_step_with_grammar(&[next_tok], pos, &step_sample, grammar.as_ref());
             match eval_res {
                 Ok(tok) => {
                     next_tok = tok;
@@ -1024,6 +1132,60 @@ impl StreamEngine {
             finish_reason,
             speculation: spec_stats,
         })
+    }
+}
+
+struct GrammarHandle {
+    raw: NonNull<LsGrammar>,
+}
+
+impl GrammarHandle {
+    fn create(eng: NonNull<LsEngine>, grammar_str: &str) -> Result<Self> {
+        let c_grammar =
+            CString::new(grammar_str).context("GBNF grammar contains interior NUL byte")?;
+        let c_root = CString::new("root").unwrap();
+        let mut err_buf = [0 as c_char; 512];
+        let ptr = unsafe {
+            ls_grammar_create(
+                eng.as_ptr(),
+                c_grammar.as_ptr(),
+                c_root.as_ptr(),
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        let Some(raw) = NonNull::new(ptr) else {
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!("invalid grammar: {msg}");
+        };
+        Ok(Self { raw })
+    }
+
+    fn accept(&mut self, token: i32) -> Result<()> {
+        let mut err_buf = [0 as c_char; 512];
+        let rc = unsafe {
+            ls_grammar_accept(
+                self.raw.as_ptr(),
+                token,
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if rc != 0 {
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!("grammar state error on token {token}: {msg}");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GrammarHandle {
+    fn drop(&mut self) {
+        unsafe { ls_grammar_free(self.raw.as_ptr()) };
     }
 }
 

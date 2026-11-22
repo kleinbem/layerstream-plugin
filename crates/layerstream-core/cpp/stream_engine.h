@@ -9,6 +9,7 @@ extern "C" {
 #endif
 
 typedef struct ls_engine ls_engine;
+typedef struct ls_grammar ls_grammar;
 
 /**
  * Callback invoked by C++ to populate all tensors of a layer (or resident set)
@@ -253,6 +254,49 @@ int ls_engine_eval_verify_sample(
     int32_t n_tokens,
     int32_t pos_start,
     const ls_sample_params * sample_params,
+    int32_t * out_accepted_count,
+    int32_t * out_next_token,
+    char * err_buf,
+    size_t err_cap
+);
+
+/** Compiles a GBNF grammar sampler against the engine's vocabulary. */
+ls_grammar * ls_grammar_create(
+    const ls_engine * eng,
+    const char * grammar_str,
+    const char * root_rule,
+    char * err_buf,
+    size_t err_cap
+);
+
+void ls_grammar_free(ls_grammar * grammar);
+
+int ls_grammar_accept(
+    ls_grammar * grammar,
+    int32_t token,
+    char * err_buf,
+    size_t err_cap
+);
+
+int ls_engine_eval_with_grammar(
+    ls_engine * eng,
+    const int32_t * tokens,
+    int32_t n_tokens,
+    int32_t pos_start,
+    const ls_sample_params * sample_params,
+    ls_grammar * grammar,
+    int32_t * out_next_token,
+    char * err_buf,
+    size_t err_cap
+);
+
+int ls_engine_eval_verify_with_grammar(
+    ls_engine * eng,
+    const int32_t * tokens,
+    int32_t n_tokens,
+    int32_t pos_start,
+    const ls_sample_params * sample_params,
+    ls_grammar * grammar,
     int32_t * out_accepted_count,
     int32_t * out_next_token,
     char * err_buf,

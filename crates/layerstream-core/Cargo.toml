@@ -7,7 +7,7 @@ description = "Zero-patch llama.cpp ping-pong GPU layer streaming core with O_DI
 
 [features]
 default = []
-hf = ["dep:serde_json", "dep:sha2", "dep:ureq"]
+hf = ["dep:sha2", "dep:ureq"]
 vulkan = []
 cuda = []
 metal = []
@@ -17,7 +17,7 @@ dynamic-backends = []
 anyhow.workspace = true
 libc.workspace = true
 serde.workspace = true
-serde_json = { workspace = true, optional = true }
+serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true

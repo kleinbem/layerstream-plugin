@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 
-def write_synthetic_mixed_dense_moe_gguf(dest: Path, *, n_vocab: int = 64) -> Path:
+def write_synthetic_mixed_dense_moe_gguf(
+    dest: Path,
+    *,
+    n_vocab: int = 64,
+    include_json_tokens: bool = False,
+) -> Path:
     """Build a tiny deterministic 6-layer mixed Dense (0..3) + Sparse MoE (4..5) GGUF v3 file.
 
     Mirrors `crates/layerstream-core/tests/parity_test.rs::write_synthetic_mixed_dense_moe_gguf`
@@ -110,7 +115,7 @@ def write_synthetic_mixed_dense_moe_gguf(dest: Path, *, n_vocab: int = 64) -> Pa
         (kv_str, "general.architecture", arch),
         (kv_str, "general.name", "synthetic-mixed-dense-moe"),
         (kv_u32, f"{arch}.block_count", n_layers),
-        (kv_u32, f"{arch}.context_length", 256),
+        (kv_u32, f"{arch}.context_length", 1024 if include_json_tokens else 256),
         (kv_u32, f"{arch}.embedding_length", n_embd),
         (kv_u32, f"{arch}.feed_forward_length", n_ff),
         (kv_u32, f"{arch}.attention.head_count", n_head),
@@ -134,6 +139,29 @@ def write_synthetic_mixed_dense_moe_gguf(dest: Path, *, n_vocab: int = 64) -> Pa
     kv_count += 1
 
     # 64-token vocabulary
+    json_extras = [
+        "{",
+        "}",
+        "[",
+        "]",
+        ":",
+        ",",
+        '"',
+        "-",
+        ".",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "_",
+        "\n",
+    ]
     write_str(kv_buf, "tokenizer.ggml.tokens")
     kv_buf += struct.pack("<IIQ", 9, 8, n_vocab)
     for i in range(n_vocab):
@@ -143,9 +171,13 @@ def write_synthetic_mixed_dense_moe_gguf(dest: Path, *, n_vocab: int = 64) -> Pa
             tok = "<eos>"
         elif i == 2:
             tok = " "
+        elif i < 29:
+            tok = chr(ord("a") + (i - 3))
+        elif include_json_tokens and (i - 29) < len(json_extras):
+            tok = json_extras[i - 29]
         else:
             ch = chr(ord("a") + ((i - 3) % 26))
-            tok = ch if i < 29 else f"{ch}{i}"
+            tok = f"{ch}{i}"
         write_str(kv_buf, tok)
     kv_count += 1
 
@@ -200,3 +232,9 @@ def synthetic_gguf(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def incompatible_vocab_gguf(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("gguf-mismatch") / "synthetic-vocab-512.gguf"
     return write_synthetic_mixed_dense_moe_gguf(path, n_vocab=512)
+
+
+@pytest.fixture(scope="session")
+def synthetic_json_gguf(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("gguf-json") / "synthetic-json.gguf"
+    return write_synthetic_mixed_dense_moe_gguf(path, include_json_tokens=True)
