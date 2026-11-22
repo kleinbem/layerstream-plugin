@@ -139,6 +139,21 @@ Endpoints:
 * `POST /v1/chat/completions` (SSE streaming, stateful `<think>` → `reasoning_content` and `<tool_call>` → `tool_calls`, stop-sequence holdback, client-disconnect cancellation, `503` backpressure when queue is full)
 * `POST /v1/completions`
 
+## Python API (AirLLM-style, Native Rust/C++)
+
+Standalone native Python bindings (`PyO3` + `maturin`) live in [bindings/python/](bindings/python/README.md) (excluded from the default Cargo workspace so `layerstream-plugin` stays Python-free):
+
+```python
+from layerstream import AutoModel
+
+with AutoModel.from_pretrained("Qwen/Qwen2.5-14B-Instruct") as model:
+    for chunk in model.generate("Explain NVMe O_DIRECT streaming.", stream=True):
+        print(chunk, end="", flush=True)
+    print("\n", model.stats())
+```
+
+Accepts local `.gguf` paths, `hf://org/repo:file.gguf` URIs, HF `-GGUF` repos (hardware-aware auto-quant selection), and official base HF repos (`{org}/{name}-GGUF`), with full GIL release (`py.detach`), `.chat(messages)`, optional `draft_model=...` speculation, and deterministic `.unload()`. Build locally via `nix develop .#python` (see [bindings/python/README.md](bindings/python/README.md)).
+
 ## Build & Test
 
 ```bash
