@@ -50,9 +50,15 @@ pub struct TokenStream {
 impl Drop for TokenStream {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
-        if let Ok(mut st) = self.state.lock() {
+        let handle = if let Ok(mut st) = self.state.lock() {
             st.rx = None;
             st.done = true;
+            st.worker.take()
+        } else {
+            None
+        };
+        if let Some(h) = handle {
+            let _ = h.join();
         }
     }
 }
@@ -101,9 +107,10 @@ impl TokenStream {
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<String>> {
         loop {
-            py.check_signals().inspect_err(|_| {
-                self.cancel.store(true, Ordering::Relaxed);
-            })?;
+            if let Err(err) = py.check_signals() {
+                let _ = self.close(py);
+                return Err(err);
+            }
 
             let recv_result = py.detach(|| {
                 let st = self.state.lock().ok()?;
@@ -691,8 +698,13 @@ impl AutoModel {
     ) -> PyResult<Py<PyAny>> {
         if !stream {
             let inner = self.inner.clone();
-            let output = py
-                .detach(move || -> anyhow::Result<String> {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = cancel.clone();
+            let (tx, rx) = mpsc::sync_channel::<anyhow::Result<String>>(1);
+            let rx = Mutex::new(rx);
+
+            let worker = std::thread::spawn(move || {
+                let res = (|| -> anyhow::Result<String> {
                     let mut guard = inner
                         .lock()
                         .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
@@ -703,20 +715,54 @@ impl AutoModel {
                         opts.max_draft_tokens = loaded.default_max_draft_tokens;
                     }
                     let mut out = String::new();
-                    let summary = loaded.engine.generate_stream(
+                    let summary = loaded.engine.generate_stream_with_cancel(
                         &prompt,
                         &opts,
                         loaded.draft.as_mut(),
+                        Some(&worker_cancel),
                         |_tok, piece| {
+                            if worker_cancel.load(Ordering::Relaxed) {
+                                return false;
+                            }
                             out.push_str(piece);
                             true
                         },
                     )?;
                     loaded.last_summary = Some(summary);
                     Ok(out)
-                })
-                .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+                })();
+                let _ = tx.send(res);
+            });
 
+            let result = loop {
+                if let Err(err) = py.check_signals() {
+                    cancel.store(true, Ordering::Relaxed);
+                    py.detach(move || {
+                        let _ = worker.join();
+                    });
+                    return Err(err);
+                }
+                match py.detach(|| {
+                    rx.lock()
+                        .map_err(|_| RecvTimeoutError::Disconnected)
+                        .and_then(|r| r.recv_timeout(Duration::from_millis(25)))
+                }) {
+                    Ok(res) => {
+                        py.detach(move || {
+                            let _ = worker.join();
+                        });
+                        break res;
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        py.detach(move || {
+                            let _ = worker.join();
+                        });
+                        break Err(anyhow::anyhow!("generation worker exited unexpectedly"));
+                    }
+                }
+            };
+            let output = result.map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
             return Ok(PyString::new(py, &output).into_any().unbind());
         }
 
