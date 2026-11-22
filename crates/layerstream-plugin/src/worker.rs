@@ -365,6 +365,10 @@ impl WorkerCoordinator {
         self.registry.read().map(|r| r.len()).unwrap_or(0)
     }
 
+    pub fn registry_snapshot(&self) -> ModelRegistry {
+        self.registry.read().map(|r| r.clone()).unwrap_or_default()
+    }
+
     pub fn set_registry(&self, new_registry: ModelRegistry) {
         if let Ok(mut guard) = self.registry.write() {
             *guard = new_registry;

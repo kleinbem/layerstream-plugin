@@ -140,42 +140,51 @@ impl HfSpec {
 
     /// Expands multi-part shard specs `*-00001-of-0000N.gguf` into all N shard specs.
     pub fn expand_shards(&self) -> Vec<Self> {
-        let (dir_prefix, file_name) = match self.filename.rsplit_once('/') {
-            Some((d, f)) => (Some(d), f),
-            None => (None, self.filename.as_str()),
-        };
-
-        if let Some(stem) = file_name.strip_suffix(".gguf")
-            && let Some((prefix_and_idx, total_str)) = stem.rsplit_once("-of-")
-            && total_str.len() == 5
-            && let Ok(total) = total_str.parse::<u32>()
-            && total > 1
-            && let Some((prefix, idx_str)) = prefix_and_idx.rsplit_once('-')
-            && idx_str.len() == 5
-            && idx_str.parse::<u32>().is_ok()
-        {
-            return (1..=total)
-                .map(|idx| {
-                    let shard_file = format!("{prefix}-{idx:05}-of-{total:05}.gguf");
-                    let full_name = match dir_prefix {
-                        Some(d) => format!("{d}/{shard_file}"),
-                        None => shard_file,
-                    };
-                    Self {
-                        repo_id: self.repo_id.clone(),
-                        filename: full_name,
-                        revision: self.revision.clone(),
-                    }
-                })
-                .collect();
-        }
-
-        vec![self.clone()]
+        expand_gguf_shard_filename(&self.filename)
+            .into_iter()
+            .map(|filename| Self {
+                repo_id: self.repo_id.clone(),
+                filename,
+                revision: self.revision.clone(),
+            })
+            .collect()
     }
 }
 
-// tracking: Mesh-LLM/mesh-llm#3192 (mesh-llm 0.80.0 does not yet pass a host model/cache
-// directory env var to spawned plugins, so fall back to LAYERSTREAM_CACHE_DIR / XDG cache).
+/// Expands multi-part GGUF filenames `*-00001-of-0000N.gguf` (or any shard index
+/// `*-XXXXX-of-0000N.gguf`) into all `N` ordered shard paths (`00001..=N`).
+pub(crate) fn expand_gguf_shard_filename(filename: &str) -> Vec<String> {
+    let (dir_prefix, file_name) = match filename.rsplit_once('/') {
+        Some((d, f)) => (Some(d), f),
+        None => (None, filename),
+    };
+
+    if let Some(stem) = file_name.strip_suffix(".gguf")
+        && let Some((prefix_and_idx, total_str)) = stem.rsplit_once("-of-")
+        && total_str.len() == 5
+        && let Ok(total) = total_str.parse::<u32>()
+        && total > 1
+        && let Some((prefix, idx_str)) = prefix_and_idx.rsplit_once('-')
+        && idx_str.len() == 5
+        && idx_str.parse::<u32>().is_ok()
+    {
+        return (1..=total)
+            .map(|idx| {
+                let shard_file = format!("{prefix}-{idx:05}-of-{total:05}.gguf");
+                match dir_prefix {
+                    Some(d) => format!("{d}/{shard_file}"),
+                    None => shard_file,
+                }
+            })
+            .collect();
+    }
+
+    vec![filename.to_string()]
+}
+
+// Host-managed `[[models]]` (`provider = "layerstream"`) use `model_assets.v1` and share
+// mesh-llm's Hugging Face cache directly. Standalone CLI / `--model hf://...` args fall back
+// to `LAYERSTREAM_CACHE_DIR` / XDG cache (tracking: Mesh-LLM/mesh-llm#3192).
 pub fn default_cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LAYERSTREAM_CACHE_DIR")
         && !dir.trim().is_empty()

@@ -1,5 +1,6 @@
 mod config;
 mod hf;
+mod managed_models;
 mod mesh_adapter;
 mod worker;
 
@@ -227,19 +228,8 @@ fn main() -> Result<()> {
                     serve_res
                 }
             }
-            Some(Command::Plugin { engine }) => {
-                let in_process = engine.in_process;
-                let has_sources = engine.has_model_sources();
-                let (server_cfg, deferred) = engine.into_server_config_with_deferred(true)?;
-                mesh_adapter::run_mesh_plugin(server_cfg, in_process, has_sources, deferred).await
-            }
-            None => {
-                let in_process = cli.plugin_args.in_process;
-                let has_sources = cli.plugin_args.has_model_sources();
-                let (server_cfg, deferred) =
-                    cli.plugin_args.into_server_config_with_deferred(true)?;
-                mesh_adapter::run_mesh_plugin(server_cfg, in_process, has_sources, deferred).await
-            }
+            Some(Command::Plugin { engine }) => run_plugin_mode(engine).await,
+            None => run_plugin_mode(cli.plugin_args).await,
             Some(Command::Pull { .. } | Command::Check { .. } | Command::Recommend { .. }) => {
                 unreachable!()
             }
@@ -250,6 +240,44 @@ fn main() -> Result<()> {
     // indefinitely on any still-unwinding blocking worker.
     rt.shutdown_timeout(Duration::from_secs(2));
     result
+}
+
+async fn run_plugin_mode(engine: EngineArgs) -> Result<()> {
+    let in_process = engine.in_process;
+    let has_cli_sources = engine.has_model_sources();
+    let default_draft_model = engine.draft_model.clone();
+    let cache_root = engine
+        .cache_dir
+        .clone()
+        .unwrap_or_else(hf::default_cache_dir);
+    let use_gpu = !engine.no_gpu;
+    let allow_slow = engine.allow_slow;
+
+    let (managed_plans, config_error) = match managed_models::load_managed_model_plans() {
+        Ok(plans) => (plans, None),
+        Err(err) => (Vec::new(), Some(format!("{err:#}"))),
+    };
+    let managed_idle_timeout_secs =
+        managed_models::effective_managed_idle_timeout_secs(&managed_plans);
+    let managed_startup = mesh_adapter::ManagedStartupConfig {
+        plans: managed_plans,
+        config_error,
+        default_draft_model,
+        cache_root,
+        use_gpu,
+        allow_slow,
+    };
+
+    let (server_cfg, deferred) =
+        engine.into_server_config_with_deferred(true, managed_idle_timeout_secs)?;
+    mesh_adapter::run_mesh_plugin(
+        server_cfg,
+        in_process,
+        has_cli_sources,
+        deferred,
+        managed_startup,
+    )
+    .await
 }
 
 fn find_existing_probe_file(dir: &std::path::Path, depth: usize) -> Option<std::path::PathBuf> {

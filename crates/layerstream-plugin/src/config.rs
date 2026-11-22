@@ -42,9 +42,9 @@ pub struct EngineArgs {
     pub kv_cache_type: String,
 
     /// Seconds of idle time before freeing model/KV GPU buffers and terminating the GPU worker
-    /// (0 = free immediately after each request so host runtimes reclaim 100% of VRAM/UMA).
-    #[arg(long, default_value_t = 60)]
-    pub idle_timeout_secs: u64,
+    /// (default: 60; 0 = free immediately after each request so host runtimes reclaim 100% of VRAM/UMA).
+    #[arg(long)]
+    pub idle_timeout_secs: Option<u64>,
 
     /// Run GPU inference in-process instead of an isolated on-demand worker subprocess
     /// (retains GPU driver/CUDA context memory after idle eviction).
@@ -127,7 +127,7 @@ impl EngineArgs {
     }
 
     pub fn into_server_config(self) -> Result<ServerConfig> {
-        let (mut cfg, deferred) = self.into_server_config_with_deferred(false)?;
+        let (mut cfg, deferred) = self.into_server_config_with_deferred(false, None)?;
         if let Some(plan) = deferred {
             cfg.registry = plan.execute()?;
         }
@@ -144,6 +144,7 @@ impl EngineArgs {
     pub fn into_server_config_with_deferred(
         self,
         defer_uncached_hf: bool,
+        managed_idle_timeout_secs: Option<u64>,
     ) -> Result<(ServerConfig, Option<DeferredPullPlan>)> {
         let use_gpu = !self.no_gpu;
 
@@ -180,6 +181,11 @@ impl EngineArgs {
                 (false, mb.saturating_mul(1024 * 1024))
             };
 
+        let effective_idle_timeout_secs = self
+            .idle_timeout_secs
+            .or(managed_idle_timeout_secs)
+            .unwrap_or(60);
+
         let needs_defer = defer_uncached_hf && self.has_uncached_hf();
         let plan = DeferredPullPlan {
             models: self.models,
@@ -211,7 +217,7 @@ impl EngineArgs {
                 cpu_head: false,
                 stream_head: self.low_vram,
                 moe_active_streaming: true,
-                idle_timeout: Duration::from_secs(self.idle_timeout_secs),
+                idle_timeout: Duration::from_secs(effective_idle_timeout_secs),
                 enable_ngram_speculation: true,
                 max_draft_tokens: self.max_draft_tokens,
                 max_queued_requests: 8,

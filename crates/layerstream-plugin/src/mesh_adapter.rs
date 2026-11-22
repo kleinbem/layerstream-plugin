@@ -2,11 +2,13 @@
 //! loopback port (0 MB VRAM/UMA and 0 MB GPU driver context while idle via
 //! on-demand worker isolation, or opt-in `--in-process` mode).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use layerstream_server::{AppState, ModelRegistry, ServerConfig, serve_with_state};
+use mesh_llm_plugin::models::ASSET_CAPABILITY;
 use mesh_llm_plugin::{
     PROTOCOL_VERSION, PluginError, PluginMetadata, PluginRuntime, PluginStartupPolicy,
     SimplePlugin, capability, plugin_server_info,
@@ -16,11 +18,35 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::DeferredPullPlan;
+use crate::managed_models::{ManagedModelPlan, prepare_managed_models};
 use crate::worker::{WorkerCoordinator, serve_with_coordinator};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PLUGIN_NAME: &str = "layerstream";
 const ENDPOINT_ID: &str = "layerstream";
+
+#[derive(Debug, Clone)]
+pub struct ManagedStartupConfig {
+    pub plans: Vec<ManagedModelPlan>,
+    pub config_error: Option<String>,
+    pub default_draft_model: Option<String>,
+    pub cache_root: PathBuf,
+    pub use_gpu: bool,
+    pub allow_slow: bool,
+}
+
+impl Default for ManagedStartupConfig {
+    fn default() -> Self {
+        Self {
+            plans: Vec::new(),
+            config_error: None,
+            default_draft_model: None,
+            cache_root: crate::hf::default_cache_dir(),
+            use_gpu: false,
+            allow_slow: false,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub enum BackendHandle {
@@ -40,6 +66,13 @@ impl BackendHandle {
         match self {
             Self::Isolated(c) => c.is_loaded(),
             Self::InProcess(s) => s.residency.is_loaded(),
+        }
+    }
+
+    fn registry_snapshot(&self) -> ModelRegistry {
+        match self {
+            Self::Isolated(c) => c.registry_snapshot(),
+            Self::InProcess(s) => s.registry_snapshot(),
         }
     }
 
@@ -93,14 +126,17 @@ impl BackendHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_plugin(
     endpoint_base: String,
     state: BackendHandle,
-    has_model_sources: bool,
+    has_cli_model_sources: bool,
     listener_slot: Arc<Mutex<Option<TcpListener>>>,
     shutdown_rx_slot: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     server_handle_slot: Arc<Mutex<Option<JoinHandle<()>>>>,
+    prep_handle_slot: Arc<Mutex<Option<JoinHandle<()>>>>,
     deferred_pull: Option<DeferredPullPlan>,
+    managed_startup: ManagedStartupConfig,
 ) -> SimplePlugin {
     let plugin_name =
         std::env::var("MESH_LLM_PLUGIN_NAME").unwrap_or_else(|_| DEFAULT_PLUGIN_NAME.to_string());
@@ -108,6 +144,9 @@ pub fn build_plugin(
     let health_state = state.clone();
     let health_handle = server_handle_slot.clone();
     let deferred_slot = Arc::new(Mutex::new(deferred_pull));
+    let has_managed_models = !managed_startup.plans.is_empty();
+    let managed_config_error = managed_startup.config_error.clone();
+    let managed_slot = Arc::new(Mutex::new(Some(managed_startup)));
 
     mesh_llm_plugin::plugin! {
         metadata: PluginMetadata::new(
@@ -119,7 +158,8 @@ pub fn build_plugin(
                 "Layerstream GGUF NVMe Streaming Provider",
                 "Runs oversized dense & MoE GGUF models via GPU layer streaming with 0 MB idle model weights.",
                 Some(
-                    "Configure [[plugin]] name = \"layerstream\" with args such as \
+                    "Configure [[models]] with provider = \"layerstream\" (uses mesh-llm's shared \
+                     Hugging Face cache via model_assets.v1), or pass args such as \
                      [\"--model\", \"hf://org/repo:model.gguf\"].",
                 ),
             ),
@@ -145,7 +185,7 @@ pub fn build_plugin(
                     anyhow::bail!("layerstream HTTP server task exited unexpectedly");
                 }
                 if let Some(err) = health_state.loading_error() {
-                    anyhow::bail!("background Hugging Face model pull failed: {err}");
+                    anyhow::bail!("background model preparation failed: {err}");
                 }
                 if let Some(status) = health_state.loading_status() {
                     return Ok(format!(
@@ -164,22 +204,44 @@ pub fn build_plugin(
                 ))
             })
         },
-        on_initialized: move |_context| {
+        on_initialized: move |context| {
             let startup_state = startup_state.clone();
             let listener_slot = listener_slot.clone();
             let shutdown_rx_slot = shutdown_rx_slot.clone();
             let server_handle_slot = server_handle_slot.clone();
+            let prep_handle_slot = prep_handle_slot.clone();
             let deferred_slot = deferred_slot.clone();
+            let managed_slot = managed_slot.clone();
+            let owned_ctx = context.owned();
             Box::pin(async move {
                 let Some(listener) = listener_slot.lock().await.take() else {
                     return Ok(());
                 };
                 let deferred_plan = deferred_slot.lock().await.take();
-                if let Some(ref plan) = deferred_plan {
-                    startup_state.set_loading_status(Some(format!(
-                        "pulling {} model(s) from Hugging Face",
-                        plan.models.len()
-                    )));
+                let managed_cfg = managed_slot
+                    .lock()
+                    .await
+                    .take()
+                    .filter(|cfg| !cfg.plans.is_empty());
+
+                if deferred_plan.is_some() || managed_cfg.is_some() {
+                    let initial_status = match (&deferred_plan, &managed_cfg) {
+                        (Some(cli_plan), Some(managed)) => format!(
+                            "preparing {} CLI and {} host-managed model(s)",
+                            cli_plan.models.len(),
+                            managed.plans.len()
+                        ),
+                        (None, Some(managed)) => format!(
+                            "preparing {} host-managed model(s) via {ASSET_CAPABILITY}",
+                            managed.plans.len()
+                        ),
+                        (Some(cli_plan), None) => format!(
+                            "pulling {} model(s) from Hugging Face",
+                            cli_plan.models.len()
+                        ),
+                        (None, None) => unreachable!(),
+                    };
+                    startup_state.set_loading_status(Some(initial_status));
                 }
 
                 let shutdown_rx = shutdown_rx_slot.lock().await.take();
@@ -204,29 +266,61 @@ pub fn build_plugin(
                 });
                 *server_handle_slot.lock().await = Some(handle);
 
-                if let Some(plan) = deferred_plan {
+                if deferred_plan.is_some() || managed_cfg.is_some() {
                     let pull_state = startup_state;
-                    tokio::task::spawn_blocking(move || match plan.execute() {
-                        Ok(registry) => {
-                            let count = registry.len();
-                            pull_state.set_registry(registry);
-                            pull_state.set_loading_status(None);
-                            tracing::info!(
-                                models = count,
-                                "background Hugging Face model pull complete; ready to serve"
-                            );
+                    let prep_handle = tokio::spawn(async move {
+                        let result: Result<ModelRegistry> = async {
+                            let base_registry = if let Some(plan) = deferred_plan {
+                                tokio::task::spawn_blocking(move || plan.execute())
+                                    .await
+                                    .context("join background model pull task")??
+                            } else {
+                                pull_state.registry_snapshot()
+                            };
+
+                            if let Some(managed) = managed_cfg {
+                                let status_state = pull_state.clone();
+                                prepare_managed_models(
+                                    &owned_ctx,
+                                    &managed.plans,
+                                    base_registry,
+                                    managed.default_draft_model,
+                                    managed.cache_root,
+                                    managed.use_gpu,
+                                    managed.allow_slow,
+                                    move |msg| status_state.set_loading_status(Some(msg)),
+                                )
+                                .await
+                            } else {
+                                Ok(base_registry)
+                            }
                         }
-                        Err(err) => {
-                            tracing::error!("background Hugging Face model pull failed: {err:#}");
-                            pull_state.set_loading_failed(format!("{err:#}"));
+                        .await;
+
+                        match result {
+                            Ok(registry) => {
+                                let count = registry.len();
+                                pull_state.set_registry(registry);
+                                pull_state.set_loading_status(None);
+                                tracing::info!(
+                                    models = count,
+                                    "background model preparation complete; ready to serve"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::error!("background model preparation failed: {err:#}");
+                                pull_state.set_loading_failed(format!("{err:#}"));
+                            }
                         }
                     });
+                    *prep_handle_slot.lock().await = Some(prep_handle);
                 }
                 Ok(())
             })
         },
     }
     .on_initialize(move |request, _| {
+        let managed_config_error = managed_config_error.clone();
         Box::pin(async move {
             if request.host_protocol_version != PROTOCOL_VERSION {
                 return Err(PluginError::startup_disabled(format!(
@@ -234,10 +328,27 @@ pub fn build_plugin(
                     request.host_protocol_version
                 )));
             }
-            if !has_model_sources {
+            if let Some(err) = managed_config_error {
+                return Err(PluginError::startup_disabled(format!(
+                    "invalid managed model configuration: {err}"
+                )));
+            }
+            if !has_cli_model_sources && !has_managed_models {
                 return Err(PluginError::startup_disabled(
-                    "no models configured; pass --model <GGUF_OR_HF> or --models-dir <DIR>",
+                    "no models configured; configure [[models]] with provider = \"layerstream\", \
+                     or pass --model <GGUF_OR_HF> / --models-dir <DIR>",
                 ));
+            }
+            if has_managed_models
+                && !request
+                    .host_capabilities
+                    .iter()
+                    .any(|cap| cap == ASSET_CAPABILITY)
+            {
+                return Err(PluginError::startup_disabled(format!(
+                    "managed models require host capability {ASSET_CAPABILITY}; \
+                     upgrade mesh-llm or pass --model/--models-dir"
+                )));
             }
             Ok(())
         })
@@ -247,8 +358,9 @@ pub fn build_plugin(
 pub async fn run_mesh_plugin(
     server_config: ServerConfig,
     in_process: bool,
-    has_model_sources: bool,
+    has_cli_model_sources: bool,
     deferred_pull: Option<DeferredPullPlan>,
+    managed_startup: ManagedStartupConfig,
 ) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -265,21 +377,28 @@ pub async fn run_mesh_plugin(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let shutdown_rx_slot = Arc::new(Mutex::new(Some(shutdown_rx)));
     let server_handle_slot = Arc::new(Mutex::new(None));
+    let prep_handle_slot = Arc::new(Mutex::new(None));
 
     let plugin = build_plugin(
         endpoint_base,
         state.clone(),
-        has_model_sources,
+        has_cli_model_sources,
         listener_slot,
         shutdown_rx_slot,
         server_handle_slot.clone(),
+        prep_handle_slot.clone(),
         deferred_pull,
+        managed_startup,
     );
 
     let result = tokio::select! {
         res = PluginRuntime::run(plugin) => res,
         _ = shutdown_signal() => Ok(()),
     };
+
+    if let Some(prep_handle) = prep_handle_slot.lock().await.take() {
+        prep_handle.abort();
+    }
 
     // Immediately cancel any in-flight prefill/decode and reap any isolated GPU worker
     // so GPU/RAM buffers and driver contexts are released promptly on host EOF,
@@ -347,7 +466,9 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
             None,
+            ManagedStartupConfig::default(),
         );
         let manifest = plugin.manifest().unwrap();
         assert_eq!(manifest.endpoints.len(), 1);

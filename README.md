@@ -58,7 +58,42 @@ Install from GitHub releases (or point `command` to your built binary):
 mesh-llm plugins install kleinbem/layerstream-plugin
 ```
 
-Add to `~/.mesh-llm/config.toml` (pair with `--vram-budget-mb auto` and `--idle-timeout-secs` so Mesh's resident Skippy runtime and `layerstream-plugin` coexist cleanly):
+### Recommended: Host-managed `[[models]]` (`model_assets.v1`, shared Hugging Face cache)
+
+On Mesh-LLM `>= 0.80.0`, configure `[[models]]` with `provider = "layerstream"` so `layerstream-plugin` shares `mesh-llm`'s Hugging Face cache, credentials, `HF_HUB_OFFLINE` policy, and `[models.source]` overrides (`repo`, `revision`, or `local_dir`) automatically — no duplicate GGUF download directory required:
+
+```toml
+[[plugin]]
+name = "layerstream"
+args = [
+  "--vram-budget-mb", "auto",
+  "--idle-timeout-secs", "60",
+]
+
+[[models]]
+model = "unsloth/Qwen3-30B-A3B-GGUF"
+provider = "layerstream"
+variant = "Qwen3-30B-A3B-Q4_K_M.gguf"
+
+# Optional overrides:
+# [models.options]
+# file = "Q4_K_M/model-00001-of-00003.gguf" # auto-expands multi-part shards
+# alias = "qwen3-30b"                       # override advertised /v1/models ID
+# draft_file = "Qwen3-0.6B-Q4_K_M.gguf"     # draft GGUF from the same repo/local_dir
+# draft_model = "/models/qwen3-0.6b.gguf"   # or external local path / hf:// URI
+#
+# [models.source]
+# repo = "unsloth/Qwen3-30B-A3B-GGUF"       # optional if model is a short alias
+# revision = "main"                         # or local_dir = "/models/qwen3"
+#
+# [models.lifecycle]
+# load = "on_demand"
+# idle_timeout_secs = 60
+```
+
+### Direct CLI Arguments (older Mesh-LLM hosts or explicit local paths)
+
+You can also pass local paths or `hf://` URIs directly via plugin `args` (both modes can be combined):
 
 ```toml
 [[plugin]]
@@ -71,7 +106,7 @@ args = [
 ]
 ```
 
-*(Note: in Mesh-LLM plugin mode, pre-download any `hf://` models first with `layerstream-plugin pull` so plugin startup handshake completes immediately.)*
+*(Note: when passing `hf://` URIs via `--model`, pre-download with `layerstream-plugin pull` or let background pull finish before sending the first request.)*
 
 ## Standalone CLI Mode (No Mesh-LLM Required)
 
