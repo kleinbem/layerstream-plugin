@@ -2741,7 +2741,8 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
 
     // Workaround: `llama_model_params.no_alloc = true` skips weight allocation, and `llama_context`
     // inherits `model.no_alloc()` (`params.no_alloc`) to skip KV/compute allocation unless cleared
-    // before `llama_init_from_model` (tracking: kleinbem/layerstream-plugin#8).
+    // before `llama_init_from_model` (tracking: kleinbem/layerstream-plugin#8,
+    // upstream: ggml-org/llama.cpp#32893).
     struct LsModelNoAllocReset : llama_model {
         static void clear(llama_model * m) { static_cast<LsModelNoAllocReset *>(m)->params.no_alloc = false; }
     };
