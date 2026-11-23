@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023", "ESNext.Disposable"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": false
+  },
+  "include": [
+    "index.d.ts",
+    "openai.d.ts",
+    "test/types-check.ts"
+  ]
+}

@@ -106,6 +106,19 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             VULKAN_SDK = lib.optionalString isLinux "${pkgs.vulkan-headers}";
           };
+
+          node = pkgs.mkShell {
+            packages =
+              commonPackages
+              ++ (with pkgs; [
+                nodejs_24
+                typescript
+              ]);
+
+            LLAMA_CPP_DIR = "${llama-cpp-src}";
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            VULKAN_SDK = lib.optionalString isLinux "${pkgs.vulkan-headers}";
+          };
         }
         // lib.optionalAttrs isLinux {
           cuda = pkgs.mkShell.override { stdenv = cudaPkgs.backendStdenv; } {

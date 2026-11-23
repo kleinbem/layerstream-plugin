@@ -1,0 +1,107 @@
+name: Node Bindings
+
+on:
+  pull_request:
+    paths:
+      - "bindings/node/**"
+      - "crates/layerstream-core/**"
+      - "Cargo.toml"
+      - ".github/workflows/node-bindings.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "bindings/node/**"
+      - "crates/layerstream-core/**"
+      - "Cargo.toml"
+      - ".github/workflows/node-bindings.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-node:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            napi_triple: linux-x64-gnu
+            features: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            napi_triple: linux-arm64-gnu
+            features: ""
+          - os: macos-15
+            target: aarch64-apple-darwin
+            napi_triple: darwin-arm64
+            features: "metal"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Checkout pinned llama.cpp
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 0693dbfb915f33233818373b5f6969396658d02c
+          path: third_party/llama.cpp
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Rust format & clippy check (bindings/node)
+        working-directory: bindings/node
+        env:
+          LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
+        run: |
+          cargo fmt -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build native Node-API addon
+        working-directory: bindings/node
+        env:
+          LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
+        run: |
+          extra_args=()
+          if [ -n "${{ matrix.features }}" ]; then
+            extra_args+=(--features "${{ matrix.features }}")
+          fi
+          node scripts/build-native.mjs --release --locked --triple "${{ matrix.napi_triple }}" "${extra_args[@]}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            codesign --force --sign - "layerstream.${{ matrix.napi_triple }}.node"
+            codesign --verify --strict "layerstream.${{ matrix.napi_triple }}.node"
+          fi
+
+      - name: Run Node.js & ESM integration test suite
+        working-directory: bindings/node
+        run: |
+          node --test test/layerstream.test.js
+          node --input-type=module -e 'import { AutoModel, OpenAI, version } from "./index.mjs"; if (!version || typeof AutoModel.fromPretrained !== "function" || typeof OpenAI !== "function") process.exit(1);'
+          mkdir -p dist
+          npm pack --pack-destination dist
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: layerstream-node-${{ matrix.napi_triple }}
+          path: |
+            bindings/node/layerstream.${{ matrix.napi_triple }}.node
+            bindings/node/dist/*.tgz

@@ -154,6 +154,23 @@ with AutoModel.from_pretrained("Qwen/Qwen2.5-14B-Instruct") as model:
 
 Accepts local `.gguf` paths, `hf://org/repo:file.gguf` URIs, HF `-GGUF` repos (hardware-aware auto-quant selection), and official base HF repos (`{org}/{name}-GGUF`), with full GIL release (`py.detach`), `isolated_worker=True` for **true 0 MB VRAM / CUDA context handoff back to PyTorch** on `.unload()`, drop-in in-process `layerstream.OpenAI` / `AsyncOpenAI` clients, native GBNF / JSON Schema / Pydantic structured decoding (`response_format` / `json_schema`), `<think>` & `<tool_call>` parsing, `recommend()` / `check()` / `inspect_gguf()`, and `.tokenize()` / `.kv_trim()`. Build locally via `nix develop .#python` (see [bindings/python/README.md](bindings/python/README.md)).
 
+## Node.js / TypeScript API (`napi-rs`, Native Rust/C++)
+
+Standalone Node-API & TypeScript bindings live in [bindings/node/](bindings/node/README.md) (excluded from the default Cargo workspace so `layerstream-plugin` stays Node-free, with zero runtime npm dependencies and dual ESM/CJS exports):
+
+```ts
+import { AutoModel } from "layerstream";
+
+await using model = await AutoModel.fromPretrained("Qwen/Qwen2.5-14B-Instruct", {
+  isolatedWorker: true,
+});
+for await (const chunk of await model.generate("Explain NVMe O_DIRECT streaming.", { stream: true })) {
+  process.stdout.write(chunk);
+}
+```
+
+Includes non-blocking Tokio worker execution, `AbortSignal` mid-prefill/mid-decode cancellation, `isolatedWorker: true` subprocess isolation, drop-in in-process `OpenAI` client (with JSON Schema and Zod `toJSONSchema()` structured `.parse()`), `recommend()` / `check()` / `inspectGguf()`, and `.tokenize()` / `.kvTrim()`. Build locally via `nix develop .#node` (see [bindings/node/README.md](bindings/node/README.md)).
+
 ## Build & Test
 
 ```bash

@@ -31,12 +31,20 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Verify Cargo.toml and plugin.toml versions match
+      - name: Verify workspace, plugin, and SDK manifest versions match
         run: |
           cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)
           plugin_ver=$(awk -F'"' '/^version =/{print $2; exit}' plugin.toml)
-          echo "Cargo.toml=${cargo_ver} plugin.toml=${plugin_ver}"
+          py_cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python/Cargo.toml)
+          py_proj_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python/pyproject.toml)
+          node_cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/node/Cargo.toml)
+          node_pkg_ver=$(python3 -c 'import json; print(json.load(open("bindings/node/package.json"))["version"])')
+          echo "Cargo=${cargo_ver} plugin=${plugin_ver} py_cargo=${py_cargo_ver} py_proj=${py_proj_ver} node_cargo=${node_cargo_ver} node_pkg=${node_pkg_ver}"
           test "$cargo_ver" = "$plugin_ver"
+          test "$cargo_ver" = "$py_cargo_ver"
+          test "$cargo_ver" = "$py_proj_ver"
+          test "$cargo_ver" = "$node_cargo_ver"
+          test "$cargo_ver" = "$node_pkg_ver"
 
       - name: Format check
         run: cargo fmt --all -- --check
