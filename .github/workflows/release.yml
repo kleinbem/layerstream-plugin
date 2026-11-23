@@ -289,7 +289,7 @@ jobs:
             ${{ matrix.container }} \
             bash -euxo pipefail -c '
               dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/${{ matrix.cuda_repo_arch }}/cuda-rhel9.repo
-              dnf install -y cuda-nvcc-13-5 cuda-cudart-devel-13-5 libcublas-devel-13-5 cuda-driver-devel-13-5
+              dnf install -y cuda-nvcc-13-5 cuda-cudart-devel-13-5 libcublas-devel-13-5 cuda-driver-devel-13-5 cuda-nvml-devel-13-5
               [ -x "$(command -v g++)" ] || dnf install -y gcc-c++
               export CC="$(command -v gcc)"
               export CXX="$(command -v g++)"
