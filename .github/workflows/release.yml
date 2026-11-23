@@ -271,17 +271,18 @@ jobs:
             quay.io/pypa/manylinux_2_28_x86_64 \
             bash -euxo pipefail -c '
               dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
-              dnf install -y cmake ninja-build gcc-toolset-13-gcc-c++ cuda-nvcc-12-6 cuda-cudart-devel-12-6 libcublas-devel-12-6 cuda-driver-devel-12-6
+              dnf install -y git gcc-toolset-13-gcc-c++ cuda-nvcc-12-8 cuda-cudart-devel-12-8 libcublas-devel-12-8 cuda-driver-devel-12-8
               export CC="/opt/rh/gcc-toolset-13/root/usr/bin/gcc"
               export CXX="/opt/rh/gcc-toolset-13/root/usr/bin/g++"
               export CUDAHOSTCXX="/opt/rh/gcc-toolset-13/root/usr/bin/g++"
               export CMAKE_CUDA_HOST_COMPILER="/opt/rh/gcc-toolset-13/root/usr/bin/g++"
-              export PATH="/usr/local/cuda-12.6/bin:$PATH"
-              export CUDAToolkit_ROOT="/usr/local/cuda-12.6"
+              PY_BIN=$(ls -1d /opt/python/cp314-cp314/bin/python /opt/python/cp315-cp315/bin/python 2>/dev/null | head -n 1)
+              PY_DIR=$(dirname "$PY_BIN")
+              "$PY_BIN" -m pip install --upgrade pip "setuptools>=68" wheel "cmake>=3.31" ninja
+              export PATH="$PY_DIR:/usr/local/cuda-12.8/bin:$PATH"
+              export CUDAToolkit_ROOT="/usr/local/cuda-12.8"
               export LLAMA_CPP_DIR="/io/third_party/llama.cpp"
               export LAYERSTREAM_CUDA_WHEEL_PLAT="manylinux_2_31_x86_64"
-              PY_BIN=$(ls -1d /opt/python/cp314-cp314/bin/python /opt/python/cp315-cp315/bin/python 2>/dev/null | head -n 1)
-              "$PY_BIN" -m pip install --upgrade pip "setuptools>=68" wheel
               "$PY_BIN" scripts/build_wheel.py --out dist
               "$PY_BIN" /io/bindings/python/scripts/audit_wheel_elf.py dist/*.whl
             '
@@ -458,7 +459,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         if: vars.PYPI_PUBLISH == 'true'
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Publish wheels to PyPI via Trusted Publishing (OIDC)
         if: vars.PYPI_PUBLISH == 'true'
@@ -468,16 +469,23 @@ jobs:
           oidc_resp=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi")
           oidc_jwt=$(python -c 'import json,sys; print(json.loads(sys.stdin.read())["value"])' <<<"$oidc_resp")
-          mint_resp=$(curl -sSf -X POST "https://pypi.org/_/oidc/mint-token" \
+          mint_http=$(curl -sS -o /tmp/pypi-mint.json -w "%{http_code}" -X POST "https://pypi.org/_/oidc/mint-token" \
             -H "Content-Type: application/json" \
             -d "{\"token\":\"${oidc_jwt}\"}")
-          pypi_token=$(python -c 'import json,sys; print(json.loads(sys.stdin.read())["token"])' <<<"$mint_resp")
+          if [ "$mint_http" != "200" ]; then
+            echo "ERROR: PyPI OIDC token mint failed (HTTP ${mint_http}):" >&2
+            cat /tmp/pypi-mint.json >&2
+            rm -f /tmp/pypi-mint.json
+            exit 1
+          fi
+          pypi_token=$(python -c 'import json,pathlib; print(json.loads(pathlib.Path("/tmp/pypi-mint.json").read_text())["token"])')
+          rm -f /tmp/pypi-mint.json
           echo "::add-mask::${pypi_token}"
           TWINE_USERNAME="__token__" TWINE_PASSWORD="${pypi_token}" \
-            python -m twine upload pypi-dist/layerstream-*.whl
+            python -m twine upload --skip-existing pypi-dist/layerstream-*.whl
           if [ "${{ vars.PYPI_PUBLISH_CUDA }}" = "true" ]; then
             TWINE_USERNAME="__token__" TWINE_PASSWORD="${pypi_token}" \
-              python -m twine upload pypi-dist/layerstream_cuda12-*.whl
+              python -m twine upload --skip-existing pypi-dist/layerstream_cuda12-*.whl
           else
             echo "Skipping layerstream-cuda12 PyPI upload until vars.PYPI_PUBLISH_CUDA == 'true' (wheel is attached to GitHub Release)."
           fi

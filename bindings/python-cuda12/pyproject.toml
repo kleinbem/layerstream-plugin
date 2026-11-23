@@ -10,8 +10,8 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.14"
 dependencies = [
-    "nvidia-cuda-runtime-cu12>=12.1,<13",
-    "nvidia-cublas-cu12>=12.1,<13",
+    "nvidia-cuda-runtime-cu12>=12.8,<13",
+    "nvidia-cublas-cu12>=12.8,<13",
 ]
 keywords = ["llm", "gguf", "cuda", "layerstream", "inference"]
 classifiers = [

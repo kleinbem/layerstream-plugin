@@ -27,8 +27,9 @@ def resolve_llama_dir(pkg_root: Path) -> Path:
 def default_cuda_archs() -> str:
     arch = platform.machine().lower()
     if arch in ("aarch64", "arm64"):
-        return "87"
-    return "75;80;86;89;90"
+        return "87-real"
+    # Turing/Ampere/Hopper+ PTX plus native Ada SASS keeps the compressed CUDA 12.8 wheel well under PyPI's 100 MiB cap.
+    return "75-virtual;80-virtual;89-real;90-virtual"
 
 
 def main() -> int:
@@ -66,7 +67,11 @@ def main() -> int:
             # (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
             "-DGGML_CUDA_GRAPHS=OFF",
             "-DGGML_CUDA_COMPRESSION_MODE=size",
+            "-DGGML_CUDA_CCCL_VERSION=v3.4.3",
+            "-DGGML_CUDA_NCCL=OFF",
+            "-DGGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;f16-f16",
             f"-DCMAKE_CUDA_ARCHITECTURES={archs}",
+            "-DGGML_CPU=OFF",
             "-DGGML_VULKAN=OFF",
             "-DGGML_METAL=OFF",
             "-DGGML_OPENMP=OFF",
@@ -78,6 +83,7 @@ def main() -> int:
             "-DLLAMA_BUILD_COMMON=OFF",
             "-DLLAMA_BUILD_APP=OFF",
             "-DLLAMA_CURL=OFF",
+            "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
             "-DCMAKE_BUILD_RPATH=$ORIGIN",
             "-DCMAKE_INSTALL_RPATH=$ORIGIN",
             "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-rpath,$ORIGIN",
