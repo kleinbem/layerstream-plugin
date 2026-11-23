@@ -19,6 +19,22 @@ def _configure_native_backends() -> list[str]:
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     local_backends = os.path.join(pkg_dir, "_backends")
 
+    # On NixOS, store-built `python3` ignores `NIX_LD_LIBRARY_PATH` and `/run/opengl-driver/lib`
+    # when `dlopen`ing portable manylinux wheels; preload host C++/Vulkan/CUDA driver libraries if present.
+    nix_host_dirs: list[str] = []
+    for raw_dir in os.environ.get("NIX_LD_LIBRARY_PATH", "").split(os.pathsep):
+        if raw_dir.strip() and os.path.isdir(raw_dir.strip()):
+            nix_host_dirs.append(raw_dir.strip())
+    if os.path.isdir("/run/opengl-driver/lib"):
+        nix_host_dirs.append("/run/opengl-driver/lib")
+    for lib_name in ("libstdc++.so.6", "libvulkan.so.1", "libcuda.so.1"):
+        for host_dir in nix_host_dirs:
+            candidate = os.path.join(host_dir, lib_name)
+            if os.path.isfile(candidate):
+                with contextlib.suppress(OSError):
+                    ctypes.CDLL(candidate, mode=rtld_global)
+                break
+
     # Preload bundled `libggml-base` with RTLD_GLOBAL so companion `layerstream-cuda13`
     # resolves `libggml-base.so.0` even when installed in a separate site-packages tree.
     if os.path.isdir(local_backends):

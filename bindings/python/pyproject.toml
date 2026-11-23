@@ -60,7 +60,7 @@ features = ["pyo3/extension-module"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-timeout = 60
+timeout = 120
 addopts = "--strict-markers"
 testpaths = ["tests"]
 

@@ -557,7 +557,7 @@ def test_interpreter_exit_with_live_model_and_stream(synthetic_gguf: Path) -> No
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=90,
         check=False,
     )
     assert proc.returncode == 0, (

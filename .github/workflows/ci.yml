@@ -19,13 +19,15 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ggml-org/llama.cpp
-          ref: 0693dbfb915f33233818373b5f6969396658d02c
+          ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
           path: third_party/llama.cpp
 
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build pkg-config protobuf-compiler libvulkan-dev glslc spirv-headers mesa-vulkan-drivers
+          sudo apt-get install -y gcc-14 g++-14 cmake ninja-build pkg-config protobuf-compiler libvulkan-dev glslc spirv-headers mesa-vulkan-drivers
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:

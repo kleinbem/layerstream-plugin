@@ -231,8 +231,8 @@ fn main() {
         .define("GGML_OPENMP", "OFF")
         .define("GGML_VULKAN", if use_vulkan { "ON" } else { "OFF" })
         .define("GGML_CUDA", if use_cuda { "ON" } else { "OFF" })
-        // Workaround: ggml-cuda holds a single graph slot invalidated by per-layer cb_eval splits
-        // (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
+        // Workaround: CUDA graphs hang sm_120 channels under sustained load and churn on sparse MoE
+        // pointer updates (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
         .define("GGML_CUDA_GRAPHS", "OFF")
         .define("GGML_METAL", if use_metal { "ON" } else { "OFF" })
         .define(
@@ -268,19 +268,6 @@ fn main() {
         cfg.define("CMAKE_BUILD_RPATH", build_rpath);
         cfg.define("CMAKE_INSTALL_RPATH", build_rpath);
         cfg.define("CMAKE_BUILD_WITH_INSTALL_RPATH", "ON");
-        for var in ["CMAKE_SHARED_LINKER_FLAGS", "CMAKE_MODULE_LINKER_FLAGS"] {
-            let mut flags = env::var(var).unwrap_or_default();
-            if !flags.contains("$ORIGIN") {
-                if !flags.is_empty() {
-                    flags.push(' ');
-                }
-                flags.push_str("-Wl,-rpath,$ORIGIN");
-            }
-            if has_opengl_dir && !flags.contains("/run/opengl-driver/lib") {
-                flags.push_str(" -Wl,-rpath,/run/opengl-driver/lib");
-            }
-            cfg.define(var, flags);
-        }
     }
 
     if use_cuda {

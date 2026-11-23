@@ -64,8 +64,8 @@ def main() -> int:
             "-DBUILD_SHARED_LIBS=ON",
             "-DGGML_BACKEND_DL=ON",
             "-DGGML_CUDA=ON",
-            # Workaround: ggml-cuda holds a single graph slot invalidated by per-layer cb_eval splits
-            # (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
+            # Workaround: CUDA graphs hang sm_120 channels under sustained load and churn on sparse MoE
+            # pointer updates (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
             "-DGGML_CUDA_GRAPHS=OFF",
             "-DGGML_CUDA_COMPRESSION_MODE=size",
             "-DGGML_CUDA_NCCL=OFF",
@@ -86,8 +86,6 @@ def main() -> int:
             "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
             "-DCMAKE_BUILD_RPATH=$ORIGIN",
             "-DCMAKE_INSTALL_RPATH=$ORIGIN",
-            "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-rpath,$ORIGIN",
-            "-DCMAKE_MODULE_LINKER_FLAGS=-Wl,-rpath,$ORIGIN",
         ]
         if shutil.which("ninja"):
             cmake_cmd.extend(["-G", "Ninja"])
