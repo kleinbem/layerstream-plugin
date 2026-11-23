@@ -47,7 +47,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ggml-org/llama.cpp
-          ref: 0693dbfb915f33233818373b5f6969396658d02c
+          ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
           path: third_party/llama.cpp
 
       - name: Install Linux build dependencies
@@ -64,14 +64,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Rust format & clippy check (bindings/node)
         working-directory: bindings/node
         env:
           LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
         run: |
           cargo fmt -- --check
           cargo clippy --locked --all-targets -- -D warnings
@@ -80,6 +81,7 @@ jobs:
         working-directory: bindings/node
         env:
           LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
         run: |
           extra_args=()
           if [ -n "${{ matrix.features }}" ]; then

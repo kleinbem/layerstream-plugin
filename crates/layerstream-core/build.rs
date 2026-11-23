@@ -216,7 +216,10 @@ fn main() {
             "GGML_BACKEND_DL",
             if dynamic_backends { "ON" } else { "OFF" },
         )
-        .define("GGML_CPU_ALL_VARIANTS", "OFF")
+        .define(
+            "GGML_CPU_ALL_VARIANTS",
+            if dynamic_backends { "ON" } else { "OFF" },
+        )
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_TOOLS", "OFF")
@@ -228,8 +231,8 @@ fn main() {
         .define("GGML_OPENMP", "OFF")
         .define("GGML_VULKAN", if use_vulkan { "ON" } else { "OFF" })
         .define("GGML_CUDA", if use_cuda { "ON" } else { "OFF" })
-        // Workaround: ggml-cuda holds a single graph slot invalidated by per-layer cb_eval splits
-        // (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
+        // Workaround: CUDA graphs hang sm_120 channels under sustained load and churn on sparse MoE
+        // pointer updates (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
         .define("GGML_CUDA_GRAPHS", "OFF")
         .define("GGML_METAL", if use_metal { "ON" } else { "OFF" })
         .define(
@@ -240,6 +243,13 @@ fn main() {
 
     if !dynamic_backends {
         cfg.build_target("llama");
+        if env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() == Some("x86_64") {
+            cfg.define("GGML_AVX", "ON")
+                .define("GGML_AVX2", "ON")
+                .define("GGML_FMA", "ON")
+                .define("GGML_F16C", "ON")
+                .define("GGML_BMI2", "ON");
+        }
     }
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -258,19 +268,6 @@ fn main() {
         cfg.define("CMAKE_BUILD_RPATH", build_rpath);
         cfg.define("CMAKE_INSTALL_RPATH", build_rpath);
         cfg.define("CMAKE_BUILD_WITH_INSTALL_RPATH", "ON");
-        for var in ["CMAKE_SHARED_LINKER_FLAGS", "CMAKE_MODULE_LINKER_FLAGS"] {
-            let mut flags = env::var(var).unwrap_or_default();
-            if !flags.contains("$ORIGIN") {
-                if !flags.is_empty() {
-                    flags.push(' ');
-                }
-                flags.push_str("-Wl,-rpath,$ORIGIN");
-            }
-            if has_opengl_dir && !flags.contains("/run/opengl-driver/lib") {
-                flags.push_str(" -Wl,-rpath,/run/opengl-driver/lib");
-            }
-            cfg.define(var, flags);
-        }
     }
 
     if use_cuda {
@@ -307,7 +304,7 @@ fn main() {
     let mut cc_build = cc::Build::new();
     cc_build
         .cpp(true)
-        .std("c++17")
+        .std("c++20")
         .file("cpp/stream_engine.cpp")
         .include("cpp")
         .include(llama_dir.join("include"))
@@ -322,7 +319,7 @@ fn main() {
 
     if dynamic_backends && (use_cuda || target_os == "linux") {
         // Resolve libcudart symbols lazily via dlopen/dlsym ONLY once `libggml-cuda.so` is
-        // loaded at runtime (e.g., via `layerstream-cuda12` or `MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR`),
+        // loaded at runtime (e.g., via `layerstream-cuda13` or `MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR`),
         // keeping the base binary/wheel free of compile-time CUDA headers and CUDA DT_NEEDED!
         cc_build.define("LAYERSTREAM_USE_CUDA_DYNAMIC", None);
     } else if use_cuda && !dynamic_backends {

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -102,10 +103,8 @@ static const Api & get_api() {
     static Api api = []() {
         Api out;
         static constexpr const char * kCandidates[] = {
-            "libcudart.so",
             "libcudart.so.13",
-            "libcudart.so.12",
-            "libcudart.so.11",
+            "libcudart.so",
         };
         void * handle = nullptr;
         for (const char * name : kCandidates) {
@@ -333,6 +332,73 @@ static bool has_registered_cpu_device() {
     return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) != nullptr;
 }
 
+static bool load_best_cpu_backend_in_dir(const std::string & dir) {
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    constexpr std::string_view kVariantPrefix = "ggml-cpu-";
+    constexpr std::string_view kPlainName = "ggml-cpu.dll";
+    constexpr std::string_view kExt = ".dll";
+#elif defined(__APPLE__)
+    constexpr std::string_view kVariantPrefix = "libggml-cpu-";
+    constexpr std::string_view kPlainName = "libggml-cpu.dylib";
+    constexpr std::string_view kExt = ".dylib";
+#else
+    constexpr std::string_view kVariantPrefix = "libggml-cpu-";
+    constexpr std::string_view kPlainName = "libggml-cpu.so";
+    constexpr std::string_view kExt = ".so";
+#endif
+    std::error_code ec;
+    int best_score = 0;
+    std::string best_path;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            continue;
+        }
+        const std::string fname = it->path().filename().string();
+        if (!fname.starts_with(kVariantPrefix) || !fname.ends_with(kExt)) {
+            continue;
+        }
+        const std::string full = it->path().string();
+#ifdef _WIN32
+        HMODULE handle = LoadLibraryA(full.c_str());
+        if (!handle) {
+            continue;
+        }
+        auto score_fn = reinterpret_cast<int (*)()>(GetProcAddress(handle, "ggml_backend_score"));
+        if (score_fn) {
+            const int s = score_fn();
+            if (s > best_score) {
+                best_score = s;
+                best_path = full;
+            }
+        }
+        FreeLibrary(handle);
+#else
+        void * handle = dlopen(full.c_str(), RTLD_LAZY | RTLD_LOCAL);
+        if (!handle) {
+            continue;
+        }
+        auto score_fn = reinterpret_cast<int (*)()>(dlsym(handle, "ggml_backend_score"));
+        if (score_fn) {
+            const int s = score_fn();
+            if (s > best_score) {
+                best_score = s;
+                best_path = full;
+            }
+        }
+        dlclose(handle);
+#endif
+    }
+    if (best_score > 0 && !best_path.empty()) {
+        return ggml_backend_load(best_path.c_str()) != nullptr;
+    }
+    const fs::path plain = fs::path(dir) / kPlainName;
+    if (fs::is_regular_file(plain, ec)) {
+        return ggml_backend_load(plain.string().c_str()) != nullptr;
+    }
+    return false;
+}
+
 static void append_unique_dir(std::vector<std::string> & dirs, const std::string & candidate) {
     if (candidate.empty() || !dir_exists(candidate)) {
         return;
@@ -387,9 +453,8 @@ static void ls_log_callback(ggml_log_level level, const char * text, void * /*us
 
 static void ensure_llama_initialized() {
     std::call_once(g_llama_init_once, []() {
-        // Workaround: ggml-cuda holds a single graph slot per context that invalidates/recaptures
-        // on every per-layer cb_eval split (tracking: kleinbem/layerstream-plugin#5,
-        // upstream: ggml-org/llama.cpp#27330).
+        // Workaround: CUDA graphs hang sm_120 channels under sustained load and churn on sparse MoE
+        // pointer updates (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
 #ifdef _WIN32
         _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
 #else
@@ -450,22 +515,10 @@ static void ensure_llama_initialized() {
                 }
             }
         }
-        // 3. Ensure the CPU backend is registered for embeddings / host fallbacks.
+        // 3. Ensure the highest-scoring SIMD CPU backend variant is registered for embeddings / host fallbacks.
         if (!has_registered_cpu_device()) {
             for (const auto & dir : search_dirs) {
-#ifdef _WIN32
-                const char * cpu_plugins[] = {"\\ggml-cpu.dll"};
-#elif defined(__APPLE__)
-                const char * cpu_plugins[] = {"/libggml-cpu.dylib", "/libggml-cpu.so"};
-#else
-                const char * cpu_plugins[] = {"/libggml-cpu.so"};
-#endif
-                for (const char * suffix : cpu_plugins) {
-                    const std::string plugin = dir + suffix;
-                    if (file_exists(plugin)) {
-                        ggml_backend_load(plugin.c_str());
-                    }
-                }
+                load_best_cpu_backend_in_dir(dir);
                 if (has_registered_cpu_device()) {
                     break;
                 }
@@ -1839,8 +1892,6 @@ static bool select_target_buft(
             if (ls_cuda::device_get_attribute(&integrated, ls_cuda::kDevAttrIntegrated, 0) == ls_cuda::kSuccess &&
                 integrated != 0) {
                 out_is_unified_memory = true;
-                // upstream: ggml-org/llama.cpp#15034 (Tegra CUDA_Host UMA is currently disabled
-                // upstream; once re-enabled, uma_zero_copy activates here automatically).
                 ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(chosen);
                 if (host_buft != nullptr && ggml_backend_dev_supports_buft(chosen, host_buft)) {
                     out_buft = host_buft;
@@ -2688,11 +2739,13 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         eng->worker_thread = std::thread([eng]() { eng->worker_loop(); });
     }
 
-    // 7. Critical: clear hparams.no_alloc BEFORE llama_init_from_model so
-    // llama_context allocates real KV cache + compute scheduler buffers.
-    // upstream: ggml-org/llama.cpp#31141 (merged; removes llama_hparams::no_alloc,
-    // drop this mutation once pinned llama.cpp is bumped past #31141).
-    eng->model->hparams.no_alloc = false;
+    // Workaround: `llama_model_params.no_alloc = true` skips weight allocation, and `llama_context`
+    // inherits `model.no_alloc()` (`params.no_alloc`) to skip KV/compute allocation unless cleared
+    // before `llama_init_from_model` (tracking: kleinbem/layerstream-plugin#8).
+    struct LsModelNoAllocReset : llama_model {
+        static void clear(llama_model * m) { static_cast<LsModelNoAllocReset *>(m)->params.no_alloc = false; }
+    };
+    LsModelNoAllocReset::clear(eng->model);
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = n_ctx;

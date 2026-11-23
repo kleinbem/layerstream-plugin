@@ -8,7 +8,7 @@ Native Python SDK (`PyO3` + `maturin`) for [`layerstream-core`](../../crates/lay
 # Apple Silicon (Metal), AMD, Intel, NVIDIA (Vulkan), or CPU fallback:
 pip install layerstream
 
-# Linux with NVIDIA GPU (adds CUDA 12 backend + cuBLAS/cudart from PyPI; no nvcc needed):
+# Linux x86_64 & aarch64 with NVIDIA Ampere+ GPU (CUDA 13.5+ driver >= 595; adds cuBLAS/cudart from PyPI, no nvcc needed):
 pip install "layerstream[cuda]"
 ```
 

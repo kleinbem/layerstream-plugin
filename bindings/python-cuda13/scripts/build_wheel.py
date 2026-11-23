@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build `libggml-cuda.so` from pinned `llama.cpp` and package `layerstream-cuda12` wheel."""
+"""Build `libggml-cuda.so` from pinned `llama.cpp` and package `layerstream-cuda13` wheel."""
 
 import argparse
 import os
@@ -27,8 +27,10 @@ def resolve_llama_dir(pkg_root: Path) -> Path:
 def default_cuda_archs() -> str:
     arch = platform.machine().lower()
     if arch in ("aarch64", "arm64"):
-        return "87"
-    return "75;80;86;89;90"
+        # Ampere+ only: native Jetson Orin (sm_87) and DGX Spark GB10 (sm_121a) SASS plus Hopper PTX.
+        return "87-real;90-virtual;121a-real"
+    # Ampere+ only: native Ada (sm_89) and Blackwell FP4/MMA (sm_120a) SASS plus Ampere/Hopper PTX.
+    return "80-virtual;89-real;90-virtual;120a-real"
 
 
 def main() -> int:
@@ -37,12 +39,12 @@ def main() -> int:
     parser.add_argument(
         "--skip-cmake",
         action="store_true",
-        help="Package an already-staged python/layerstream_cuda12/_backends/libggml-cuda.so",
+        help="Package an already-staged python/layerstream_cuda13/_backends/libggml-cuda.so",
     )
     args = parser.parse_args()
 
     pkg_root = Path(__file__).resolve().parent.parent
-    stage_dir = pkg_root / "python" / "layerstream_cuda12" / "_backends"
+    stage_dir = pkg_root / "python" / "layerstream_cuda13" / "_backends"
     stage_dir.mkdir(parents=True, exist_ok=True)
     staged_so = stage_dir / "libggml-cuda.so"
 
@@ -62,11 +64,14 @@ def main() -> int:
             "-DBUILD_SHARED_LIBS=ON",
             "-DGGML_BACKEND_DL=ON",
             "-DGGML_CUDA=ON",
-            # Workaround: ggml-cuda holds a single graph slot invalidated by per-layer cb_eval splits
-            # (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
+            # Workaround: CUDA graphs hang sm_120 channels under sustained load and churn on sparse MoE
+            # pointer updates (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
             "-DGGML_CUDA_GRAPHS=OFF",
             "-DGGML_CUDA_COMPRESSION_MODE=size",
+            "-DGGML_CUDA_NCCL=OFF",
+            "-DGGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;f16-f16",
             f"-DCMAKE_CUDA_ARCHITECTURES={archs}",
+            "-DGGML_CPU=OFF",
             "-DGGML_VULKAN=OFF",
             "-DGGML_METAL=OFF",
             "-DGGML_OPENMP=OFF",
@@ -78,10 +83,9 @@ def main() -> int:
             "-DLLAMA_BUILD_COMMON=OFF",
             "-DLLAMA_BUILD_APP=OFF",
             "-DLLAMA_CURL=OFF",
+            "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
             "-DCMAKE_BUILD_RPATH=$ORIGIN",
             "-DCMAKE_INSTALL_RPATH=$ORIGIN",
-            "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-rpath,$ORIGIN",
-            "-DCMAKE_MODULE_LINKER_FLAGS=-Wl,-rpath,$ORIGIN",
         ]
         if shutil.which("ninja"):
             cmake_cmd.extend(["-G", "Ninja"])
@@ -108,7 +112,7 @@ def main() -> int:
 
     out_dir = (pkg_root / args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    for old_whl in out_dir.glob("layerstream_cuda12-*.whl"):
+    for old_whl in out_dir.glob("layerstream_cuda13-*.whl"):
         old_whl.unlink()
 
     subprocess.run(
@@ -126,7 +130,7 @@ def main() -> int:
         check=True,
     )
 
-    built = sorted(out_dir.glob("layerstream_cuda12-*.whl"))
+    built = sorted(out_dir.glob("layerstream_cuda13-*.whl"))
     if not built:
         raise SystemExit(f"ERROR: no wheel built in {out_dir}")
     print(f"Built CUDA plugin wheel: {built[0]}")

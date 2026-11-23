@@ -1,4 +1,4 @@
-"""CUDA 12 dynamic backend plugin package for `layerstream`."""
+"""CUDA 13 dynamic backend plugin package for `layerstream`."""
 
 import ctypes
 import glob
@@ -13,16 +13,17 @@ def backend_dir() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "_backends")
 
 
-# Workaround: PyPI `nvidia-*-cu12` wheels install shared libraries under `site-packages/nvidia/*/lib`
-# outside the dynamic linker search path (upstream: abetlen/llama-cpp-python#1460).
+# Workaround: PyPI `nvidia-cuda-runtime` and `nvidia-cublas` (CUDA 13) install shared libraries
+# under `site-packages/nvidia/cu13/lib` outside the dynamic linker search path
+# (upstream: abetlen/llama-cpp-python#1460).
 def preload_nvidia_libraries() -> list[str]:
-    """Preload `libcudart` and `libcublas` from PyPI `nvidia-*-cu12` packages with RTLD_GLOBAL."""
+    """Preload `libcudart` and `libcublas` from PyPI `nvidia.cu13` packages with RTLD_GLOBAL."""
     loaded: list[str] = []
     rtld_global = getattr(os, "RTLD_GLOBAL", ctypes.RTLD_GLOBAL)
     candidates = [
-        ("nvidia.cuda_runtime", "libcudart.so*"),
-        ("nvidia.cublas", "libcublasLt.so*"),
-        ("nvidia.cublas", "libcublas.so*"),
+        ("nvidia.cu13", "libcudart.so*"),
+        ("nvidia.cu13", "libcublasLt.so*"),
+        ("nvidia.cu13", "libcublas.so*"),
     ]
     for mod_name, pattern in candidates:
         try:

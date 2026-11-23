@@ -1,5 +1,6 @@
 import os
 import platform
+
 from setuptools import Distribution, setup
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
@@ -19,9 +20,9 @@ class PlatformWheel(_bdist_wheel):
         if not plat:
             arch = platform.machine().lower()
             if arch in ("aarch64", "arm64"):
-                plat = "manylinux_2_31_aarch64"
+                plat = "manylinux_2_34_aarch64"
             else:
-                plat = f"manylinux_2_31_{arch}"
+                plat = f"manylinux_2_34_{arch}"
         return ("py3", "none", plat)
 
 

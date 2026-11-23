@@ -141,7 +141,7 @@ Endpoints:
 
 ## Python API (AirLLM-style, Native Rust/C++)
 
-Standalone native Python bindings (`PyO3` + `maturin`) live in [bindings/python/](bindings/python/README.md) (excluded from the default Cargo workspace so `layerstream-plugin` stays Python-free), with prebuilt GPU wheels (`Vulkan` + `dynamic-backends` on Linux, `Metal` on Apple Silicon, and zero-compile CUDA 12 via `pip install "layerstream[cuda]"`):
+Standalone native Python bindings (`PyO3` + `maturin`) live in [bindings/python/](bindings/python/README.md) (excluded from the default Cargo workspace so `layerstream-plugin` stays Python-free), with prebuilt GPU wheels (`Vulkan` + `dynamic-backends` on Linux, `Metal` on Apple Silicon, and zero-compile CUDA 13 via `pip install "layerstream[cuda]"`):
 
 ```python
 from layerstream import AutoModel

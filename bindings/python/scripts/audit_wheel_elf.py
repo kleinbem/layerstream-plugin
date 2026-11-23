@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Strict ELF & PyPI compliance auditor for Linux `layerstream` and `layerstream-cuda12` wheels.
+"""Strict ELF & PyPI compliance auditor for Linux `layerstream` and `layerstream-cuda13` wheels.
 
 Workaround: `auditwheel repair` hashes/renames runtime-`dlopen`ed `libggml-*.so` backend plugins
 (upstream: pypa/auditwheel#594), so Linux wheels build with `--auditwheel skip` and enforce
-manylinux_2_31 symbol/RUNPATH bounds here.
+manylinux_2_34 symbol/RUNPATH bounds here.
 """
 
 import re
@@ -14,9 +14,9 @@ import zipfile
 from pathlib import Path
 
 MAX_WHEEL_BYTES = 98 * 1024 * 1024  # PyPI hard cap is 100 MiB
-MAX_GLIBC = (2, 31)
-MAX_GLIBCXX = (3, 4, 28)
-MAX_CXXABI = (1, 3, 12)
+MAX_GLIBC = (2, 34)
+MAX_GLIBCXX = (3, 4, 29)
+MAX_CXXABI = (1, 3, 13)
 FORBIDDEN_RPATH_SUBSTRINGS = (
     "/opt/",
     "/nix/",
@@ -71,6 +71,8 @@ def audit_wheel(wheel_path: Path) -> None:
                 print(f"[audit]   {member}: NEEDED={needed} RUNPATH={rpaths}")
 
                 for rp in rpaths:
+                    if "" in rp.split(":"):
+                        raise SystemExit(f"ERROR: empty CWD segment in RUNPATH of {member}: {rp!r}")
                     for bad in FORBIDDEN_RPATH_SUBSTRINGS:
                         if bad in rp:
                             raise SystemExit(

@@ -5,7 +5,6 @@ import atexit
 import contextlib
 import ctypes
 import glob
-import importlib.util
 import os
 import weakref
 from collections.abc import Callable, Mapping, Sequence
@@ -15,36 +14,28 @@ from typing import Any, override
 
 
 def _configure_native_backends() -> list[str]:
-    """Preload PyPI CUDA runtimes (if installed) and configure dynamic ggml backend paths."""
+    """Preload companion CUDA 13 runtimes (if installed) and configure dynamic ggml backend paths."""
     rtld_global = getattr(os, "RTLD_GLOBAL", ctypes.RTLD_GLOBAL)
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     local_backends = os.path.join(pkg_dir, "_backends")
 
-    # Workaround: PyPI `nvidia-*-cu12` wheels install shared libraries under
-    # `site-packages/nvidia/*/lib` outside the dynamic linker search path
-    # (upstream: abetlen/llama-cpp-python#1460).
-    for mod_name, pattern in (
-        ("nvidia.cuda_runtime", "libcudart.so*"),
-        ("nvidia.cublas", "libcublasLt.so*"),
-        ("nvidia.cublas", "libcublas.so*"),
-    ):
-        try:
-            spec = importlib.util.find_spec(mod_name)
-        except ImportError, ValueError:
-            spec = None
-        if spec is None or not spec.submodule_search_locations:
-            continue
-        for root in spec.submodule_search_locations:
-            lib_dir = os.path.join(root, "lib")
-            for match in sorted(glob.glob(os.path.join(lib_dir, pattern))):
-                if os.path.isfile(match):
-                    try:
-                        ctypes.CDLL(match, mode=rtld_global)
-                        break
-                    except OSError:
-                        continue
+    # On NixOS, store-built `python3` ignores `NIX_LD_LIBRARY_PATH` and `/run/opengl-driver/lib`
+    # when `dlopen`ing portable manylinux wheels; preload host C++/Vulkan/CUDA driver libraries if present.
+    nix_host_dirs: list[str] = []
+    for raw_dir in os.environ.get("NIX_LD_LIBRARY_PATH", "").split(os.pathsep):
+        if raw_dir.strip() and os.path.isdir(raw_dir.strip()):
+            nix_host_dirs.append(raw_dir.strip())
+    if os.path.isdir("/run/opengl-driver/lib"):
+        nix_host_dirs.append("/run/opengl-driver/lib")
+    for lib_name in ("libstdc++.so.6", "libvulkan.so.1", "libcuda.so.1"):
+        for host_dir in nix_host_dirs:
+            candidate = os.path.join(host_dir, lib_name)
+            if os.path.isfile(candidate):
+                with contextlib.suppress(OSError):
+                    ctypes.CDLL(candidate, mode=rtld_global)
+                break
 
-    # Preload bundled `libggml-base` with RTLD_GLOBAL so companion `layerstream-cuda12`
+    # Preload bundled `libggml-base` with RTLD_GLOBAL so companion `layerstream-cuda13`
     # resolves `libggml-base.so.0` even when installed in a separate site-packages tree.
     if os.path.isdir(local_backends):
         for pattern in ("libggml-base.so*", "libggml.so*"):
@@ -71,10 +62,10 @@ def _configure_native_backends() -> list[str]:
     _add(os.environ.get("MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR", "").strip() or None)
 
     with contextlib.suppress(ImportError, OSError):
-        import layerstream_cuda12  # type: ignore[import-not-found]
+        import layerstream_cuda13  # type: ignore[import-not-found]
 
-        layerstream_cuda12.preload_nvidia_libraries()
-        _add(layerstream_cuda12.backend_dir())
+        layerstream_cuda13.preload_nvidia_libraries()
+        _add(layerstream_cuda13.backend_dir())
 
     _add(local_backends)
     if dirs:

@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - "bindings/python/**"
-      - "bindings/python-cuda12/**"
+      - "bindings/python-cuda13/**"
       - "crates/layerstream-core/**"
       - "crates/layerstream-server/**"
       - "Cargo.toml"
@@ -14,7 +14,7 @@ on:
       - main
     paths:
       - "bindings/python/**"
-      - "bindings/python-cuda12/**"
+      - "bindings/python-cuda13/**"
       - "crates/layerstream-core/**"
       - "crates/layerstream-server/**"
       - "Cargo.toml"
@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ggml-org/llama.cpp
-          ref: 0693dbfb915f33233818373b5f6969396658d02c
+          ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
           path: third_party/llama.cpp
 
       - name: Install Linux build dependencies
@@ -62,20 +62,20 @@ jobs:
         working-directory: bindings/python
         run: |
           python -m pip install --upgrade pip ruff pyright pytest pytest-asyncio pytest-timeout hypothesis
-          ruff check python tests scripts ../python-cuda12/python ../python-cuda12/scripts
-          ruff format --check python tests scripts ../python-cuda12/python ../python-cuda12/scripts
+          ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts
+          ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts
           pyright python/layerstream tests
 
-      - name: Smoke-test layerstream-cuda12 companion wheel packaging & metadata
+      - name: Smoke-test layerstream-cuda13 companion wheel packaging & metadata
         run: |
           python -m pip install --upgrade pip setuptools wheel twine
-          mkdir -p bindings/python-cuda12/python/layerstream_cuda12/_backends
+          mkdir -p bindings/python-cuda13/python/layerstream_cuda13/_backends
           gcc -shared -fPIC -Wl,-soname,libggml-cuda.so -Wl,-rpath,'$ORIGIN' \
-            -o bindings/python-cuda12/python/layerstream_cuda12/_backends/libggml-cuda.so -xc /dev/null
-          python bindings/python-cuda12/scripts/build_wheel.py --skip-cmake --out dist
-          python -m twine check --strict bindings/python-cuda12/dist/*.whl
-          python -m pip install --no-deps --force-reinstall bindings/python-cuda12/dist/*.whl
-          python -c 'import os, layerstream_cuda12; assert os.path.isfile(os.path.join(layerstream_cuda12.backend_dir(), "libggml-cuda.so"))'
+            -o bindings/python-cuda13/python/layerstream_cuda13/_backends/libggml-cuda.so -xc /dev/null
+          python bindings/python-cuda13/scripts/build_wheel.py --skip-cmake --out dist
+          python -m twine check --strict bindings/python-cuda13/dist/*.whl
+          python -m pip install --no-deps --force-reinstall bindings/python-cuda13/dist/*.whl
+          python -c 'import os, layerstream_cuda13; assert os.path.isfile(os.path.join(layerstream_cuda13.backend_dir(), "libggml-cuda.so"))'
 
   build-wheels:
     strategy:
@@ -83,18 +83,18 @@ jobs:
       matrix:
         include:
           # Workaround: `--auditwheel skip` preserves unhashed `libggml-*.so` names for runtime
-          # `dlopen` plugin loading; `audit_wheel_elf.py` enforces manylinux_2_31 ELF bounds
+          # `dlopen` plugin loading; `audit_wheel_elf.py` enforces manylinux_2_34 ELF bounds
           # (upstream: pypa/auditwheel#594).
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            container: "2_28"
-            manylinux: "2_31"
+            container: "2_34"
+            manylinux: "2_34"
             vulkan_sdk: "/opt/vk"
             args: "--auditwheel skip --locked --release --out dist --features vulkan,dynamic-backends"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            container: "2_28"
-            manylinux: "2_31"
+            container: "2_34"
+            manylinux: "2_34"
             vulkan_sdk: "/opt/vk"
             args: "--auditwheel skip --locked --release --out dist --features vulkan,dynamic-backends"
           - os: macos-15
@@ -112,7 +112,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ggml-org/llama.cpp
-          ref: 0693dbfb915f33233818373b5f6969396658d02c
+          ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
           path: third_party/llama.cpp
 
       - name: Install macOS build dependencies
@@ -126,6 +126,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         env:
           LAYERSTREAM_PORTABLE_WHEEL: "1"
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
           VULKAN_SDK: ${{ matrix.vulkan_sdk }}
           CMAKE_PREFIX_PATH: ${{ matrix.vulkan_sdk }}
         with:

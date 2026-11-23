@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/0bb2eedc20e4739f29e8045034f2828ad7054f8f";
     llama-cpp-src = {
-      url = "github:ggml-org/llama.cpp/0693dbfb915f33233818373b5f6969396658d02c";
+      url = "github:ggml-org/llama.cpp/7d9b931df9bb7c689f067a7fed23e7f5253951f6";
       flake = false;
     };
   };
@@ -20,7 +20,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forAllSystems =
@@ -146,7 +145,7 @@
             CUDAToolkit_ROOT = "${cudaMerged}";
             CMAKE_CUDA_COMPILER = "${cudaPkgs.cuda_nvcc}/bin/nvcc";
             CMAKE_CUDA_HOST_COMPILER = "${cudaPkgs.backendStdenv.cc}/bin/g++";
-            CMAKE_CUDA_ARCHITECTURES = if isAarch64 then "87" else "86;89";
+            CMAKE_CUDA_ARCHITECTURES = if isAarch64 then "87" else "89;120a";
             LD_LIBRARY_PATH =
               lib.makeLibraryPath [
                 (lib.getLib cudaPkgs.cuda_cudart)
