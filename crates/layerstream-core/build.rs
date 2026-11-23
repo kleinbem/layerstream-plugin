@@ -216,7 +216,10 @@ fn main() {
             "GGML_BACKEND_DL",
             if dynamic_backends { "ON" } else { "OFF" },
         )
-        .define("GGML_CPU_ALL_VARIANTS", "OFF")
+        .define(
+            "GGML_CPU_ALL_VARIANTS",
+            if dynamic_backends { "ON" } else { "OFF" },
+        )
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_TOOLS", "OFF")
@@ -240,6 +243,13 @@ fn main() {
 
     if !dynamic_backends {
         cfg.build_target("llama");
+        if env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() == Some("x86_64") {
+            cfg.define("GGML_AVX", "ON")
+                .define("GGML_AVX2", "ON")
+                .define("GGML_FMA", "ON")
+                .define("GGML_F16C", "ON")
+                .define("GGML_BMI2", "ON");
+        }
     }
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -307,7 +317,7 @@ fn main() {
     let mut cc_build = cc::Build::new();
     cc_build
         .cpp(true)
-        .std("c++17")
+        .std("c++20")
         .file("cpp/stream_engine.cpp")
         .include("cpp")
         .include(llama_dir.join("include"))

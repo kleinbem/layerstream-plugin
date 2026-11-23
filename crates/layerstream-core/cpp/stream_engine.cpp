@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -102,10 +103,8 @@ static const Api & get_api() {
     static Api api = []() {
         Api out;
         static constexpr const char * kCandidates[] = {
-            "libcudart.so",
             "libcudart.so.13",
-            "libcudart.so.12",
-            "libcudart.so.11",
+            "libcudart.so",
         };
         void * handle = nullptr;
         for (const char * name : kCandidates) {
@@ -333,6 +332,73 @@ static bool has_registered_cpu_device() {
     return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) != nullptr;
 }
 
+static bool load_best_cpu_backend_in_dir(const std::string & dir) {
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    constexpr std::string_view kVariantPrefix = "ggml-cpu-";
+    constexpr std::string_view kPlainName = "ggml-cpu.dll";
+    constexpr std::string_view kExt = ".dll";
+#elif defined(__APPLE__)
+    constexpr std::string_view kVariantPrefix = "libggml-cpu-";
+    constexpr std::string_view kPlainName = "libggml-cpu.dylib";
+    constexpr std::string_view kExt = ".dylib";
+#else
+    constexpr std::string_view kVariantPrefix = "libggml-cpu-";
+    constexpr std::string_view kPlainName = "libggml-cpu.so";
+    constexpr std::string_view kExt = ".so";
+#endif
+    std::error_code ec;
+    int best_score = 0;
+    std::string best_path;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            continue;
+        }
+        const std::string fname = it->path().filename().string();
+        if (!fname.starts_with(kVariantPrefix) || !fname.ends_with(kExt)) {
+            continue;
+        }
+        const std::string full = it->path().string();
+#ifdef _WIN32
+        HMODULE handle = LoadLibraryA(full.c_str());
+        if (!handle) {
+            continue;
+        }
+        auto score_fn = reinterpret_cast<int (*)()>(GetProcAddress(handle, "ggml_backend_score"));
+        if (score_fn) {
+            const int s = score_fn();
+            if (s > best_score) {
+                best_score = s;
+                best_path = full;
+            }
+        }
+        FreeLibrary(handle);
+#else
+        void * handle = dlopen(full.c_str(), RTLD_LAZY | RTLD_LOCAL);
+        if (!handle) {
+            continue;
+        }
+        auto score_fn = reinterpret_cast<int (*)()>(dlsym(handle, "ggml_backend_score"));
+        if (score_fn) {
+            const int s = score_fn();
+            if (s > best_score) {
+                best_score = s;
+                best_path = full;
+            }
+        }
+        dlclose(handle);
+#endif
+    }
+    if (best_score > 0 && !best_path.empty()) {
+        return ggml_backend_load(best_path.c_str()) != nullptr;
+    }
+    const fs::path plain = fs::path(dir) / kPlainName;
+    if (fs::is_regular_file(plain, ec)) {
+        return ggml_backend_load(plain.string().c_str()) != nullptr;
+    }
+    return false;
+}
+
 static void append_unique_dir(std::vector<std::string> & dirs, const std::string & candidate) {
     if (candidate.empty() || !dir_exists(candidate)) {
         return;
@@ -450,22 +516,10 @@ static void ensure_llama_initialized() {
                 }
             }
         }
-        // 3. Ensure the CPU backend is registered for embeddings / host fallbacks.
+        // 3. Ensure the highest-scoring SIMD CPU backend variant is registered for embeddings / host fallbacks.
         if (!has_registered_cpu_device()) {
             for (const auto & dir : search_dirs) {
-#ifdef _WIN32
-                const char * cpu_plugins[] = {"\\ggml-cpu.dll"};
-#elif defined(__APPLE__)
-                const char * cpu_plugins[] = {"/libggml-cpu.dylib", "/libggml-cpu.so"};
-#else
-                const char * cpu_plugins[] = {"/libggml-cpu.so"};
-#endif
-                for (const char * suffix : cpu_plugins) {
-                    const std::string plugin = dir + suffix;
-                    if (file_exists(plugin)) {
-                        ggml_backend_load(plugin.c_str());
-                    }
-                }
+                load_best_cpu_backend_in_dir(dir);
                 if (has_registered_cpu_device()) {
                     break;
                 }

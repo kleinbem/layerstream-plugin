@@ -20,7 +20,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forAllSystems =
@@ -146,7 +145,7 @@
             CUDAToolkit_ROOT = "${cudaMerged}";
             CMAKE_CUDA_COMPILER = "${cudaPkgs.cuda_nvcc}/bin/nvcc";
             CMAKE_CUDA_HOST_COMPILER = "${cudaPkgs.backendStdenv.cc}/bin/g++";
-            CMAKE_CUDA_ARCHITECTURES = if isAarch64 then "87" else "86;89";
+            CMAKE_CUDA_ARCHITECTURES = if isAarch64 then "87" else "89;120a";
             LD_LIBRARY_PATH =
               lib.makeLibraryPath [
                 (lib.getLib cudaPkgs.cuda_cudart)

@@ -27,10 +27,10 @@ def resolve_llama_dir(pkg_root: Path) -> Path:
 def default_cuda_archs() -> str:
     arch = platform.machine().lower()
     if arch in ("aarch64", "arm64"):
-        # Native Jetson Orin (sm_87) SASS plus Ampere/Hopper/Blackwell CUDA 13.0 PTX.
-        return "80-virtual;87-real;90-virtual"
-    # Native Ada (sm_89) SASS plus Turing/Ampere/Hopper/Blackwell CUDA 13.0 PTX keeps the wheel well under PyPI's 100 MiB cap.
-    return "75-virtual;80-virtual;89-real;90-virtual"
+        # Ampere+ only: native Jetson Orin (sm_87) and DGX Spark GB10 (sm_121a) SASS plus Hopper PTX.
+        return "87-real;90-virtual;121a-real"
+    # Ampere+ only: native Ada (sm_89) and Blackwell FP4/MMA (sm_120a) SASS plus Ampere/Hopper PTX.
+    return "80-virtual;89-real;90-virtual;120a-real"
 
 
 def main() -> int:
@@ -68,7 +68,6 @@ def main() -> int:
             # (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
             "-DGGML_CUDA_GRAPHS=OFF",
             "-DGGML_CUDA_COMPRESSION_MODE=size",
-            "-DGGML_CUDA_CCCL_VERSION=v3.4.3",
             "-DGGML_CUDA_NCCL=OFF",
             "-DGGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;f16-f16",
             f"-DCMAKE_CUDA_ARCHITECTURES={archs}",

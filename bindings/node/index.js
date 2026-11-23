@@ -5,7 +5,7 @@ const native = require("./native.js");
 const { IsolatedWorkerClient } = require("./worker.js");
 const { OpenAI } = require("./openai.js");
 
-const ASYNC_DISPOSE = Symbol.asyncDispose || Symbol.for("nodejs.dispose.async");
+const ASYNC_DISPOSE = Symbol.asyncDispose;
 const MAX_I32 = 2147483647;
 
 function createAbortError(signal) {

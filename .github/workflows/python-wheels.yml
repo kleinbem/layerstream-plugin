@@ -83,18 +83,18 @@ jobs:
       matrix:
         include:
           # Workaround: `--auditwheel skip` preserves unhashed `libggml-*.so` names for runtime
-          # `dlopen` plugin loading; `audit_wheel_elf.py` enforces manylinux_2_31 ELF bounds
+          # `dlopen` plugin loading; `audit_wheel_elf.py` enforces manylinux_2_34 ELF bounds
           # (upstream: pypa/auditwheel#594).
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            container: "2_28"
-            manylinux: "2_31"
+            container: "2_34"
+            manylinux: "2_34"
             vulkan_sdk: "/opt/vk"
             args: "--auditwheel skip --locked --release --out dist --features vulkan,dynamic-backends"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            container: "2_28"
-            manylinux: "2_31"
+            container: "2_34"
+            manylinux: "2_34"
             vulkan_sdk: "/opt/vk"
             args: "--auditwheel skip --locked --release --out dist --features vulkan,dynamic-backends"
           - os: macos-15
@@ -126,6 +126,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         env:
           LAYERSTREAM_PORTABLE_WHEEL: "1"
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
           VULKAN_SDK: ${{ matrix.vulkan_sdk }}
           CMAKE_PREFIX_PATH: ${{ matrix.vulkan_sdk }}
         with:
