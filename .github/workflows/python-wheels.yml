@@ -61,14 +61,17 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            manylinux: "2_28"
+            container: "2_28"
+            manylinux: "2_31"
             args: "--locked --release --out dist"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            manylinux: "2_28"
+            container: "2_28"
+            manylinux: "2_31"
             args: "--locked --release --out dist"
           - os: macos-15
             target: aarch64-apple-darwin
+            container: ""
             manylinux: ""
             args: "--locked --release --out dist --features metal"
 
@@ -95,6 +98,7 @@ jobs:
         with:
           command: build
           working-directory: bindings/python
+          container: ${{ matrix.container }}
           manylinux: ${{ matrix.manylinux }}
           before-script-linux: dnf install -y cmake ninja-build
           args: ${{ matrix.args }}
@@ -106,6 +110,9 @@ jobs:
       - name: Verify PyPI wheel tag, metadata, and pytest suite
         working-directory: bindings/python
         run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo chown -R "$(id -u):$(id -g)" dist
+          fi
           python -m pip install --upgrade pip pytest twine
           python -m twine check --strict dist/*.whl
           for whl in dist/*.whl; do

@@ -1,8 +1,9 @@
+use std::collections::VecDeque;
+use std::future::poll_fn;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use layerstream_core::hf::{self, PretrainedResolveOptions, resolve_pretrained_model};
@@ -290,10 +291,51 @@ pub struct ChatResultJs {
     pub summary: GenerateSummaryJs,
 }
 
+fn push_waker(list: &mut Vec<Waker>, waker: &Waker) {
+    if !list.iter().any(|w| w.will_wake(waker)) {
+        list.push(waker.clone());
+    }
+}
+
+struct CancelState {
+    flag: AtomicBool,
+    wakers: Mutex<Vec<Waker>>,
+}
+
+impl CancelState {
+    fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            wakers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+        if let Ok(mut list) = self.wakers.lock() {
+            let drained = std::mem::take(&mut *list);
+            drop(list);
+            for w in drained {
+                w.wake();
+            }
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    fn register_waker(&self, waker: &Waker) {
+        if let Ok(mut list) = self.wakers.lock() {
+            push_waker(&mut list, waker);
+        }
+    }
+}
+
 /// Cooperative cancellation handle flipped synchronously from JS `AbortSignal` listeners.
 #[napi]
 pub struct NativeCancelToken {
-    flag: Arc<AtomicBool>,
+    state: Arc<CancelState>,
 }
 
 #[napi]
@@ -301,18 +343,18 @@ impl NativeCancelToken {
     #[napi(constructor)]
     pub fn new() -> Self {
         Self {
-            flag: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(CancelState::new()),
         }
     }
 
     #[napi]
     pub fn cancel(&self) {
-        self.flag.store(true, Ordering::Relaxed);
+        self.state.cancel();
     }
 
     #[napi(getter)]
     pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::Relaxed)
+        self.state.is_cancelled()
     }
 }
 
@@ -370,151 +412,326 @@ impl Default for StreamTagParser {
     }
 }
 
-enum StreamEvent {
-    Chunk(String),
-    Done(GenerateSummary),
-    Err(String),
+const STREAM_BUFFER_CAPACITY: usize = 64;
+
+struct StreamInner {
+    queue: VecDeque<String>,
+    closed_by_consumer: bool,
+    producer_finished: bool,
+    worker_exited: bool,
+    error: Option<String>,
+    summary: Option<GenerateSummaryJs>,
+    read_wakers: Vec<Waker>,
+    exit_wakers: Vec<Waker>,
 }
 
-struct StreamState {
-    rx: Option<mpsc::Receiver<StreamEvent>>,
-    worker: Option<JoinHandle<()>>,
-    done: bool,
-    summary: Option<GenerateSummary>,
+struct StreamShared {
+    inner: Mutex<StreamInner>,
+    not_full_cv: Condvar,
+    cancel: Arc<CancelState>,
+}
+
+impl StreamShared {
+    fn new(cancel: Arc<CancelState>) -> Self {
+        Self {
+            inner: Mutex::new(StreamInner {
+                queue: VecDeque::with_capacity(STREAM_BUFFER_CAPACITY),
+                closed_by_consumer: false,
+                producer_finished: false,
+                worker_exited: false,
+                error: None,
+                summary: None,
+                read_wakers: Vec::new(),
+                exit_wakers: Vec::new(),
+            }),
+            not_full_cv: Condvar::new(),
+            cancel,
+        }
+    }
+
+    fn send_chunk(&self, text: String) -> bool {
+        let Ok(mut st) = self.inner.lock() else {
+            return false;
+        };
+        while !st.closed_by_consumer
+            && !self.cancel.is_cancelled()
+            && st.queue.len() >= STREAM_BUFFER_CAPACITY
+        {
+            st = match self.not_full_cv.wait(st) {
+                Ok(g) => g,
+                Err(_) => return false,
+            };
+        }
+        if st.closed_by_consumer || self.cancel.is_cancelled() {
+            return false;
+        }
+        st.queue.push_back(text);
+        let wakers = std::mem::take(&mut st.read_wakers);
+        drop(st);
+        for w in wakers {
+            w.wake();
+        }
+        true
+    }
+
+    fn finish_producer(
+        &self,
+        res: anyhow::Result<Option<GenerateSummary>>,
+        model_last_summary: &Mutex<Option<GenerateSummaryJs>>,
+    ) {
+        let Ok(mut st) = self.inner.lock() else {
+            return;
+        };
+        match res {
+            Ok(Some(sum)) => {
+                let js_sum = summary_to_js(&sum);
+                if let Ok(mut mls) = model_last_summary.lock() {
+                    *mls = Some(js_sum.clone());
+                }
+                st.summary = Some(js_sum);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                if !st.closed_by_consumer && !self.cancel.is_cancelled() {
+                    st.error = Some(format!("{e:#}"));
+                }
+            }
+        }
+        st.producer_finished = true;
+        let wakers = std::mem::take(&mut st.read_wakers);
+        drop(st);
+        for w in wakers {
+            w.wake();
+        }
+    }
+
+    fn mark_worker_exited(&self) {
+        if let Ok(mut st) = self.inner.lock() {
+            st.producer_finished = true;
+            st.worker_exited = true;
+            let read_wakers = std::mem::take(&mut st.read_wakers);
+            let exit_wakers = std::mem::take(&mut st.exit_wakers);
+            drop(st);
+            for w in read_wakers {
+                w.wake();
+            }
+            for w in exit_wakers {
+                w.wake();
+            }
+        }
+    }
+
+    fn cancel_and_disconnect(&self) {
+        self.cancel.cancel();
+        if let Ok(mut st) = self.inner.lock() {
+            st.closed_by_consumer = true;
+            st.queue.clear();
+            let wakers = std::mem::take(&mut st.read_wakers);
+            drop(st);
+            self.not_full_cv.notify_all();
+            for w in wakers {
+                w.wake();
+            }
+        } else {
+            self.not_full_cv.notify_all();
+        }
+    }
+
+    async fn next_chunk(&self) -> Result<Option<String>> {
+        poll_fn(|cx| {
+            if self.cancel.is_cancelled() {
+                return Poll::Ready(Ok(None));
+            }
+            self.cancel.register_waker(cx.waker());
+            if self.cancel.is_cancelled() {
+                return Poll::Ready(Ok(None));
+            }
+            let mut st = match self.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return Poll::Ready(Err(generic_err("stream lock poisoned"))),
+            };
+            if st.closed_by_consumer {
+                return Poll::Ready(Ok(None));
+            }
+            if let Some(chunk) = st.queue.pop_front() {
+                drop(st);
+                self.not_full_cv.notify_one();
+                return Poll::Ready(Ok(Some(chunk)));
+            }
+            if let Some(err) = st.error.take() {
+                return Poll::Ready(Err(generic_err(err)));
+            }
+            if st.producer_finished || st.worker_exited {
+                return Poll::Ready(Ok(None));
+            }
+            push_waker(&mut st.read_wakers, cx.waker());
+            Poll::Pending
+        })
+        .await
+    }
+
+    async fn wait_worker_exited(&self) {
+        poll_fn(|cx| {
+            let mut st = match self.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return Poll::Ready(()),
+            };
+            if st.worker_exited {
+                return Poll::Ready(());
+            }
+            push_waker(&mut st.exit_wakers, cx.waker());
+            Poll::Pending
+        })
+        .await;
+    }
+}
+
+struct WorkerExitGuard {
+    shared: Arc<StreamShared>,
+}
+
+impl Drop for WorkerExitGuard {
+    fn drop(&mut self) {
+        self.shared.mark_worker_exited();
+    }
 }
 
 #[napi]
 pub struct NativeTokenStream {
-    state: Arc<Mutex<StreamState>>,
-    cancel: Arc<AtomicBool>,
+    shared: Arc<StreamShared>,
 }
 
 impl Drop for NativeTokenStream {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        let handle = if let Ok(mut st) = self.state.lock() {
-            st.rx = None;
-            st.done = true;
-            st.worker.take()
-        } else {
-            None
-        };
-        if let Some(h) = handle {
-            let _ = h.join();
-        }
+        self.shared.cancel_and_disconnect();
     }
 }
 
 #[napi]
 impl NativeTokenStream {
-    /// Synchronously signals the underlying C++ / NVMe engine to abort immediately.
+    /// Synchronously signals the underlying C++ / NVMe engine to abort and wakes any full-buffer send.
     #[napi]
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.shared.cancel_and_disconnect();
     }
 
     #[napi(getter)]
     pub fn summary(&self) -> Result<Option<GenerateSummaryJs>> {
         let st = self
-            .state
+            .shared
+            .inner
             .lock()
             .map_err(|_| generic_err("stream lock poisoned"))?;
-        Ok(st.summary.as_ref().map(summary_to_js))
+        Ok(st.summary.clone())
     }
 
     #[napi]
     pub async fn close(&self) -> Result<()> {
-        self.cancel.store(true, Ordering::Relaxed);
-        let state = self.state.clone();
-        run_blocking(move || {
-            let handle = {
-                let mut st = state
-                    .lock()
-                    .map_err(|_| generic_err("stream lock poisoned"))?;
-                st.rx = None;
-                st.done = true;
-                st.worker.take()
-            };
-            if let Some(h) = handle {
-                let _ = h.join();
-            }
-            Ok(())
-        })
-        .await
+        self.shared.cancel_and_disconnect();
+        self.shared.wait_worker_exited().await;
+        Ok(())
     }
 
     #[napi]
     pub async fn next_chunk(&self) -> Result<Option<String>> {
-        let state = self.state.clone();
-        let cancel = self.cancel.clone();
-        run_blocking(move || {
-            loop {
-                if cancel.load(Ordering::Relaxed) {
-                    let handle = if let Ok(mut st) = state.lock() {
-                        st.rx = None;
-                        st.done = true;
-                        st.worker.take()
-                    } else {
-                        None
-                    };
-                    if let Some(h) = handle {
-                        let _ = h.join();
-                    }
-                    return Ok(None);
-                }
-
-                let ev = {
-                    let st = state
-                        .lock()
-                        .map_err(|_| generic_err("stream lock poisoned"))?;
-                    if st.done {
-                        None
-                    } else if let Some(ref rx) = st.rx {
-                        match rx.recv_timeout(Duration::from_millis(25)) {
-                            Ok(ev) => Some(Ok(ev)),
-                            Err(RecvTimeoutError::Timeout) => Some(Err(())),
-                            Err(RecvTimeoutError::Disconnected) => None,
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                match ev {
-                    None => {
-                        finish_stream_state(&state, None);
-                        return Ok(None);
-                    }
-                    Some(Ok(StreamEvent::Done(summary))) => {
-                        finish_stream_state(&state, Some(summary));
-                        return Ok(None);
-                    }
-                    Some(Ok(StreamEvent::Chunk(text))) => return Ok(Some(text)),
-                    Some(Ok(StreamEvent::Err(msg))) => {
-                        finish_stream_state(&state, None);
-                        return Err(generic_err(msg));
-                    }
-                    Some(Err(())) => continue,
-                }
-            }
-        })
-        .await
+        self.shared.next_chunk().await
     }
 }
 
-fn finish_stream_state(state: &Mutex<StreamState>, summary: Option<GenerateSummary>) {
-    let handle = if let Ok(mut st) = state.lock() {
-        st.done = true;
-        st.rx = None;
-        if summary.is_some() {
-            st.summary = summary;
+struct GateInner {
+    busy: bool,
+    wakers: Vec<Waker>,
+}
+
+struct EngineGate {
+    inner: Mutex<GateInner>,
+    cv: Condvar,
+}
+
+struct EnginePermit {
+    gate: Arc<EngineGate>,
+}
+
+impl Drop for EnginePermit {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.gate.inner.lock() {
+            g.busy = false;
+            let wakers = std::mem::take(&mut g.wakers);
+            drop(g);
+            self.gate.cv.notify_one();
+            for w in wakers {
+                w.wake();
+            }
         }
-        st.worker.take()
-    } else {
-        None
-    };
-    if let Some(h) = handle {
-        let _ = h.join();
+    }
+}
+
+impl EngineGate {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(GateInner {
+                busy: false,
+                wakers: Vec::new(),
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    async fn acquire_async(
+        self: &Arc<Self>,
+        cancel: Option<&Arc<CancelState>>,
+    ) -> Result<EnginePermit> {
+        poll_fn(|cx| {
+            if let Some(c) = cancel {
+                if c.is_cancelled() {
+                    return Poll::Ready(Err(generic_err("ABORT_ERR: operation aborted")));
+                }
+                c.register_waker(cx.waker());
+                if c.is_cancelled() {
+                    return Poll::Ready(Err(generic_err("ABORT_ERR: operation aborted")));
+                }
+            }
+            let mut g = match self.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return Poll::Ready(Err(generic_err("model gate poisoned"))),
+            };
+            if !g.busy {
+                g.busy = true;
+                return Poll::Ready(Ok(EnginePermit {
+                    gate: Arc::clone(self),
+                }));
+            }
+            push_waker(&mut g.wakers, cx.waker());
+            Poll::Pending
+        })
+        .await
+    }
+
+    fn acquire_sync(
+        self: &Arc<Self>,
+        cancel: &Arc<CancelState>,
+    ) -> anyhow::Result<Option<EnginePermit>> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model gate poisoned"))?;
+        while g.busy {
+            if cancel.is_cancelled() {
+                return Ok(None);
+            }
+            let (next_g, _) = self
+                .cv
+                .wait_timeout(g, Duration::from_millis(5))
+                .map_err(|_| anyhow::anyhow!("model gate poisoned"))?;
+            g = next_g;
+        }
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        g.busy = true;
+        Ok(Some(EnginePermit {
+            gate: Arc::clone(self),
+        }))
     }
 }
 
@@ -527,27 +744,6 @@ struct LoadedEngine {
     resolved_repo: Option<String>,
     selected_quant: Option<String>,
     default_max_draft_tokens: usize,
-    last_summary: Option<GenerateSummary>,
-}
-
-fn lock_engine_with_cancel<'a>(
-    inner: &'a Mutex<Option<LoadedEngine>>,
-    cancel: &AtomicBool,
-) -> anyhow::Result<Option<std::sync::MutexGuard<'a, Option<LoadedEngine>>>> {
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
-        match inner.try_lock() {
-            Ok(guard) => return Ok(Some(guard)),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                anyhow::bail!("model lock poisoned");
-            }
-        }
-    }
 }
 
 #[derive(Deserialize, Default)]
@@ -752,8 +948,11 @@ fn build_generate_options(wire: &GenerateOptionsWire) -> Result<GenerateOptions>
 #[napi]
 pub struct NativeAutoModel {
     inner: Arc<Mutex<Option<LoadedEngine>>>,
+    gate: Arc<EngineGate>,
     loaded: Arc<AtomicBool>,
     cached_model_path: Arc<Mutex<Option<String>>>,
+    last_summary: Arc<Mutex<Option<GenerateSummaryJs>>>,
+    active_streams: Arc<Mutex<Vec<Weak<StreamShared>>>>,
 }
 
 #[napi]
@@ -871,7 +1070,6 @@ impl NativeAutoModel {
                     resolved_repo: resolved_target.resolved_repo,
                     selected_quant: resolved_target.selected_quant,
                     default_max_draft_tokens: max_draft_tokens,
-                    last_summary: None,
                 })
             })();
             res.map_err(map_anyhow_err)
@@ -881,8 +1079,11 @@ impl NativeAutoModel {
         let path_str = loaded.model_path.to_string_lossy().into_owned();
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(loaded))),
+            gate: Arc::new(EngineGate::new()),
             loaded: Arc::new(AtomicBool::new(true)),
             cached_model_path: Arc::new(Mutex::new(Some(path_str))),
+            last_summary: Arc::new(Mutex::new(None)),
+            active_streams: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -896,24 +1097,20 @@ impl NativeAutoModel {
         let wire: GenerateOptionsWire = serde_json::from_str(&opts_json)
             .map_err(|e| invalid_arg(format!("invalid generate options: {e}")))?;
         let mut opts = build_generate_options(&wire)?;
-        let inner = self.inner.clone();
         let cancel = cancel_token
-            .map(|t| t.flag.clone())
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+            .map(|t| t.state.clone())
+            .unwrap_or_else(|| Arc::new(CancelState::new()));
+
+        let permit = self.gate.acquire_async(Some(&cancel)).await?;
+        let inner = self.inner.clone();
+        let last_summary = self.last_summary.clone();
 
         run_blocking(move || {
+            let _permit = permit;
             let (text, summary) = (|| -> anyhow::Result<(String, GenerateSummary)> {
-                let Some(mut guard) = lock_engine_with_cancel(&inner, &cancel)? else {
-                    return Ok((
-                        String::new(),
-                        GenerateSummary {
-                            prompt_tokens: 0,
-                            completion_tokens: 0,
-                            finish_reason: "cancelled".to_string(),
-                            speculation: Default::default(),
-                        },
-                    ));
-                };
+                let mut guard = inner
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
                 let loaded = guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("model has been unloaded"))?;
@@ -925,23 +1122,26 @@ impl NativeAutoModel {
                     &prompt,
                     &opts,
                     loaded.draft.as_mut(),
-                    Some(&cancel),
+                    Some(&cancel.flag),
                     |_tok, piece| {
-                        if cancel.load(Ordering::Relaxed) {
+                        if cancel.is_cancelled() {
                             return false;
                         }
                         out.push_str(piece);
                         true
                     },
                 )?;
-                loaded.last_summary = Some(summary.clone());
                 Ok((out, summary))
             })()
             .map_err(map_anyhow_err)?;
 
+            let js_summary = summary_to_js(&summary);
+            if let Ok(mut ls) = last_summary.lock() {
+                *ls = Some(js_summary.clone());
+            }
             Ok(GenerateResultJs {
                 text,
-                summary: summary_to_js(&summary),
+                summary: js_summary,
             })
         })
         .await
@@ -975,24 +1175,19 @@ impl NativeAutoModel {
         let parse_out = wire.parse_output.unwrap_or(false);
         let mut opts = build_generate_options(&wire)?;
 
-        let inner = self.inner.clone();
         let cancel = cancel_token
-            .map(|t| t.flag.clone())
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+            .map(|t| t.state.clone())
+            .unwrap_or_else(|| Arc::new(CancelState::new()));
+        let permit = self.gate.acquire_async(Some(&cancel)).await?;
+        let inner = self.inner.clone();
+        let last_summary = self.last_summary.clone();
 
         run_blocking(move || {
+            let _permit = permit;
             let (text, summary) = (|| -> anyhow::Result<(String, GenerateSummary)> {
-                let Some(mut guard) = lock_engine_with_cancel(&inner, &cancel)? else {
-                    return Ok((
-                        String::new(),
-                        GenerateSummary {
-                            prompt_tokens: 0,
-                            completion_tokens: 0,
-                            finish_reason: "cancelled".to_string(),
-                            speculation: Default::default(),
-                        },
-                    ));
-                };
+                let mut guard = inner
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
                 let loaded = guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("model has been unloaded"))?;
@@ -1005,20 +1200,23 @@ impl NativeAutoModel {
                     &prompt,
                     &opts,
                     loaded.draft.as_mut(),
-                    Some(&cancel),
+                    Some(&cancel.flag),
                     |_tok, piece| {
-                        if cancel.load(Ordering::Relaxed) {
+                        if cancel.is_cancelled() {
                             return false;
                         }
                         out.push_str(piece);
                         true
                     },
                 )?;
-                loaded.last_summary = Some(summary.clone());
                 Ok((out, summary))
             })()
             .map_err(map_anyhow_err)?;
 
+            let js_summary = summary_to_js(&summary);
+            if let Ok(mut ls) = last_summary.lock() {
+                *ls = Some(js_summary.clone());
+            }
             let parsed = if parse_out {
                 Some(parsed_to_js(core_parse_assistant_output(&text)))
             } else {
@@ -1027,7 +1225,7 @@ impl NativeAutoModel {
             Ok(ChatResultJs {
                 text,
                 parsed,
-                summary: summary_to_js(&summary),
+                summary: js_summary,
             })
         })
         .await
@@ -1038,6 +1236,7 @@ impl NativeAutoModel {
         &self,
         messages_json: String,
         opts_json: String,
+        cancel_token: Option<&NativeCancelToken>,
     ) -> Result<NativeTokenStream> {
         if !self.loaded.load(Ordering::Acquire) {
             return Err(generic_err("model has been unloaded"));
@@ -1056,8 +1255,11 @@ impl NativeAutoModel {
         let add_gen = wire.add_generation_prompt.unwrap_or(true);
         let opts = build_generate_options(&wire)?;
 
+        let cancel = cancel_token.map(|t| t.state.clone());
+        let permit = self.gate.acquire_async(cancel.as_ref()).await?;
         let inner = self.inner.clone();
         let prompt = run_blocking(move || {
+            let _permit = permit;
             let guard = inner
                 .lock()
                 .map_err(|_| generic_err("model lock poisoned"))?;
@@ -1071,6 +1273,11 @@ impl NativeAutoModel {
         })
         .await?;
 
+        if let Some(ref c) = cancel
+            && c.is_cancelled()
+        {
+            return Err(generic_err("ABORT_ERR: operation aborted"));
+        }
         self.spawn_token_stream(prompt, opts)
     }
 
@@ -1079,61 +1286,67 @@ impl NativeAutoModel {
         prompt: String,
         mut opts: GenerateOptions,
     ) -> Result<NativeTokenStream> {
-        let (tx, rx) = mpsc::sync_channel::<StreamEvent>(64);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = cancel.clone();
-        let inner = self.inner.clone();
-
-        let worker = std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<Option<GenerateSummary>> {
-                let Some(mut guard) = lock_engine_with_cancel(&inner, &worker_cancel)? else {
-                    return Ok(None);
-                };
-                let loaded = guard
-                    .as_mut()
-                    .ok_or_else(|| anyhow::anyhow!("model has been unloaded"))?;
-                if opts.max_draft_tokens == 0 {
-                    opts.max_draft_tokens = loaded.default_max_draft_tokens;
-                }
-                let summary = loaded.engine.generate_stream_with_cancel(
-                    &prompt,
-                    &opts,
-                    loaded.draft.as_mut(),
-                    Some(&worker_cancel),
-                    |_tok, piece| {
-                        if worker_cancel.load(Ordering::Relaxed) {
-                            return false;
-                        }
-                        if piece.is_empty() {
-                            return true;
-                        }
-                        tx.send(StreamEvent::Chunk(piece.to_string())).is_ok()
-                    },
-                )?;
-                loaded.last_summary = Some(summary.clone());
-                Ok(Some(summary))
-            })();
-
-            match res {
-                Ok(Some(summary)) => {
-                    let _ = tx.send(StreamEvent::Done(summary));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Err(format!("{e:#}")));
-                }
+        let cancel = Arc::new(CancelState::new());
+        let shared = Arc::new(StreamShared::new(cancel.clone()));
+        {
+            let mut active = self
+                .active_streams
+                .lock()
+                .map_err(|_| generic_err("active streams lock poisoned"))?;
+            if !self.loaded.load(Ordering::Acquire) {
+                return Err(generic_err("model has been unloaded"));
             }
-        });
+            active.retain(|w| w.strong_count() > 0);
+            active.push(Arc::downgrade(&shared));
+        }
 
-        Ok(NativeTokenStream {
-            state: Arc::new(Mutex::new(StreamState {
-                rx: Some(rx),
-                worker: Some(worker),
-                done: false,
-                summary: None,
-            })),
-            cancel,
-        })
+        let worker_shared = Arc::clone(&shared);
+        let gate = Arc::clone(&self.gate);
+        let inner = Arc::clone(&self.inner);
+        let last_summary = Arc::clone(&self.last_summary);
+
+        std::thread::Builder::new()
+            .name("layerstream-node-stream".to_string())
+            .spawn(move || {
+                let _exit_guard = WorkerExitGuard {
+                    shared: Arc::clone(&worker_shared),
+                };
+                let res = (|| -> anyhow::Result<Option<GenerateSummary>> {
+                    let Some(_permit) = gate.acquire_sync(&cancel)? else {
+                        return Ok(None);
+                    };
+                    let mut guard = inner
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
+                    let loaded = guard
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("model has been unloaded"))?;
+                    if opts.max_draft_tokens == 0 {
+                        opts.max_draft_tokens = loaded.default_max_draft_tokens;
+                    }
+                    let summary = loaded.engine.generate_stream_with_cancel(
+                        &prompt,
+                        &opts,
+                        loaded.draft.as_mut(),
+                        Some(&cancel.flag),
+                        |_tok, piece| {
+                            if cancel.is_cancelled() {
+                                return false;
+                            }
+                            if piece.is_empty() {
+                                return true;
+                            }
+                            worker_shared.send_chunk(piece.to_string())
+                        },
+                    )?;
+                    Ok(Some(summary))
+                })();
+
+                worker_shared.finish_producer(res, &last_summary);
+            })
+            .map_err(|e| generic_err(format!("failed to start stream worker thread: {e}")))?;
+
+        Ok(NativeTokenStream { shared })
     }
 
     #[napi]
@@ -1143,8 +1356,10 @@ impl NativeAutoModel {
         add_special: bool,
         parse_special: bool,
     ) -> Result<Vec<i32>> {
+        let permit = self.gate.acquire_async(None).await?;
         let inner = self.inner.clone();
         run_blocking(move || {
+            let _permit = permit;
             let guard = inner
                 .lock()
                 .map_err(|_| generic_err("model lock poisoned"))?;
@@ -1161,8 +1376,10 @@ impl NativeAutoModel {
 
     #[napi]
     pub async fn detokenize(&self, tokens: Vec<i32>) -> Result<String> {
+        let permit = self.gate.acquire_async(None).await?;
         let inner = self.inner.clone();
         run_blocking(move || {
+            let _permit = permit;
             let guard = inner
                 .lock()
                 .map_err(|_| generic_err("model lock poisoned"))?;
@@ -1187,8 +1404,10 @@ impl NativeAutoModel {
                 .map_err(|e| invalid_arg(format!("invalid tools JSON: {e}")))?;
             inject_tools_into_messages(&mut messages, &tools)?;
         }
+        let permit = self.gate.acquire_async(None).await?;
         let inner = self.inner.clone();
         run_blocking(move || {
+            let _permit = permit;
             let guard = inner
                 .lock()
                 .map_err(|_| generic_err("model lock poisoned"))?;
@@ -1205,8 +1424,10 @@ impl NativeAutoModel {
 
     #[napi]
     pub async fn kv_clear(&self) -> Result<()> {
+        let permit = self.gate.acquire_async(None).await?;
         let inner = self.inner.clone();
         run_blocking(move || {
+            let _permit = permit;
             let mut guard = inner
                 .lock()
                 .map_err(|_| generic_err("model lock poisoned"))?;
@@ -1227,8 +1448,10 @@ impl NativeAutoModel {
         if pos_min < 0 {
             return Err(invalid_arg("posMin must be non-negative"));
         }
+        let permit = self.gate.acquire_async(None).await?;
         let inner = self.inner.clone();
         run_blocking(move || {
+            let _permit = permit;
             let mut guard = inner
                 .lock()
                 .map_err(|_| generic_err("model lock poisoned"))?;
@@ -1246,8 +1469,10 @@ impl NativeAutoModel {
 
     #[napi]
     pub async fn stats(&self) -> Result<EngineStatsJs> {
+        let permit = self.gate.acquire_async(None).await?;
         let inner = self.inner.clone();
         run_blocking(move || {
+            let _permit = permit;
             let guard = inner
                 .lock()
                 .map_err(|_| generic_err("model lock poisoned"))?;
@@ -1345,25 +1570,41 @@ impl NativeAutoModel {
 
     #[napi(getter)]
     pub fn last_summary(&self) -> Option<GenerateSummaryJs> {
-        self.inner.lock().ok().and_then(|g| {
-            g.as_ref()
-                .and_then(|l| l.last_summary.as_ref().map(summary_to_js))
-        })
+        self.last_summary.lock().ok().and_then(|g| g.clone())
     }
 
     #[napi]
     pub async fn unload(&self) -> Result<()> {
+        let streams_to_stop: Vec<Arc<StreamShared>> = {
+            let mut active = self
+                .active_streams
+                .lock()
+                .map_err(|_| generic_err("active streams lock poisoned"))?;
+            self.loaded.store(false, Ordering::Release);
+            active.drain(..).filter_map(|weak| weak.upgrade()).collect()
+        };
+        for st in &streams_to_stop {
+            st.cancel_and_disconnect();
+        }
+        for st in &streams_to_stop {
+            st.wait_worker_exited().await;
+        }
+
+        let permit = self.gate.acquire_async(None).await?;
         let inner = self.inner.clone();
-        let loaded = self.loaded.clone();
         let cached_path = self.cached_model_path.clone();
+        let last_summary = self.last_summary.clone();
         run_blocking(move || {
+            let _permit = permit;
             let dropped = {
                 let mut guard = inner
                     .lock()
                     .map_err(|_| generic_err("model lock poisoned"))?;
-                loaded.store(false, Ordering::Release);
                 if let Ok(mut cp) = cached_path.lock() {
                     *cp = None;
+                }
+                if let Ok(mut ls) = last_summary.lock() {
+                    *ls = None;
                 }
                 guard.take()
             };

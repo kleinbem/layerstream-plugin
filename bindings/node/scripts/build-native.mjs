@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkgRoot = path.resolve(__dirname, "..");
+const manifestPath = path.join(pkgRoot, "Cargo.toml");
 
 function detectDefaultTriple() {
   const { platform, arch } = process;
@@ -19,8 +20,7 @@ function detectDefaultTriple() {
 
 const rawArgs = process.argv.slice(2);
 let triple = detectDefaultTriple();
-let profile = "debug";
-const cargoArgs = ["build"];
+const cargoArgs = ["build", "--message-format=json-render-diagnostics"];
 
 for (let i = 0; i < rawArgs.length; i += 1) {
   const arg = rawArgs[i];
@@ -30,9 +30,8 @@ for (let i = 0; i < rawArgs.length; i += 1) {
     }
     triple = rawArgs[i + 1];
     i += 1;
-  } else if (arg === "--release") {
-    profile = "release";
-    cargoArgs.push("--release");
+  } else if (arg === "--message-format" || arg.startsWith("--message-format=")) {
+    throw new Error("--message-format is managed by build-native.mjs");
   } else {
     cargoArgs.push(arg);
   }
@@ -40,27 +39,51 @@ for (let i = 0; i < rawArgs.length; i += 1) {
 
 const res = spawnSync("cargo", cargoArgs, {
   cwd: pkgRoot,
-  stdio: "inherit",
+  stdio: ["inherit", "pipe", "inherit"],
+  encoding: "utf8",
+  maxBuffer: 64 * 1024 * 1024,
   env: process.env,
 });
+if (res.error) {
+  throw res.error;
+}
 if (res.status !== 0) {
   process.exit(res.status ?? 1);
 }
 
-const targetDir = process.env.CARGO_TARGET_DIR
-  ? path.resolve(pkgRoot, process.env.CARGO_TARGET_DIR)
-  : path.join(pkgRoot, "target");
+let builtPath = null;
+for (const line of (res.stdout || "").split("\n")) {
+  const trimmed = line.trim();
+  if (!trimmed) continue;
+  let rec;
+  try {
+    rec = JSON.parse(trimmed);
+  } catch {
+    continue;
+  }
+  if (
+    rec &&
+    rec.reason === "compiler-artifact" &&
+    (rec.manifest_path === manifestPath || rec.target?.name === "layerstream_node") &&
+    Array.isArray(rec.target?.crate_types) &&
+    rec.target.crate_types.includes("cdylib") &&
+    Array.isArray(rec.filenames)
+  ) {
+    const cdylib = rec.filenames.find(
+      (f) =>
+        typeof f === "string" &&
+        (f.endsWith(".so") || f.endsWith(".dylib") || f.endsWith(".dll"))
+    );
+    if (cdylib) {
+      builtPath = cdylib;
+    }
+  }
+}
 
-const libFile =
-  process.platform === "win32"
-    ? "layerstream_node.dll"
-    : process.platform === "darwin"
-      ? "liblayerstream_node.dylib"
-      : "liblayerstream_node.so";
-
-const builtPath = path.join(targetDir, profile, libFile);
-if (!fs.existsSync(builtPath)) {
-  throw new Error(`Expected built cdylib at '${builtPath}', but file was not found`);
+if (!builtPath || !fs.existsSync(builtPath)) {
+  throw new Error(
+    "Cargo succeeded without reporting a built layerstream_node cdylib artifact"
+  );
 }
 
 const destPath = path.join(pkgRoot, `layerstream.${triple}.node`);

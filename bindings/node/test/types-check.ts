@@ -12,11 +12,18 @@ import {
   recommend,
   version,
   type AbortSignalLike,
+  type ChatCompletionStream,
+  type ChatMessageInput,
   type CheckReport,
   type EngineStats,
   type GgufInfo,
   type QuantRecommendation,
 } from "../index.js";
+import OpenAISubpathDefault, {
+  ChatCompletionStream as SubpathChatCompletionStream,
+  CompletionStream as SubpathCompletionStream,
+  OpenAI as SubpathOpenAI,
+} from "../openai.js";
 
 export async function verifyTypesOnly(signal: AbortSignalLike): Promise<void> {
   const v: string = version;
@@ -44,6 +51,23 @@ export async function verifyTypesOnly(signal: AbortSignalLike): Promise<void> {
   void deltas;
   void parsed;
 
+  const validMessages: ChatMessageInput[] = [
+    { role: "user", content: "" },
+    {
+      role: "assistant",
+      tool_calls: [{ function: { name: "ping", arguments: "{}" } }],
+    },
+    {
+      role: "assistant",
+      content: "calling",
+      tool_calls: [{ function: { name: "ping", arguments: { x: 1 } } }],
+    },
+  ];
+
+  // @ts-expect-error ChatMessageInput requires at least one of content or tool_calls
+  const invalidMsg: ChatMessageInput = { role: "user" };
+  void invalidMsg;
+
   await using model = await AutoModel.fromPretrained("/tmp/model.gguf", {
     isolatedWorker: true,
     vramBudgetMb: "auto",
@@ -59,6 +83,19 @@ export async function verifyTypesOnly(signal: AbortSignalLike): Promise<void> {
   void st;
 
   await using client = new OpenAI(model);
+  await using subClient = new OpenAISubpathDefault(model);
+  const subNamed = SubpathOpenAI;
+  void subClient;
+  void subNamed;
+  void SubpathChatCompletionStream;
+  void SubpathCompletionStream;
+
+  const chatStream: ChatCompletionStream = await client.chat.completions.create({
+    messages: validMessages,
+    stream: true,
+  });
+  await chatStream.close();
+
   const chatResp = await client.chat.completions.parse<{ ok: boolean }>({
     messages: [{ role: "user", content: "hi" }],
     response_format: {

@@ -113,12 +113,21 @@ describe("layerstream Node-API SDK", () => {
       assert.ok(tmpl.includes("42"));
 
       assert.equal(typeof (await model.kvTrim(1)), "boolean");
+      await assert.rejects(
+        () => model.kvTrim(4294967296),
+        RangeError
+      );
       await model.kvClear();
 
       const st = await model.stats();
       assert.equal(st.loaded, true);
       assert.equal(st.nLayers, 6);
       assert.equal(st.moeLayers, 2);
+
+      // Unread stream with filled buffer does not block lastSummary or unload()
+      const unreadStream = await model.generate("a b c", { maxTokens: 16, stream: true });
+      void unreadStream;
+      assert.ok(model.lastSummary === null || typeof model.lastSummary.completionTokens === "number");
     } finally {
       await model.unload();
       // Idempotent second unload
@@ -320,8 +329,10 @@ describe("layerstream Node-API SDK", () => {
     assert.ok(formatToolsSystemPrompt(toolsSpec).includes("lookup"));
     assert.throws(() => formatToolsSystemPrompt([1]), TypeError);
 
+    let schemaCalls = 0;
     const mockZodSchema = {
       toJSONSchema() {
+        schemaCalls += 1;
         return {
           type: "object",
           properties: {
@@ -363,8 +374,74 @@ describe("layerstream Node-API SDK", () => {
         response_format: mockZodSchema,
         max_tokens: 96,
       });
+      assert.equal(schemaCalls, 1, "parse() should compile response_format once");
       assert.equal(parsedResp.choices[0].message.parsed.validated, true);
       assert.ok(["alpha", "beta"].includes(parsedResp.choices[0].message.parsed.mode));
+
+      // Primitive and enum raw JSON Schemas in public parse()
+      const primResp = await client.chat.completions.parse({
+        messages: [{ role: "user", content: "a b" }],
+        response_format: { type: "string", maxLength: 4 },
+        max_tokens: 32,
+      });
+      assert.equal(typeof primResp.choices[0].message.parsed, "string");
+      assert.ok(primResp.choices[0].message.parsed.length <= 4);
+
+      const boolResp = await client.chat.completions.parse({
+        messages: [{ role: "user", content: "a b" }],
+        response_format: { type: "boolean" },
+        max_tokens: 16,
+      });
+      assert.equal(typeof boolResp.choices[0].message.parsed, "boolean");
+
+      const enumResp = await client.chat.completions.parse({
+        messages: [{ role: "user", content: "a b" }],
+        response_format: { enum: ["alpha", "beta"] },
+        max_tokens: 32,
+      });
+      assert.ok(["alpha", "beta"].includes(enumResp.choices[0].message.parsed));
+
+      // json_schema wrapper without explicit schema fails closed
+      await assert.rejects(
+        () =>
+          client.chat.completions.parse({
+            messages: [{ role: "user", content: "a b" }],
+            response_format: { type: "json_schema", json_schema: { name: "missing" } },
+            max_tokens: 8,
+          }),
+        RangeError
+      );
+
+      // Abort inside toJSONSchema() is observed before inference starts
+      const prepAbortCtrl = new AbortController();
+      await assert.rejects(
+        () =>
+          client.chat.completions.parse({
+            messages: [{ role: "user", content: "a b" }],
+            response_format: {
+              toJSONSchema() {
+                prepAbortCtrl.abort();
+                return { type: "boolean" };
+              },
+            },
+            signal: prepAbortCtrl.signal,
+            max_tokens: 8,
+          }),
+        (err) => err.name === "AbortError"
+      );
+
+      // Explicit close before first read emits zero chunks (no queued role chunk)
+      const closedEarly = await client.chat.completions.create({
+        messages: [{ role: "user", content: "a b" }],
+        max_tokens: 6,
+        stream: true,
+      });
+      await closedEarly.close();
+      const afterClose = [];
+      for await (const ch of closedEarly) {
+        afterClose.push(ch);
+      }
+      assert.equal(afterClose.length, 0);
 
       const chatStream = await client.chat.completions.create({
         messages: [{ role: "user", content: "a b" }],
@@ -394,6 +471,47 @@ describe("layerstream Node-API SDK", () => {
       assert.ok(compChunks.join("").length > 0);
     } finally {
       await client.close();
+    }
+
+    // Retry after failed initial load + pre-aborted call skips model load
+    const delayedGguf = path.join(tmpDir, "delayed-init.gguf");
+    const retryClient = new OpenAI(delayedGguf, {
+      useGpu: false,
+      ctxSize: 256,
+      batchSize: 64,
+      vramBudgetMb: 0,
+      preferDirectIo: false,
+    });
+    try {
+      const preAborted = new AbortController();
+      preAborted.abort();
+      await assert.rejects(
+        () =>
+          retryClient.chat.completions.create({
+            messages: [{ role: "user", content: "hi" }],
+            signal: preAborted.signal,
+          }),
+        (err) => err.name === "AbortError"
+      );
+      await assert.rejects(
+        () =>
+          retryClient.chat.completions.create({
+            messages: [{ role: "user", content: "hi" }],
+            max_tokens: 2,
+          }),
+        (err) => err.code === "ENOENT"
+      );
+      fs.copyFileSync(syntheticGguf, delayedGguf);
+      const [c1, c2] = await Promise.all([
+        retryClient.completions.create({ prompt: "a b", max_tokens: 2 }),
+        retryClient.completions.create({ prompt: "a b", max_tokens: 2 }),
+      ]);
+      assert.equal(c1.object, "text_completion");
+      assert.equal(c2.object, "text_completion");
+      const listed = await retryClient.models.list();
+      assert.equal(listed.data.length, 1);
+    } finally {
+      await retryClient.close();
     }
   });
 

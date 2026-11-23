@@ -32,7 +32,7 @@
       "require": "./index.js"
     },
     "./openai": {
-      "types": "./index.d.ts",
+      "types": "./openai.d.ts",
       "import": "./openai.mjs",
       "require": "./openai.js"
     }
@@ -43,6 +43,7 @@
     "index.d.ts",
     "openai.js",
     "openai.mjs",
+    "openai.d.ts",
     "native.js",
     "worker.js",
     "layerstream.*.node",

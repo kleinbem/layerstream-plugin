@@ -153,14 +153,17 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            manylinux: "2_28"
+            container: "2_28"
+            manylinux: "2_31"
             args: "--locked --release --out dist"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            manylinux: "2_28"
+            container: "2_28"
+            manylinux: "2_31"
             args: "--locked --release --out dist"
           - os: macos-15
             target: aarch64-apple-darwin
+            container: ""
             manylinux: ""
             args: "--locked --release --out dist --features metal"
 
@@ -187,6 +190,7 @@ jobs:
         with:
           command: build
           working-directory: bindings/python
+          container: ${{ matrix.container }}
           manylinux: ${{ matrix.manylinux }}
           before-script-linux: dnf install -y cmake ninja-build
           args: ${{ matrix.args }}
@@ -198,6 +202,9 @@ jobs:
       - name: Verify PyPI wheel tag, metadata, pytest, and SHA-256
         working-directory: bindings/python
         run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo chown -R "$(id -u):$(id -g)" dist
+          fi
           python -m pip install --upgrade pip pytest twine
           python -m twine check --strict dist/*.whl
           for whl in dist/*.whl; do
@@ -345,8 +352,9 @@ jobs:
             --generate-notes
 
   publish-pypi:
-    if: startsWith(github.ref, 'refs/tags/v') && vars.PYPI_PUBLISH == 'true'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs:
+      - build
       - build-wheels
     runs-on: ubuntu-latest
     environment: pypi
@@ -354,17 +362,25 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Check PyPI opt-in variable
+        if: vars.PYPI_PUBLISH != 'true'
+        run: |
+          echo "Skipping PyPI upload because vars.PYPI_PUBLISH is not set to 'true' in repository, org, or pypi environment."
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: vars.PYPI_PUBLISH == 'true'
         with:
           pattern: layerstream-python-*
           path: pypi-dist
           merge-multiple: true
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        if: vars.PYPI_PUBLISH == 'true'
         with:
           python-version: "3.12"
 
       - name: Publish wheels to PyPI via Trusted Publishing (OIDC)
+        if: vars.PYPI_PUBLISH == 'true'
         run: |
           python -m pip install --upgrade pip twine
           python -m twine check --strict pypi-dist/*.whl

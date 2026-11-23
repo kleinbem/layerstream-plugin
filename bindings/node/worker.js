@@ -3,7 +3,6 @@
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const net = require("node:net");
-const path = require("node:path");
 const readline = require("node:readline");
 
 function sendJsonLine(sock, obj) {
@@ -35,6 +34,7 @@ class WorkerState {
     this.modelPath = null;
     this.lastSummary = null;
     this.shuttingDown = false;
+    this._exitPromise = null;
   }
 }
 
@@ -50,7 +50,7 @@ function failAllPending(state, message) {
   }
   state.pendingRpc.clear();
   for (const streamQueue of state.activeStreams.values()) {
-    streamQueue.push(errPayload);
+    streamQueue.terminate(errPayload);
   }
   state.activeStreams.clear();
 }
@@ -89,56 +89,131 @@ async function shutdownWorkerState(state) {
       }
     } catch {}
 
-    state._exitPromise = new Promise((resolve) => {
+    state._exitPromise = new Promise((resolve, reject) => {
       if (proc.exitCode !== null || proc.signalCode !== null) {
         resolve();
         return;
       }
-      const killTimer = setTimeout(() => {
+
+      let termTimer = null;
+      let killTimer = null;
+      let reapDeadline = null;
+
+      const clearTimers = () => {
+        if (termTimer) clearTimeout(termTimer);
+        if (killTimer) clearTimeout(killTimer);
+        if (reapDeadline) clearTimeout(reapDeadline);
+      };
+
+      const onExit = () => {
+        clearTimers();
+        proc.removeListener("error", onError);
+        resolve();
+      };
+
+      const onError = (err) => {
+        clearTimers();
+        proc.removeListener("exit", onExit);
+        if (proc.exitCode !== null || proc.signalCode !== null) {
+          resolve();
+        } else {
+          reject(new Error(`failed to shut down isolated worker: ${err.message}`));
+        }
+      };
+
+      proc.once("exit", onExit);
+      proc.once("error", onError);
+
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        onExit();
+        return;
+      }
+
+      termTimer = setTimeout(() => {
         try {
-          proc.kill("SIGTERM");
+          if (proc.exitCode === null && proc.signalCode === null) {
+            proc.kill("SIGTERM");
+          }
         } catch {}
-        setTimeout(() => {
+
+        killTimer = setTimeout(() => {
           try {
             if (proc.exitCode === null && proc.signalCode === null) {
               proc.kill("SIGKILL");
             }
           } catch {}
-          resolve();
-        }, 1000).unref();
+
+          reapDeadline = setTimeout(() => {
+            proc.removeListener("exit", onExit);
+            proc.removeListener("error", onError);
+            if (proc.exitCode !== null || proc.signalCode !== null) {
+              resolve();
+            } else {
+              reject(new Error("isolated worker did not exit after SIGKILL"));
+            }
+          }, 5000);
+          reapDeadline.unref();
+        }, 1000);
+        killTimer.unref();
       }, 2000);
-      killTimer.unref();
-      proc.once("exit", () => {
-        clearTimeout(killTimer);
-        resolve();
-      });
+      termTimer.unref();
     });
+
     await state._exitPromise;
   }
 }
 
 const workerFinalizer = new FinalizationRegistry((state) => {
-  void shutdownWorkerState(state);
+  void shutdownWorkerState(state).catch(() => {});
 });
 
 class EventQueue {
   constructor() {
     this._items = [];
     this._waiters = [];
+    this._terminal = null;
   }
 
   push(item) {
+    if (this._terminal) {
+      return;
+    }
+    const isTerminal =
+      item !== null &&
+      typeof item === "object" &&
+      (item.event === "done" || item.event === "error");
+    if (isTerminal) {
+      this._terminal = item;
+    }
     const waiter = this._waiters.shift();
     if (waiter) {
       waiter(item);
+      if (isTerminal) {
+        while (this._waiters.length > 0) {
+          this._waiters.shift()(item);
+        }
+      }
     } else {
       this._items.push(item);
+    }
+  }
+
+  terminate(item) {
+    if (this._terminal) {
+      return;
+    }
+    this._terminal = item;
+    while (this._waiters.length > 0) {
+      this._waiters.shift()(item);
     }
   }
 
   shift() {
     if (this._items.length > 0) {
       return Promise.resolve(this._items.shift());
+    }
+    if (this._terminal) {
+      return Promise.resolve(this._terminal);
     }
     return new Promise((resolve) => {
       this._waiters.push(resolve);
@@ -195,13 +270,13 @@ class WorkerTokenStream {
       this._done = true;
       this._summary = msg.summary ?? null;
       this._client = null;
-      client._finishStream(this._reqId, msg.summary ?? null);
+      client._finishStream(this._reqId);
       return null;
     }
     if (msg.event === "error") {
       this._done = true;
       this._client = null;
-      client._finishStream(this._reqId, null);
+      client._finishStream(this._reqId);
       throw reviveWorkerError(msg.errType, msg.message || "worker stream failed");
     }
     return null;
@@ -209,6 +284,22 @@ class WorkerTokenStream {
 }
 
 function attachSocketReader(state, rl) {
+  let tornDown = false;
+  const onTransportDown = (err) => {
+    if (tornDown) return;
+    tornDown = true;
+    state.loaded = false;
+    const reason =
+      err instanceof Error && err.message
+        ? `isolated worker transport error: ${err.message}`
+        : "isolated worker exited";
+    failAllPending(state, reason);
+    try {
+      rl.close();
+    } catch {}
+    void shutdownWorkerState(state).catch(() => {});
+  };
+
   rl.on("line", (line) => {
     if (!line) return;
     let msg;
@@ -220,6 +311,14 @@ function attachSocketReader(state, rl) {
     const reqId = Number(msg.id);
     const streamQ = state.activeStreams.get(reqId);
     if (streamQ) {
+      if (msg.event === "done") {
+        state.activeStreams.delete(reqId);
+        if (msg.summary) {
+          state.lastSummary = { ...msg.summary };
+        }
+      } else if (msg.event === "error") {
+        state.activeStreams.delete(reqId);
+      }
       streamQ.push(msg);
       return;
     }
@@ -230,11 +329,11 @@ function attachSocketReader(state, rl) {
     }
   });
 
-  const onClose = () => {
-    state.loaded = false;
-    failAllPending(state, "isolated worker exited");
-  };
-  rl.on("close", onClose);
+  rl.on("error", onTransportDown);
+  rl.on("close", () => onTransportDown(null));
+  if (state.sock) {
+    state.sock.on("error", onTransportDown);
+  }
 }
 
 class IsolatedWorkerClient {
@@ -256,71 +355,138 @@ class IsolatedWorkerClient {
 
     let proc = null;
     let conn = null;
-    try {
-      const connPromise = new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          reject(new Error("timed out waiting for isolated worker connection"));
-        }, 30000);
-        timer.unref();
-        server.once("connection", (socket) => {
-          clearTimeout(timer);
-          resolve(socket);
-        });
-        server.once("error", (err) => {
-          clearTimeout(timer);
-          reject(err);
-        });
-      });
+    let rl = null;
+    let startupTimer = null;
 
-      proc = spawn(process.execPath, [__filename, "--worker-port", String(port)], {
-        stdio: ["pipe", "ignore", "inherit"],
-        env: { ...process.env },
-      });
-      proc.stdin.write(token + "\n");
-
-      conn = await connPromise;
-      conn.setNoDelay(true);
-    } catch (err) {
-      if (conn) conn.destroy();
-      if (proc) {
+    const cleanupStartup = async (stateOrNull) => {
+      if (startupTimer) {
+        clearTimeout(startupTimer);
+        startupTimer = null;
+      }
+      try {
+        server.close();
+      } catch {}
+      if (rl) {
         try {
-          proc.kill("SIGKILL");
+          rl.close();
         } catch {}
       }
-      throw new Error(`failed to start isolated layerstream worker: ${err.message}`);
-    } finally {
-      server.close();
-    }
+      if (stateOrNull) {
+        await shutdownWorkerState(stateOrNull).catch(() => {});
+      } else {
+        const tempState = new WorkerState(proc, conn);
+        await shutdownWorkerState(tempState).catch(() => {});
+      }
+    };
 
-    const state = new WorkerState(proc, conn);
-    const rl = readline.createInterface({ input: conn, crlfDelay: Infinity });
-
-    const firstLine = await new Promise((resolve, reject) => {
-      const onLine = (l) => {
-        rl.removeListener("close", onClose);
-        resolve(l);
-      };
-      const onClose = () => {
-        rl.removeListener("line", onLine);
-        reject(new Error("isolated worker exited before handshake"));
-      };
-      rl.once("line", onLine);
-      rl.once("close", onClose);
-    });
-
-    let hello;
+    let state = null;
     try {
-      hello = JSON.parse(firstLine);
-    } catch {
-      await shutdownWorkerState(state);
-      throw new Error("invalid handshake from isolated worker");
-    }
-    if (!hello || hello.token !== token) {
-      await shutdownWorkerState(state);
-      throw new Error("isolated layerstream worker failed authentication handshake");
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        const fail = (err) => {
+          if (settled) return;
+          settled = true;
+          reject(err);
+        };
+
+        startupTimer = setTimeout(() => {
+          fail(new Error("timed out waiting for isolated worker handshake"));
+        }, 30000);
+        startupTimer.unref();
+
+        server.once("error", (err) => {
+          fail(err);
+        });
+
+        server.once("connection", (socket) => {
+          if (settled) {
+            socket.destroy();
+            return;
+          }
+          conn = socket;
+          conn.setNoDelay(true);
+          conn.on("error", (err) => fail(err));
+          try {
+            server.close();
+          } catch {}
+
+          rl = readline.createInterface({ input: conn, crlfDelay: Infinity });
+          const onHandshakeErr = (err) => fail(err);
+          const onHandshakeClose = () => {
+            fail(new Error("isolated worker exited before handshake"));
+          };
+          const onHandshakeLine = (firstLine) => {
+            rl.removeListener("error", onHandshakeErr);
+            rl.removeListener("close", onHandshakeClose);
+            let hello;
+            try {
+              hello = JSON.parse(firstLine);
+            } catch {
+              fail(new Error("invalid handshake from isolated worker"));
+              return;
+            }
+            if (!hello || hello.token !== token) {
+              fail(new Error("isolated layerstream worker failed authentication handshake"));
+              return;
+            }
+            if (!settled) {
+              settled = true;
+              resolve();
+            }
+          };
+
+          rl.once("error", onHandshakeErr);
+          rl.once("close", onHandshakeClose);
+          rl.once("line", onHandshakeLine);
+        });
+
+        proc = spawn(process.execPath, [__filename, "--worker-port", String(port)], {
+          stdio: ["pipe", "ignore", "inherit"],
+          env: { ...process.env },
+        });
+
+        const onEarlyProcError = (err) => {
+          fail(err);
+        };
+        const onEarlyProcExit = (code, sig) => {
+          fail(
+            new Error(
+              `isolated worker exited before handshake (code=${code ?? "null"}, signal=${sig ?? "null"})`
+            )
+          );
+        };
+
+        proc.once("error", onEarlyProcError);
+        proc.once("exit", onEarlyProcExit);
+        if (proc.stdin) {
+          proc.stdin.on("error", () => {});
+          proc.stdin.write(token + "\n");
+        }
+      });
+
+      clearTimeout(startupTimer);
+      startupTimer = null;
+
+      // Remove startup-only listeners on proc/conn before attaching steady-state reader.
+      proc.removeAllListeners("error");
+      proc.removeAllListeners("exit");
+      proc.on("error", () => {});
+      conn.removeAllListeners("error");
+
+      state = new WorkerState(proc, conn);
+      attachSocketReader(state, rl);
+    } catch (err) {
+      await cleanupStartup(state);
+      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        msg.includes("handshake") ||
+        msg.startsWith("failed to start isolated layerstream worker:")
+      ) {
+        throw new Error(msg);
+      }
+      throw new Error(`failed to start isolated layerstream worker: ${msg}`);
     }
 
-    attachSocketReader(state, rl);
     const client = new IsolatedWorkerClient(state);
 
     try {
@@ -421,33 +587,37 @@ class IsolatedWorkerClient {
   async _cancelStreamAndDrain(reqId, evQ) {
     const state = this._state;
     if (!state.activeStreams.has(reqId) || !state.sock || state.sock.destroyed) {
+      evQ.terminate({ id: reqId, event: "done", summary: null });
       state.activeStreams.delete(reqId);
       return null;
     }
     this._sendCancelFireAndForget(reqId);
     let captured = null;
-    const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 2000).unref());
+    let timer = null;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), 2000);
+      timer.unref();
+    });
     try {
-      while (state.activeStreams.has(reqId)) {
+      while (true) {
         const msg = await Promise.race([evQ.shift(), timeout]);
         if (!msg) break;
         if (msg.event === "done" || msg.event === "error") {
           captured = msg.summary ? { ...msg.summary } : null;
-          this._finishStream(reqId, captured);
+          this._finishStream(reqId);
           break;
         }
       }
     } finally {
+      if (timer) clearTimeout(timer);
+      evQ.terminate({ id: reqId, event: "done", summary: captured });
       state.activeStreams.delete(reqId);
     }
     return captured;
   }
 
-  _finishStream(reqId, summary) {
+  _finishStream(reqId) {
     this._state.activeStreams.delete(reqId);
-    if (summary) {
-      this._state.lastSummary = { ...summary };
-    }
   }
 
   get isLoaded() {
@@ -495,6 +665,7 @@ async function runChildWorkerMain(port) {
   const native = require("./native.js");
 
   const stdinRl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  stdinRl.on("error", () => {});
   const token = await new Promise((resolve) => {
     stdinRl.once("line", (l) => resolve(l.trim()));
     stdinRl.once("close", () => resolve(""));
@@ -513,8 +684,10 @@ async function runChildWorkerMain(port) {
     sock.once("error", reject);
   });
   sock.setNoDelay(true);
+  sock.on("error", () => process.exit(0));
   sendJsonLine(sock, { token });
 
+  const outstandingIds = new Set();
   const cancelledIds = new Set();
   const activeCancels = new Map();
   const workQueue = new EventQueue();
@@ -524,7 +697,7 @@ async function runChildWorkerMain(port) {
   const engineLoop = (async () => {
     while (true) {
       const cmd = await workQueue.shift();
-      if (cmd === null) {
+      if (cmd === null || (cmd && cmd.event === "done")) {
         if (model) {
           try {
             await model.unload();
@@ -538,17 +711,16 @@ async function runChildWorkerMain(port) {
       const op = String(cmd.op);
       const params = cmd.params || {};
 
-      if (cancelledIds.has(reqId)) {
-        cancelledIds.delete(reqId);
-        if (op === "generate_stream" || op === "chat_stream") {
-          sendJsonLine(sock, { id: reqId, event: "done", summary: null });
-        } else {
-          sendJsonLine(sock, { id: reqId, ok: true, result: {}, summary: null });
-        }
-        continue;
-      }
-
       try {
+        if (cancelledIds.has(reqId)) {
+          if (op === "generate_stream" || op === "chat_stream") {
+            sendJsonLine(sock, { id: reqId, event: "done", summary: null });
+          } else {
+            sendJsonLine(sock, { id: reqId, ok: true, result: {}, summary: null });
+          }
+          continue;
+        }
+
         if (op === "open") {
           model = await native.NativeAutoModel.open(
             params.model,
@@ -593,43 +765,44 @@ async function runChildWorkerMain(port) {
           if (cancelledIds.has(reqId)) {
             cancelTok.cancel();
           }
-          try {
-            if (op === "generate") {
-              const out = await model.generateWithSummary(
-                params.prompt,
-                JSON.stringify(params.wire || {}),
-                cancelTok
-              );
-              sendJsonLine(sock, {
-                id: reqId,
-                ok: true,
-                result: { text: out.text },
-                summary: out.summary,
-              });
-            } else {
-              const out = await model.chatWithSummary(
-                JSON.stringify(params.messages),
-                JSON.stringify(params.wire || {}),
-                cancelTok
-              );
-              sendJsonLine(sock, {
-                id: reqId,
-                ok: true,
-                result: { text: out.text, parsed: out.parsed ?? null },
-                summary: out.summary,
-              });
-            }
-          } finally {
-            activeCancels.delete(reqId);
-            cancelledIds.delete(reqId);
+          if (op === "generate") {
+            const out = await model.generateWithSummary(
+              params.prompt,
+              JSON.stringify(params.wire || {}),
+              cancelTok
+            );
+            sendJsonLine(sock, {
+              id: reqId,
+              ok: true,
+              result: { text: out.text },
+              summary: out.summary,
+            });
+          } else {
+            const out = await model.chatWithSummary(
+              JSON.stringify(params.messages),
+              JSON.stringify(params.wire || {}),
+              cancelTok
+            );
+            sendJsonLine(sock, {
+              id: reqId,
+              ok: true,
+              result: { text: out.text, parsed: out.parsed ?? null },
+              summary: out.summary,
+            });
           }
         } else if (op === "generate_stream" || op === "chat_stream") {
+          const cancelTok = new native.NativeCancelToken();
+          activeCancels.set(reqId, () => cancelTok.cancel());
+          if (cancelledIds.has(reqId)) {
+            cancelTok.cancel();
+          }
           const stream =
             op === "generate_stream"
               ? model.generateStream(params.prompt, JSON.stringify(params.wire || {}))
               : await model.chatStream(
                   JSON.stringify(params.messages),
-                  JSON.stringify(params.wire || {})
+                  JSON.stringify(params.wire || {}),
+                  cancelTok
                 );
           activeCancels.set(reqId, () => stream.cancel());
           if (cancelledIds.has(reqId)) {
@@ -648,8 +821,6 @@ async function runChildWorkerMain(port) {
               sendJsonLine(sock, { id: reqId, event: "chunk", text: piece });
             }
           } finally {
-            activeCancels.delete(reqId);
-            cancelledIds.delete(reqId);
             await stream.close();
           }
           sendJsonLine(sock, {
@@ -672,11 +843,16 @@ async function runChildWorkerMain(port) {
             sendJsonLine(sock, { id: reqId, ok: false, errType, message });
           } catch {}
         }
+      } finally {
+        activeCancels.delete(reqId);
+        cancelledIds.delete(reqId);
+        outstandingIds.delete(reqId);
       }
     }
   })();
 
   const sockRl = readline.createInterface({ input: sock, crlfDelay: Infinity });
+  sockRl.on("error", () => {});
   for await (const line of sockRl) {
     if (!line) continue;
     let msg;
@@ -690,15 +866,18 @@ async function runChildWorkerMain(port) {
     }
     if (msg.op === "cancel") {
       const targetId = Number(msg.params?.targetId);
-      cancelledIds.add(targetId);
-      const cancelFn = activeCancels.get(targetId);
-      if (cancelFn) {
-        try {
-          cancelFn();
-        } catch {}
+      if (outstandingIds.has(targetId)) {
+        cancelledIds.add(targetId);
+        const cancelFn = activeCancels.get(targetId);
+        if (cancelFn) {
+          try {
+            cancelFn();
+          } catch {}
+        }
       }
       continue;
     }
+    outstandingIds.add(Number(msg.id));
     workQueue.push(msg);
   }
 

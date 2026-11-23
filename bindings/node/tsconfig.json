@@ -10,6 +10,7 @@
   },
   "include": [
     "index.d.ts",
+    "openai.d.ts",
     "test/types-check.ts"
   ]
 }

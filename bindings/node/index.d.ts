@@ -191,17 +191,32 @@ export interface GenerateOptions {
   signal?: AbortSignalLike;
 }
 
-export interface ChatMessageInput {
+export type ChatMessageContent =
+  | string
+  | Array<string | { type?: string; text: string }>
+  | null;
+
+export interface ChatMessageToolCallInput {
+  id?: string;
+  type?: string;
+  function: { name: string; arguments: string | Record<string, unknown> };
+}
+
+interface ChatMessageBase {
   role: "system" | "user" | "assistant" | "tool" | string;
-  content?: string | Array<string | { type?: string; text: string }> | null;
-  tool_calls?: Array<{
-    id?: string;
-    type?: string;
-    function: { name: string; arguments: string | Record<string, unknown> };
-  }> | null;
   name?: string | null;
   tool_call_id?: string | null;
 }
+
+export type ChatMessageInput =
+  | (ChatMessageBase & {
+      content: ChatMessageContent;
+      tool_calls?: ChatMessageToolCallInput[] | null;
+    })
+  | (ChatMessageBase & {
+      content?: ChatMessageContent;
+      tool_calls: ChatMessageToolCallInput[] | null;
+    });
 
 export interface ChatOptions extends GenerateOptions {
   addGenerationPrompt?: boolean;
@@ -367,17 +382,17 @@ export interface OpenAICompletion {
   usage: CompletionUsage | null;
 }
 
-export declare class ChatCompletionStream
-  implements AsyncIterable<OpenAIChatCompletionChunk>, AsyncDisposable
-{
+export interface ChatCompletionStream
+  extends AsyncIterable<OpenAIChatCompletionChunk>,
+    AsyncDisposable {
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
   [Symbol.asyncIterator](): AsyncIterator<OpenAIChatCompletionChunk>;
 }
 
-export declare class CompletionStream
-  implements AsyncIterable<OpenAICompletion>, AsyncDisposable
-{
+export interface CompletionStream
+  extends AsyncIterable<OpenAICompletion>,
+    AsyncDisposable {
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
   [Symbol.asyncIterator](): AsyncIterator<OpenAICompletion>;
@@ -389,11 +404,13 @@ export type ResponseFormatSpec<T = unknown> =
   | { type: "gbnf"; grammar: string }
   | {
       type: "json_schema";
-      json_schema?: { name?: string; schema: Record<string, unknown>; parse?: (v: unknown) => T };
-      schema?: Record<string, unknown>;
+      json_schema?: { name?: string; schema: Record<string, unknown> | boolean; parse?: (v: unknown) => T };
+      schema?: Record<string, unknown> | boolean;
+      parse?: (v: unknown) => T;
     }
   | SchemaWithToJsonSchema<T>
-  | Record<string, unknown>;
+  | Record<string, unknown>
+  | boolean;
 
 export interface OpenAIChatCreateParams {
   model?: string;

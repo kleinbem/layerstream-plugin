@@ -1,10 +1,11 @@
 "use strict";
 
 const native = require("./native.js");
-const { IsolatedWorkerClient, WorkerTokenStream } = require("./worker.js");
+const { IsolatedWorkerClient } = require("./worker.js");
 const { OpenAI } = require("./openai.js");
 
 const ASYNC_DISPOSE = Symbol.asyncDispose || Symbol.for("nodejs.dispose.async");
+const MAX_I32 = 2147483647;
 
 function createAbortError(signal) {
   if (signal && signal.reason instanceof Error) {
@@ -16,11 +17,19 @@ function createAbortError(signal) {
   return err;
 }
 
-function mapNativeError(err) {
-  if (err instanceof Error && typeof err.message === "string" && err.message.startsWith("ENOENT: ")) {
-    const e = new Error(err.message.slice("ENOENT: ".length));
-    e.code = "ENOENT";
-    return e;
+function mapNativeError(err, signal = undefined) {
+  if (signal && signal.aborted) {
+    return createAbortError(signal);
+  }
+  if (err instanceof Error && typeof err.message === "string") {
+    if (err.message.startsWith("ABORT_ERR:")) {
+      return createAbortError(signal);
+    }
+    if (err.message.startsWith("ENOENT: ")) {
+      const e = new Error(err.message.slice("ENOENT: ".length));
+      e.code = "ENOENT";
+      return e;
+    }
   }
   return err;
 }
@@ -303,7 +312,7 @@ class TokenStream {
           return { done: false, value: chunk };
         } catch (err) {
           await this.close();
-          throw mapNativeError(err);
+          throw mapNativeError(err, this._signal);
         }
       },
       return: async () => {
@@ -374,21 +383,28 @@ class AutoModel {
     if (typeof prompt !== "string") {
       throw new TypeError("prompt must be a string");
     }
+    if (!isPlainObject(opts)) {
+      throw new TypeError("generation options must be an object");
+    }
     const signal = opts.signal;
     if (signal && signal.aborted) {
       throw createAbortError(signal);
     }
     const stream = Boolean(opts.stream ?? false);
-    const wire = this._buildGenWire(opts, false);
 
     if (stream) {
+      const wire = this._buildGenWire(opts, false);
+      const wireJson = JSON.stringify(wire);
+      if (signal && signal.aborted) {
+        throw createAbortError(signal);
+      }
       try {
         const inner = this._isolated
           ? this._backend.startStream("generate_stream", { prompt, wire })
-          : this._backend.generateStream(prompt, JSON.stringify(wire));
+          : this._backend.generateStream(prompt, wireJson);
         return new TokenStream(inner, signal);
       } catch (err) {
-        throw mapNativeError(err);
+        throw mapNativeError(err, signal);
       }
     }
 
@@ -400,11 +416,18 @@ class AutoModel {
     if (typeof prompt !== "string") {
       throw new TypeError("prompt must be a string");
     }
+    if (!isPlainObject(opts)) {
+      throw new TypeError("generation options must be an object");
+    }
     const signal = opts.signal;
     if (signal && signal.aborted) {
       throw createAbortError(signal);
     }
     const wire = this._buildGenWire(opts, false);
+    const wireJson = JSON.stringify(wire);
+    if (signal && signal.aborted) {
+      throw createAbortError(signal);
+    }
 
     if (this._isolated) {
       const { result, summary } = await this._backend.rpcWithSummary(
@@ -422,22 +445,20 @@ class AutoModel {
     const onAbort = cancelTok ? () => cancelTok.cancel() : null;
     if (signal && onAbort) {
       signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        signal.removeEventListener("abort", onAbort);
+        cancelTok.cancel();
+        throw createAbortError(signal);
+      }
     }
     try {
-      const out = await this._backend.generateWithSummary(
-        prompt,
-        JSON.stringify(wire),
-        cancelTok
-      );
+      const out = await this._backend.generateWithSummary(prompt, wireJson, cancelTok);
       if (signal && signal.aborted) {
         throw createAbortError(signal);
       }
       return { text: out.text, summary: out.summary };
     } catch (err) {
-      if (signal && signal.aborted) {
-        throw createAbortError(signal);
-      }
-      throw mapNativeError(err);
+      throw mapNativeError(err, signal);
     } finally {
       if (signal && onAbort) {
         signal.removeEventListener("abort", onAbort);
@@ -447,29 +468,87 @@ class AutoModel {
 
   async chat(messages, opts = {}) {
     const cleanMessages = validateMessages(messages);
+    if (!isPlainObject(opts)) {
+      throw new TypeError("generation options must be an object");
+    }
     const signal = opts.signal;
     if (signal && signal.aborted) {
       throw createAbortError(signal);
     }
     const stream = Boolean(opts.stream ?? false);
-    const wire = this._buildGenWire(opts, true);
-    if (stream && wire.parseOutput) {
-      throw new RangeError(
-        "parseOutput=true cannot be combined with stream=true (use StreamTagParser or OpenAI)"
-      );
-    }
 
     if (stream) {
+      const wire = this._buildGenWire(opts, true);
+      if (wire.parseOutput) {
+        throw new RangeError(
+          "parseOutput=true cannot be combined with stream=true (use StreamTagParser or OpenAI)"
+        );
+      }
+      const messagesJson = JSON.stringify(cleanMessages);
+      const wireJson = JSON.stringify(wire);
+      if (signal && signal.aborted) {
+        throw createAbortError(signal);
+      }
+
+      if (this._isolated) {
+        try {
+          const inner = this._backend.startStream("chat_stream", {
+            messages: cleanMessages,
+            wire,
+          });
+          return new TokenStream(inner, signal);
+        } catch (err) {
+          throw mapNativeError(err, signal);
+        }
+      }
+
+      const cancelTok = signal ? new native.NativeCancelToken() : undefined;
+      let abortReject = null;
+      const onAbort = signal
+        ? () => {
+            if (cancelTok) cancelTok.cancel();
+            if (abortReject) abortReject(createAbortError(signal));
+          }
+        : null;
+      const abortPromise =
+        signal && onAbort
+          ? new Promise((_resolve, reject) => {
+              abortReject = reject;
+              signal.addEventListener("abort", onAbort, { once: true });
+              if (signal.aborted) {
+                if (cancelTok) cancelTok.cancel();
+                reject(createAbortError(signal));
+              }
+            })
+          : null;
+
       try {
-        const inner = this._isolated
-          ? this._backend.startStream("chat_stream", { messages: cleanMessages, wire })
-          : await this._backend.chatStream(
-              JSON.stringify(cleanMessages),
-              JSON.stringify(wire)
-            );
+        const startPromise = this._backend.chatStream(messagesJson, wireJson, cancelTok);
+        let inner;
+        if (abortPromise) {
+          startPromise.then(
+            (lateStream) => {
+              if (signal.aborted && lateStream) {
+                void lateStream.close().catch(() => {});
+              }
+            },
+            () => {}
+          );
+          inner = await Promise.race([startPromise, abortPromise]);
+        } else {
+          inner = await startPromise;
+        }
+        if (signal && signal.aborted) {
+          await inner.close();
+          throw createAbortError(signal);
+        }
         return new TokenStream(inner, signal);
       } catch (err) {
-        throw mapNativeError(err);
+        throw mapNativeError(err, signal);
+      } finally {
+        if (signal && onAbort) {
+          signal.removeEventListener("abort", onAbort);
+        }
       }
     }
 
@@ -479,11 +558,19 @@ class AutoModel {
 
   async _chatWithSummary(messages, opts = {}, alreadyValidated = false) {
     const cleanMessages = alreadyValidated ? messages : validateMessages(messages);
+    if (!isPlainObject(opts)) {
+      throw new TypeError("generation options must be an object");
+    }
     const signal = opts.signal;
     if (signal && signal.aborted) {
       throw createAbortError(signal);
     }
     const wire = this._buildGenWire(opts, true);
+    const messagesJson = JSON.stringify(cleanMessages);
+    const wireJson = JSON.stringify(wire);
+    if (signal && signal.aborted) {
+      throw createAbortError(signal);
+    }
 
     if (this._isolated) {
       const { result, summary } = await this._backend.rpcWithSummary(
@@ -502,23 +589,21 @@ class AutoModel {
     const onAbort = cancelTok ? () => cancelTok.cancel() : null;
     if (signal && onAbort) {
       signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        signal.removeEventListener("abort", onAbort);
+        cancelTok.cancel();
+        throw createAbortError(signal);
+      }
     }
     try {
-      const out = await this._backend.chatWithSummary(
-        JSON.stringify(cleanMessages),
-        JSON.stringify(wire),
-        cancelTok
-      );
+      const out = await this._backend.chatWithSummary(messagesJson, wireJson, cancelTok);
       if (signal && signal.aborted) {
         throw createAbortError(signal);
       }
       const payload = wire.parseOutput ? out.parsed : out.text;
       return { payload, summary: out.summary };
     } catch (err) {
-      if (signal && signal.aborted) {
-        throw createAbortError(signal);
-      }
-      throw mapNativeError(err);
+      throw mapNativeError(err, signal);
     } finally {
       if (signal && onAbort) {
         signal.removeEventListener("abort", onAbort);
@@ -598,8 +683,8 @@ class AutoModel {
   }
 
   async kvTrim(posMin) {
-    if (!Number.isInteger(posMin) || posMin < 0) {
-      throw new RangeError("posMin must be a non-negative integer");
+    if (!Number.isInteger(posMin) || posMin < 0 || posMin > MAX_I32) {
+      throw new RangeError("posMin must be a non-negative 32-bit integer");
     }
     try {
       if (this._isolated) {
@@ -719,7 +804,6 @@ module.exports = {
   OpenAI,
   StreamTagParser: native.StreamTagParser,
   TokenStream,
-  WorkerTokenStream,
   check,
   formatToolsSystemPrompt,
   inspectGguf,

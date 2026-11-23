@@ -9,6 +9,22 @@ function isPlainObject(val) {
   return val !== null && typeof val === "object" && !Array.isArray(val);
 }
 
+function createAbortError(signal) {
+  if (signal && signal.reason instanceof Error) {
+    return signal.reason;
+  }
+  const err = new Error("The operation was aborted");
+  err.name = "AbortError";
+  err.code = "ABORT_ERR";
+  return err;
+}
+
+function throwIfAborted(signal) {
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+}
+
 function usageFromSummary(summary) {
   if (!summary) return null;
   const p = Number(summary.promptTokens ?? summary.prompt_tokens ?? 0);
@@ -23,6 +39,13 @@ function usageFromSummary(summary) {
 function compileResponseFormat(responseFormat) {
   if (responseFormat === undefined || responseFormat === null) {
     return { grammar: undefined, parser: null };
+  }
+
+  if (typeof responseFormat === "boolean") {
+    return {
+      grammar: native.jsonSchemaToGbnf(JSON.stringify(responseFormat)),
+      parser: (raw) => JSON.parse(raw),
+    };
   }
 
   // Zod v4 (`toJSONSchema()`) or custom schema object with `.parse(data)` + `.toJSONSchema()`
@@ -45,17 +68,27 @@ function compileResponseFormat(responseFormat) {
       return { grammar: native.jsonObjectGbnf(), parser: (raw) => JSON.parse(raw) };
     }
     if (rfType === "json_schema") {
-      const inner = isPlainObject(responseFormat.json_schema)
-        ? responseFormat.json_schema
-        : responseFormat;
-      const schema = inner.schema !== undefined ? inner.schema : inner;
-      if (schema === undefined || schema === null) {
-        throw new RangeError("response_format 'json_schema' requires a 'schema' object");
+      let schema;
+      let validator = (raw) => JSON.parse(raw);
+      if (responseFormat.json_schema !== undefined) {
+        if (!isPlainObject(responseFormat.json_schema)) {
+          throw new TypeError("response_format.json_schema must be an object");
+        }
+        schema = responseFormat.json_schema.schema;
+        if (typeof responseFormat.json_schema.parse === "function") {
+          const fn = responseFormat.json_schema.parse.bind(responseFormat.json_schema);
+          validator = (raw) => fn(JSON.parse(raw));
+        }
+      } else {
+        schema = responseFormat.schema;
+        if (typeof responseFormat.parse === "function") {
+          const fn = responseFormat.parse.bind(responseFormat);
+          validator = (raw) => fn(JSON.parse(raw));
+        }
       }
-      const validator =
-        typeof inner.parse === "function"
-          ? (raw) => inner.parse(JSON.parse(raw))
-          : (raw) => JSON.parse(raw);
+      if (schema === undefined || schema === null) {
+        throw new RangeError("response_format 'json_schema' requires an explicit 'schema'");
+      }
       return {
         grammar: native.jsonSchemaToGbnf(JSON.stringify(schema)),
         parser: validator,
@@ -68,24 +101,12 @@ function compileResponseFormat(responseFormat) {
       }
       return { grammar: g, parser: null };
     }
-    // Direct JSON Schema object (`{ type: "object", properties: ... }`) passed to `.parse(...)`
-    if (
-      rfType === "object" ||
-      rfType === "array" ||
-      "properties" in responseFormat ||
-      "anyOf" in responseFormat ||
-      "oneOf" in responseFormat ||
-      "allOf" in responseFormat ||
-      "$ref" in responseFormat
-    ) {
-      return {
-        grammar: native.jsonSchemaToGbnf(JSON.stringify(responseFormat)),
-        parser: (raw) => JSON.parse(raw),
-      };
-    }
-    throw new RangeError(
-      `Unsupported response_format type '${rfType}' (expected 'text', 'json_object', 'json_schema', or 'gbnf')`
-    );
+
+    // Raw JSON Schema (primitive `{ type: "string" }`, `{ enum: [...] }`, object/array schemas, etc.)
+    return {
+      grammar: native.jsonSchemaToGbnf(JSON.stringify(responseFormat)),
+      parser: (raw) => JSON.parse(raw),
+    };
   }
 
   throw new TypeError(
@@ -112,10 +133,13 @@ class ChatCompletionStream {
       },
     ];
     this._finished = false;
+    this._closed = false;
   }
 
   async close() {
+    this._closed = true;
     this._finished = true;
+    this._pending.length = 0;
     await this._stream.close();
   }
 
@@ -188,12 +212,19 @@ class ChatCompletionStream {
     const innerIter = this._stream[Symbol.asyncIterator]();
     return {
       next: async () => {
+        if (this._closed) {
+          return { done: true, value: undefined };
+        }
         try {
           while (this._pending.length === 0) {
-            if (this._finished) {
+            if (this._closed || this._finished) {
               return { done: true, value: undefined };
             }
             const step = await innerIter.next();
+            if (this._closed) {
+              this._pending.length = 0;
+              return { done: true, value: undefined };
+            }
             if (step.done) {
               this._finished = true;
               if (this._tagParser) {
@@ -233,7 +264,7 @@ class ChatCompletionStream {
               this._enqueueDeltas(this._tagParser.push(piece));
             }
           }
-          if (this._pending.length === 0) {
+          if (this._closed || this._pending.length === 0) {
             return { done: true, value: undefined };
           }
           return { done: false, value: this._pending.shift() };
@@ -261,9 +292,11 @@ class CompletionStream {
     this._created = created;
     this._modelId = modelId;
     this._finished = false;
+    this._closed = false;
   }
 
   async close() {
+    this._closed = true;
     this._finished = true;
     await this._stream.close();
   }
@@ -276,11 +309,14 @@ class CompletionStream {
     const innerIter = this._stream[Symbol.asyncIterator]();
     return {
       next: async () => {
-        if (this._finished) {
+        if (this._closed || this._finished) {
           return { done: true, value: undefined };
         }
         try {
           const step = await innerIter.next();
+          if (this._closed) {
+            return { done: true, value: undefined };
+          }
           if (step.done) {
             this._finished = true;
             const summary = this._stream.summary;
@@ -331,6 +367,7 @@ class ModelManager {
     this._openOptions = openOptions;
     this._models = new Map();
     this._owned = new Set();
+    this._loadingModels = new Map();
     this._defaultId = null;
     this._initPromise = null;
 
@@ -351,14 +388,23 @@ class ModelManager {
     if (!this._initialModel) return;
     if (!this._initPromise) {
       const spec = this._initialModel;
-      this._initPromise = (async () => {
-        const { AutoModel } = require("./index.js");
-        const loaded = await AutoModel.fromPretrained(spec, this._openOptions);
-        this._models.set(spec, loaded);
-        this._owned.add(spec);
-        this._defaultId = spec;
-        this._initialModel = null;
+      const p = (async () => {
+        try {
+          const { AutoModel } = require("./index.js");
+          const loaded = await AutoModel.fromPretrained(spec, this._openOptions);
+          this._models.set(spec, loaded);
+          this._owned.add(spec);
+          if (!this._defaultId) {
+            this._defaultId = spec;
+          }
+          this._initialModel = null;
+        } finally {
+          if (this._initPromise === p) {
+            this._initPromise = null;
+          }
+        }
       })();
+      this._initPromise = p;
     }
     await this._initPromise;
   }
@@ -381,13 +427,30 @@ class ModelManager {
         return { modelId: this._defaultId, engine: def };
       }
     }
-    const { AutoModel } = require("./index.js");
-    const loaded = await AutoModel.fromPretrained(key, this._openOptions);
-    this._models.set(key, loaded);
-    this._owned.add(key);
-    if (!this._defaultId) {
-      this._defaultId = key;
+
+    let inFlight = this._loadingModels.get(key);
+    if (!inFlight) {
+      const p = (async () => {
+        try {
+          const { AutoModel } = require("./index.js");
+          const loaded = await AutoModel.fromPretrained(key, this._openOptions);
+          this._models.set(key, loaded);
+          this._owned.add(key);
+          if (!this._defaultId) {
+            this._defaultId = key;
+          }
+          return loaded;
+        } finally {
+          if (this._loadingModels.get(key) === p) {
+            this._loadingModels.delete(key);
+          }
+        }
+      })();
+      this._loadingModels.set(key, p);
+      inFlight = p;
     }
+
+    const loaded = await inFlight;
     return { modelId: key, engine: loaded };
   }
 
@@ -403,20 +466,29 @@ class ModelManager {
   }
 
   async unloadAll() {
-    if (this._initPromise) {
+    while (this._initPromise || this._loadingModels.size > 0) {
+      const pending = [this._initPromise, ...this._loadingModels.values()].filter(Boolean);
+      await Promise.allSettled(pending);
+    }
+
+    let firstError = null;
+    for (const key of [...this._owned]) {
       try {
-        await this._initPromise;
-      } catch {}
+        const inst = this._models.get(key);
+        if (inst) {
+          await inst.unload();
+        }
+        this._models.delete(key);
+        this._owned.delete(key);
+        if (this._defaultId === key) {
+          this._defaultId = null;
+        }
+      } catch (err) {
+        firstError ??= err;
+      }
     }
-    const ownedInstances = [];
-    for (const key of this._owned) {
-      const inst = this._models.get(key);
-      if (inst) ownedInstances.push(inst);
-      this._models.delete(key);
-    }
-    this._owned.clear();
-    for (const inst of ownedInstances) {
-      await inst.unload();
+    if (firstError) {
+      throw firstError;
     }
   }
 }
@@ -427,11 +499,27 @@ class ChatCompletionsResource {
   }
 
   async create(params = {}, callOpts = {}) {
-    const { modelId, engine } = await this._mgr.resolve(params.model);
-    const maxTokens =
-      params.max_completion_tokens ?? params.maxCompletionTokens ?? params.max_tokens ?? params.maxTokens ?? 512;
-    const { grammar } = compileResponseFormat(params.response_format ?? params.responseFormat);
+    return this._createInternal(params, callOpts, null);
+  }
+
+  async _createInternal(params = {}, callOpts = {}, precompiledFormat = null) {
     const signal = params.signal ?? callOpts?.signal;
+    throwIfAborted(signal);
+
+    const { grammar } =
+      precompiledFormat ??
+      compileResponseFormat(params.response_format ?? params.responseFormat);
+    throwIfAborted(signal);
+
+    const { modelId, engine } = await this._mgr.resolve(params.model);
+    throwIfAborted(signal);
+
+    const maxTokens =
+      params.max_completion_tokens ??
+      params.maxCompletionTokens ??
+      params.max_tokens ??
+      params.maxTokens ??
+      512;
     const reqId = `chatcmpl-ls-${crypto.randomBytes(8).toString("hex")}`;
     const created = Math.floor(Date.now() / 1000);
 
@@ -519,11 +607,14 @@ class ChatCompletionsResource {
   }
 
   async parse(params = {}, callOpts = {}) {
+    const signal = params.signal ?? callOpts?.signal;
+    throwIfAborted(signal);
     const rf = params.response_format ?? params.responseFormat;
-    const { parser } = compileResponseFormat(rf);
-    const resp = await this.create({ ...params, stream: false }, callOpts);
+    const compiled = compileResponseFormat(rf);
+    throwIfAborted(signal);
+    const resp = await this._createInternal({ ...params, stream: false }, callOpts, compiled);
     const rawContent = resp.choices[0].message.content ?? "";
-    resp.choices[0].message.parsed = parser ? parser(rawContent) : null;
+    resp.choices[0].message.parsed = compiled.parser ? compiled.parser(rawContent) : null;
     return resp;
   }
 }
@@ -534,8 +625,12 @@ class CompletionsResource {
   }
 
   async create(params = {}, callOpts = {}) {
-    const { modelId, engine } = await this._mgr.resolve(params.model);
     const signal = params.signal ?? callOpts?.signal;
+    throwIfAborted(signal);
+
+    const { modelId, engine } = await this._mgr.resolve(params.model);
+    throwIfAborted(signal);
+
     const reqId = `cmpl-ls-${crypto.randomBytes(8).toString("hex")}`;
     const created = Math.floor(Date.now() / 1000);
 
