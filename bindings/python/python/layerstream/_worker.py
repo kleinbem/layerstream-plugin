@@ -8,9 +8,9 @@ so the OS kernel immediately reclaims 100% of VRAM/UMA, CUDA primary driver cont
 (~300-524 MiB), and C++ heap arenas.
 """
 
-from __future__ import annotations
-
+import contextlib
 import json
+import math
 import os
 import queue
 import secrets
@@ -22,7 +22,7 @@ import weakref
 from collections.abc import Iterator, Mapping, Sequence
 from os import PathLike
 from types import TracebackType
-from typing import Any
+from typing import Any, override
 
 from ._layerstream import (
     NativeAutoModel,
@@ -48,11 +48,9 @@ def _file_not_found_or_runtime(err_type: str, msg: str) -> BaseException:
 
 
 def _reap_proc(proc: subprocess.Popen[bytes]) -> None:
-    try:
-        if proc.stdin is not None:
+    if proc.stdin is not None:
+        with contextlib.suppress(OSError):
             proc.stdin.close()
-    except Exception:
-        pass
     try:
         proc.wait(timeout=3.0)
         return
@@ -62,13 +60,11 @@ def _reap_proc(proc: subprocess.Popen[bytes]) -> None:
         proc.terminate()
         proc.wait(timeout=2.0)
         return
-    except Exception:
+    except subprocess.TimeoutExpired, OSError:
         pass
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
         proc.kill()
         proc.wait(timeout=2.0)
-    except Exception:
-        pass
 
 
 class _WorkerState:
@@ -101,18 +97,12 @@ def _shutdown_worker_state(state: _WorkerState) -> None:
         state.proc = None
 
     if sock is not None:
-        try:
+        with contextlib.suppress(OSError):
             _send_json_line(sock, state.send_lock, {"id": 0, "op": "shutdown", "params": {}})
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(OSError):
             sock.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(OSError):
             sock.close()
-        except Exception:
-            pass
 
     if proc is not None:
         _reap_proc(proc)
@@ -132,13 +122,11 @@ def _reader_loop(state: _WorkerState, reader_file: Any) -> None:
                 stream_q.put(msg)
             elif rpc_q is not None:
                 rpc_q.put(msg)
-    except Exception:
+    except OSError, ValueError, KeyError:
         pass
     finally:
-        try:
+        with contextlib.suppress(OSError):
             reader_file.close()
-        except Exception:
-            pass
         with state.state_lock:
             state.loaded = False
             eof_msg = {
@@ -171,6 +159,7 @@ class WorkerTokenStream(Iterator[str]):
         self._summary: dict[str, Any] | None = None
         self._lock = threading.Lock()
 
+    @override
     def __iter__(self) -> WorkerTokenStream:
         return self
 
@@ -207,11 +196,10 @@ class WorkerTokenStream(Iterator[str]):
                     self._summary = sum_out
 
     def __del__(self) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
+    @override
     def __next__(self) -> str:
         while True:
             with self._lock:
@@ -258,7 +246,12 @@ class WorkerTokenStream(Iterator[str]):
 class _IsolatedWorkerClient:
     """Parent-side IPC client managing one isolated child `python -m layerstream._worker`."""
 
-    def __init__(self, open_kwargs: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        open_kwargs: dict[str, Any],
+        *,
+        on_progress: Any = None,
+    ) -> None:
         token = secrets.token_hex(32)
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -287,7 +280,8 @@ class _IsolatedWorkerClient:
                 stderr=None,
                 env=env,
             )
-            assert proc.stdin is not None
+            if proc.stdin is None:
+                raise RuntimeError("worker stdin pipe missing")
             proc.stdin.write((token + "\n").encode("ascii"))
             proc.stdin.flush()
 
@@ -329,7 +323,10 @@ class _IsolatedWorkerClient:
         self._reader_thread.start()
 
         try:
-            resp, _ = self._rpc_with_summary("open", open_kwargs)
+            payload_open = dict(open_kwargs)
+            if on_progress is not None:
+                payload_open["_stream_progress"] = True
+            resp, _ = self._rpc_with_summary("open", payload_open, on_progress=on_progress)
             with state.state_lock:
                 state.loaded = True
                 state.model_path = resp.get("model_path")
@@ -348,7 +345,11 @@ class _IsolatedWorkerClient:
         return res
 
     def _rpc_with_summary(
-        self, op: str, params: dict[str, Any]
+        self,
+        op: str,
+        params: dict[str, Any],
+        *,
+        on_progress: Any = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         state = self._state
         with state.state_lock:
@@ -365,22 +366,35 @@ class _IsolatedWorkerClient:
             while True:
                 try:
                     resp = q.get(timeout=0.05)
-                    break
                 except queue.Empty:
                     continue
+                if resp.get("event") == "progress":
+                    if on_progress is not None:
+                        try:
+                            on_progress(dict(resp.get("progress") or {}))
+                        except BaseException:
+                            with contextlib.suppress(OSError):
+                                _send_json_line(
+                                    sock,
+                                    state.send_lock,
+                                    {
+                                        "id": req_id,
+                                        "op": "cancel",
+                                        "params": {"target_id": req_id},
+                                    },
+                                )
+                            raise
+                    continue
+                break
         except KeyboardInterrupt:
-            try:
+            with contextlib.suppress(OSError):
                 _send_json_line(
                     sock,
                     state.send_lock,
                     {"id": req_id, "op": "cancel", "params": {"target_id": req_id}},
                 )
-                try:
+                with contextlib.suppress(queue.Empty):
                     q.get(timeout=2.0)
-                except queue.Empty:
-                    pass
-            except Exception:
-                pass
             raise
         finally:
             with state.state_lock:
@@ -428,23 +442,22 @@ class _IsolatedWorkerClient:
             return None
         captured_summary: dict[str, Any] | None = None
         try:
-            _send_json_line(
-                sock,
-                state.send_lock,
-                {"id": self._alloc_id(), "op": "cancel", "params": {"target_id": req_id}},
-            )
-            while True:
-                try:
-                    msg = ev_q.get(timeout=2.0)
-                except queue.Empty:
-                    break
-                if msg.get("event") in ("done", "error"):
-                    raw_sum = msg.get("summary")
-                    captured_summary = dict(raw_sum) if isinstance(raw_sum, Mapping) else None
-                    self._finish_stream(req_id, captured_summary)
-                    break
-        except Exception:
-            pass
+            with contextlib.suppress(OSError):
+                _send_json_line(
+                    sock,
+                    state.send_lock,
+                    {"id": self._alloc_id(), "op": "cancel", "params": {"target_id": req_id}},
+                )
+                while True:
+                    try:
+                        msg = ev_q.get(timeout=2.0)
+                    except queue.Empty:
+                        break
+                    if msg.get("event") in ("done", "error"):
+                        raw_sum = msg.get("summary")
+                        captured_summary = dict(raw_sum) if isinstance(raw_sum, Mapping) else None
+                        self._finish_stream(req_id, captured_summary)
+                        break
         finally:
             with state.state_lock:
                 state.active_streams.pop(req_id, None)
@@ -534,9 +547,7 @@ def normalize_open_kwargs(
             if parsed_mb < 0:
                 raise ValueError("vram_budget_mb must be non-negative")
     if kv_cache_type.strip().lower() not in ("f16", "q8_0", "q4_0"):
-        raise ValueError(
-            f"invalid kv_cache_type '{kv_cache_type}' (expected f16, q8_0, or q4_0)"
-        )
+        raise ValueError(f"invalid kv_cache_type '{kv_cache_type}' (expected f16, q8_0, or q4_0)")
 
     return {
         "model": model,
@@ -566,6 +577,149 @@ def serialize_schema_arg(json_schema: Any) -> str | None:
     if json_schema is None:
         return None
     return json_schema_to_gbnf(json_schema)
+
+
+def _validate_sample_args(
+    *,
+    temperature: float,
+    top_p: float,
+    min_p: float,
+    repeat_penalty: float,
+    frequency_penalty: float,
+    presence_penalty: float,
+) -> None:
+    if not math.isfinite(temperature) or temperature < 0.0:
+        raise ValueError("temperature must be a finite non-negative number")
+    if not math.isfinite(top_p) or top_p <= 0.0 or top_p > 1.0:
+        raise ValueError("top_p must be in (0.0, 1.0]")
+    if not math.isfinite(min_p) or min_p < 0.0 or min_p > 1.0:
+        raise ValueError("min_p must be in [0.0, 1.0]")
+    if not math.isfinite(repeat_penalty) or repeat_penalty <= 0.0:
+        raise ValueError("repeat_penalty must be a finite positive number")
+    if not math.isfinite(frequency_penalty):
+        raise ValueError("frequency_penalty must be finite")
+    if not math.isfinite(presence_penalty):
+        raise ValueError("presence_penalty must be finite")
+
+
+def _normalize_stop_and_grammar(
+    stop: str | Sequence[str] | None,
+    grammar: str | None,
+    json_schema: Any,
+) -> tuple[str | list[str] | None, str | None]:
+    if grammar is not None and json_schema is not None:
+        raise ValueError("pass at most one of 'grammar' or 'json_schema', not both")
+    if stop is not None and not isinstance(stop, str):
+        if not isinstance(stop, Sequence) or not all(isinstance(s, str) for s in stop):
+            raise TypeError("stop must be None, a string, or a sequence of strings")
+        stop_val: str | list[str] | None = list(stop)
+    else:
+        stop_val = stop
+
+    eff_grammar = grammar if grammar is not None else serialize_schema_arg(json_schema)
+    if eff_grammar is not None and not eff_grammar.strip():
+        raise ValueError("grammar must not be empty")
+    return stop_val, eff_grammar
+
+
+def prepare_generate_params(
+    prompt: str,
+    *,
+    max_tokens: int = 256,
+    temperature: float = 0.0,
+    top_p: float = 0.95,
+    min_p: float = 0.0,
+    top_k: int = 40,
+    repeat_penalty: float = 1.0,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    penalty_last_n: int = 64,
+    seed: int = 42,
+    stop: str | Sequence[str] | None = None,
+    ngram_speculation: bool = True,
+    max_draft_tokens: int | None = None,
+    grammar: str | None = None,
+    json_schema: Any = None,
+) -> dict[str, Any]:
+    _validate_sample_args(
+        temperature=temperature,
+        top_p=top_p,
+        min_p=min_p,
+        repeat_penalty=repeat_penalty,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+    )
+    stop_val, eff_grammar = _normalize_stop_and_grammar(stop, grammar, json_schema)
+    return {
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "min_p": min_p,
+        "top_k": top_k,
+        "repeat_penalty": repeat_penalty,
+        "frequency_penalty": frequency_penalty,
+        "presence_penalty": presence_penalty,
+        "penalty_last_n": penalty_last_n,
+        "seed": seed,
+        "stop": stop_val,
+        "ngram_speculation": ngram_speculation,
+        "max_draft_tokens": max_draft_tokens,
+        "grammar": eff_grammar,
+    }
+
+
+def prepare_chat_params(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    max_tokens: int = 256,
+    temperature: float = 0.0,
+    top_p: float = 0.95,
+    min_p: float = 0.0,
+    top_k: int = 40,
+    repeat_penalty: float = 1.0,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    penalty_last_n: int = 64,
+    seed: int = 42,
+    stop: str | Sequence[str] | None = None,
+    add_generation_prompt: bool = True,
+    ngram_speculation: bool = True,
+    max_draft_tokens: int | None = None,
+    tools: Sequence[Mapping[str, Any]] | None = None,
+    grammar: str | None = None,
+    json_schema: Any = None,
+) -> dict[str, Any]:
+    _validate_sample_args(
+        temperature=temperature,
+        top_p=top_p,
+        min_p=min_p,
+        repeat_penalty=repeat_penalty,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+    )
+    stop_val, eff_grammar = _normalize_stop_and_grammar(stop, grammar, json_schema)
+    clean_msgs = serialize_messages_arg(messages)
+    clean_tools = validate_tools_arg(tools)
+    return {
+        "messages": clean_msgs,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "min_p": min_p,
+        "top_k": top_k,
+        "repeat_penalty": repeat_penalty,
+        "frequency_penalty": frequency_penalty,
+        "presence_penalty": presence_penalty,
+        "penalty_last_n": penalty_last_n,
+        "seed": seed,
+        "stop": stop_val,
+        "add_generation_prompt": add_generation_prompt,
+        "ngram_speculation": ngram_speculation,
+        "max_draft_tokens": max_draft_tokens,
+        "tools": clean_tools,
+        "grammar": eff_grammar,
+    }
 
 
 def validate_tools_arg(tools: Sequence[Mapping[str, Any]] | None) -> list[dict[str, Any]] | None:
@@ -626,11 +780,9 @@ def _run_worker_main(port: int) -> int:
 
     # Exit immediately if parent process dies and closes stdin pipe.
     def watch_parent_stdin() -> None:
-        try:
+        with contextlib.suppress(OSError, ValueError):
             while sys.stdin.read(64):
                 pass
-        except Exception:
-            pass
         os._exit(0)
 
     threading.Thread(target=watch_parent_stdin, daemon=True).start()
@@ -641,10 +793,8 @@ def _run_worker_main(port: int) -> int:
             cmd = work_q.get()
             if cmd is None:
                 if model is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         model.unload()
-                    except Exception:
-                        pass
                 break
 
             req_id = int(cmd["id"])
@@ -670,6 +820,20 @@ def _run_worker_main(port: int) -> int:
 
             try:
                 if op == "open":
+                    stream_prog = bool(params.pop("_stream_progress", False))
+                    if stream_prog:
+
+                        def _emit_prog(ev: dict[str, Any], rid: int = req_id) -> None:
+                            with cancel_lock:
+                                if rid in cancelled_ids:
+                                    raise RuntimeError("open cancelled")
+                            _send_json_line(
+                                sock,
+                                send_lock,
+                                {"id": rid, "event": "progress", "progress": dict(ev)},
+                            )
+
+                        params["on_progress"] = _emit_prog
                     model = NativeAutoModel.from_pretrained(**params)
                     _send_json_line(
                         sock,
@@ -727,17 +891,27 @@ def _run_worker_main(port: int) -> int:
                         send_lock,
                         {"id": req_id, "ok": True, "result": {"trimmed": ok}},
                     )
+                elif op == "save_state":
+                    n_tok = model.save_state(str(params["path"]))
+                    _send_json_line(
+                        sock,
+                        send_lock,
+                        {"id": req_id, "ok": True, "result": {"tokens": n_tok}},
+                    )
+                elif op == "load_state":
+                    n_tok = model.load_state(str(params["path"]))
+                    _send_json_line(
+                        sock,
+                        send_lock,
+                        {"id": req_id, "ok": True, "result": {"tokens": n_tok}},
+                    )
                 elif op in ("generate", "chat"):
                     parse_out = bool(params.pop("parse_output", False))
                     # Run via NativeTokenStream so mid-request cancel aborts C++ immediately.
                     if op == "generate":
-                        stream_iter = model.generate(
-                            params.pop("prompt"), stream=True, **params
-                        )
+                        stream_iter = model.generate(params.pop("prompt"), stream=True, **params)
                     else:
-                        stream_iter = model.chat(
-                            params.pop("messages"), stream=True, **params
-                        )
+                        stream_iter = model.chat(params.pop("messages"), stream=True, **params)
                     with cancel_lock:
                         active_stream_holder[req_id] = stream_iter
                         cancelled_before_reg = req_id in cancelled_ids
@@ -775,13 +949,9 @@ def _run_worker_main(port: int) -> int:
                     )
                 elif op in ("generate_stream", "chat_stream"):
                     if op == "generate_stream":
-                        stream_iter = model.generate(
-                            params.pop("prompt"), stream=True, **params
-                        )
+                        stream_iter = model.generate(params.pop("prompt"), stream=True, **params)
                     else:
-                        stream_iter = model.chat(
-                            params.pop("messages"), stream=True, **params
-                        )
+                        stream_iter = model.chat(params.pop("messages"), stream=True, **params)
                     with cancel_lock:
                         active_stream_holder[req_id] = stream_iter
                         cancelled_before_reg = req_id in cancelled_ids
@@ -854,28 +1024,22 @@ def _run_worker_main(port: int) -> int:
                     cancelled_ids.add(target_id)
                     live = active_stream_holder.get(target_id)
                 if live is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         live.close()
-                    except Exception:
-                        pass
                 continue
             work_q.put(msg)
-    except Exception:
+    except OSError, ValueError, KeyError:
         pass
     finally:
         with cancel_lock:
             for live in list(active_stream_holder.values()):
-                try:
+                with contextlib.suppress(Exception):
                     live.close()
-                except Exception:
-                    pass
         work_q.put(None)
         worker_thread.join(timeout=3.0)
-        try:
+        with contextlib.suppress(OSError):
             reader.close()
             sock.close()
-        except Exception:
-            pass
     return 0
 
 

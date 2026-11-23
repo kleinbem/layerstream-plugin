@@ -2,16 +2,58 @@
 
 Native Python SDK (`PyO3` + `maturin`) for [`layerstream-core`](../../crates/layerstream-core): an out-of-core GGUF layer-streaming inference engine backed by unpatched `llama.cpp`, `O_DIRECT` / `F_NOCACHE` async ping-pong GPU streaming, auto-sized hybrid residency, sparse MoE TinyLFU expert caching, and speculative decoding.
 
+## Installation (Python 3.14+, Zero Compile Required)
+
+```bash
+# Apple Silicon (Metal), AMD, Intel, NVIDIA (Vulkan), or CPU fallback:
+pip install layerstream
+
+# Linux with NVIDIA GPU (adds CUDA 12 backend + cuBLAS/cudart from PyPI; no nvcc needed):
+pip install "layerstream[cuda]"
+```
+
 ## Quickstart
 
 ```python
 from layerstream import AutoModel
 
-with AutoModel.from_pretrained("Qwen/Qwen2.5-14B-Instruct") as model:
-    print(model.generate("Explain NVMe O_DIRECT streaming.", max_tokens=128))
+with AutoModel.from_pretrained("Qwen/Qwen2.5-14B-Instruct", draft_model="auto") as model:
+    print(model.generate("Explain NVMe O_DIRECT streaming.", max_tokens=128, min_p=0.05))
 ```
 
-### True 0 MB VRAM Handoff (`isolated_worker=True`)
+## Built-In `layerstream` CLI
+
+```bash
+# Interactive terminal chat with live tok/s, VRAM residency, and NVMe telemetry:
+layerstream chat Qwen/Qwen2.5-14B-Instruct --draft-model auto
+
+# Rank Hugging Face GGUF quantizations for your GPU + NVMe:
+layerstream recommend Qwen/Qwen3-30B-A3B-GGUF
+
+# Fail-closed hardware & storage preflight check:
+layerstream check Qwen/Qwen2.5-14B-Instruct
+
+# Native Rust `axum` + `tokio` OpenAI HTTP + SSE server (/v1/chat/completions, /v1/models, /v1/unload):
+layerstream serve Qwen/Qwen2.5-14B-Instruct --port 8080
+```
+
+## Instant NVMe KV-Cache Snapshots (`save_state` / `load_state`)
+
+Prefill a large system prompt or repository context once, save the quantized (`q8_0`) KV cache to NVMe, and restore it in ~20 ms on future runs without re-streaming model weights:
+
+```python
+from layerstream import AutoModel
+
+with AutoModel.from_pretrained("Qwen/Qwen2.5-14B-Instruct") as model:
+    model.chat([{"role": "system", "content": repo_context}, {"role": "user", "content": "Ready?"}], max_tokens=8)
+    model.save_state("repo_context.kv")
+
+with AutoModel.from_pretrained("Qwen/Qwen2.5-14B-Instruct") as model:
+    model.load_state("repo_context.kv")
+    print(model.chat([{"role": "system", "content": repo_context}, {"role": "user", "content": "Ready?"}, {"role": "assistant", "content": "Yes."}, {"role": "user", "content": "Summarize module A."}]))
+```
+
+## True 0 MB VRAM Handoff (`isolated_worker=True`)
 
 When mixing `layerstream` with PyTorch / Whisper / Diffusers on 8–16 GB GPUs, pass `isolated_worker=True` so GPU inference runs in an isolated child worker process. Calling `.unload()` (or exiting the `with` block) terminates and reaps the worker so **100% of VRAM and CUDA/Vulkan/Metal driver contexts (~300–524 MiB)** return to `torch.cuda`:
 
@@ -20,7 +62,7 @@ from layerstream import AutoModel
 
 with AutoModel.from_pretrained(
     "Qwen/Qwen2.5-14B-Instruct",
-    draft_model="Qwen/Qwen2.5-0.5B-Instruct",
+    draft_model="auto",
     isolated_worker=True,
 ) as model:
     for chunk in model.chat(
@@ -31,9 +73,9 @@ with AutoModel.from_pretrained(
 # <- Worker reaped; 0 B GPU / CUDA driver context remains in Python!
 ```
 
-### Drop-In In-Process `OpenAI` / `AsyncOpenAI` & Structured Outputs
+## Drop-In In-Process `OpenAI` / `AsyncOpenAI` & Structured Outputs
 
-Use `layerstream.OpenAI` or `layerstream.AsyncOpenAI` in-process (no daemon or port required) with native GBNF / JSON Schema / Pydantic constrained decoding, `<think>` → `reasoning_content`, and `<tool_call>` → `tool_calls`:
+Use `layerstream.OpenAI` or `layerstream.AsyncOpenAI` in-process (no daemon or port required) with native GBNF / JSON Schema / Pydantic / `dataclass` constrained decoding, `<think>` -> `reasoning_content`, and `<tool_call>` -> `tool_calls`:
 
 ```python
 from pydantic import BaseModel
@@ -52,45 +94,13 @@ with OpenAI("Qwen/Qwen2.5-14B-Instruct", isolated_worker=True) as client:
     print(verdict)
 ```
 
-### Hardware Advisor, Preflight & Low-Level Controls
-
-```python
-import layerstream
-
-# Rank GGUF quantizations in any HF repo (or base repo with -GGUF sibling) against GPU + NVMe:
-recs = layerstream.recommend("Qwen/Qwen3-30B-A3B-GGUF")
-
-# Header-only (~20 ms, 0 MB VRAM) local GGUF metadata inspection:
-info = layerstream.inspect_gguf("/models/Qwen2.5-14B-Instruct-Q4_K_M.gguf")
-
-# Preflight check (resolves/downloads uncached HF specs, probes GPU VRAM, and benchmarks storage I/O):
-report = layerstream.check("hf://Qwen/Qwen2.5-14B-Instruct-GGUF:qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf")
-```
-
-`AutoModel` also exposes `.tokenize(text)`, `.detokenize(ids)`, `.apply_chat_template(messages)`, `.kv_clear()`, `.kv_trim(pos_min)`, `grammar=...`, `json_schema=...`, `tools=[...]`, `parse_output=True`, and `async for` on `TokenStream`.
-
-### Supported `from_pretrained(model, ...)` Inputs
-
-1. **Local GGUF path:** `"/models/Qwen2.5-14B-Instruct-Q4_K_M.gguf"`
-2. **Explicit Hugging Face URI:** `"hf://org/repo:file.gguf"` (auto-expands multi-part shards and verifies ETag/SHA-256)
-3. **HF GGUF repo ID:** `"Qwen/Qwen2.5-14B-Instruct-GGUF"` (auto-selects the best quant for probed GPU/NVMe, or pass `quant="Q4_K_M"`)
-4. **Base HF repo ID:** `"Qwen/Qwen2.5-14B-Instruct"` (resolves the official `{org}/{name}-GGUF` sibling repository)
-
-## Building & Trying the Demos Locally
+## Building Locally from Source
 
 ```bash
 nix develop .#python
 cd bindings/python
-maturin build --locked --release --features vulkan --out dist   # or omit --features for CPU
+maturin build --locked --release --features vulkan,dynamic-backends --out dist
 python3 -m zipfile -e dist/*.whl .wheel-local
-
-# 3-line Hugging Face quickstart (or pass --model /path/to/model.gguf):
-PYTHONPATH=.wheel-local python3 examples/quickstart.py
-
-# Multi-turn KV reuse & MoE/streaming telemetry demo:
-PYTHONPATH=.wheel-local python3 examples/streaming_benchmark.py /path/to/model.gguf --vram-budget-mb 2048
-
-# Unit & integration tests:
 PYTHONPATH=.wheel-local pytest -v
 ```
 

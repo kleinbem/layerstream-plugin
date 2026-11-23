@@ -298,3 +298,75 @@ async fn unload_endpoint_and_worker_token_auth() {
     assert_eq!(v["unloaded"], false);
     assert_eq!(v["loaded"], false);
 }
+
+#[tokio::test]
+async fn bearer_api_key_middleware_protects_v1_and_allows_health() {
+    let cfg = ServerConfig {
+        registry: ModelRegistry::default(),
+        n_ctx: 512,
+        n_batch: 128,
+        n_threads: 2,
+        resident_layers: Some(0),
+        vram_budget_bytes: 0,
+        vram_budget_auto: false,
+        kv_cache_type: KvCacheType::F16,
+        use_gpu: false,
+        prefer_direct_io: true,
+        cpu_embeddings: false,
+        cpu_head: false,
+        stream_head: false,
+        moe_active_streaming: true,
+        idle_timeout: Duration::ZERO,
+        enable_ngram_speculation: true,
+        max_draft_tokens: 4,
+        max_queued_requests: 4,
+    };
+    let app = layerstream_server::build_router_with_api_key(
+        AppState::new(cfg),
+        Some("top-secret-bearer".to_string()),
+    );
+
+    // `/health` stays unauthenticated for liveness checks.
+    let health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    // `/v1/models` without Bearer header -> 401 Unauthorized (`authentication_error`).
+    let unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    let ubytes = axum::body::to_bytes(unauth.into_body(), 16 * 1024)
+        .await
+        .unwrap();
+    let uv: Value = serde_json::from_slice(&ubytes).unwrap();
+    assert_eq!(uv["error"]["type"], "authentication_error");
+
+    // `/v1/models` with valid Bearer header -> 200 OK.
+    let authed = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer top-secret-bearer")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authed.status(), StatusCode::OK);
+}

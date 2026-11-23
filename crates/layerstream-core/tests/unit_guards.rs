@@ -6,7 +6,10 @@
 
 use std::io::Write;
 
-use layerstream_core::ffi::{ls_sample_from_logits, ls_verify_sample_from_logits};
+use layerstream_core::ffi::{
+    ls_sample_from_logits, ls_sample_from_logits_with_history, ls_verify_sample_from_logits,
+    ls_verify_sample_from_logits_with_history,
+};
 use layerstream_core::{GgufIndex, LsSampleParams, StopFilter, check_vocab_lists_compatible};
 
 #[test]
@@ -92,8 +95,10 @@ fn rejection_sampler_matches_eval_sample_distribution() {
             let sp_direct = LsSampleParams {
                 temperature: temp,
                 top_p: 0.92,
+                min_p: 0.05,
                 top_k: 12,
                 seed: (i as u32).wrapping_mul(2654435761).wrapping_add(17),
+                ..LsSampleParams::default()
             };
             let t_direct = unsafe { ls_sample_from_logits(logits.as_ptr(), n_vocab, &sp_direct) };
             counts_direct[t_direct as usize] += 1;
@@ -101,8 +106,10 @@ fn rejection_sampler_matches_eval_sample_distribution() {
             let sp_verify = LsSampleParams {
                 temperature: temp,
                 top_p: 0.92,
+                min_p: 0.05,
                 top_k: 12,
                 seed: (i as u32).wrapping_mul(2246822519).wrapping_add(99),
+                ..LsSampleParams::default()
             };
             let mut acc = 0i32;
             let mut next = 0i32;
@@ -166,4 +173,131 @@ fn corrupt_gguf_headers_are_rejected_without_oom() {
         f.write_all(&0u32.to_le_bytes()).unwrap(); // invalid alignment=0
     }
     assert!(GgufIndex::open(&bad_align).is_err());
+}
+
+#[test]
+fn repetition_and_frequency_penalties_preserve_exact_speculative_parity() {
+    let n_vocab: i32 = 12;
+    let logits0: Vec<f32> = (0..n_vocab).map(|i| 3.0 - 0.35 * (i as f32)).collect();
+    let logits1: Vec<f32> = (0..n_vocab)
+        .map(|i| 2.5 - 0.25 * ((i as f32 - 2.0).abs()))
+        .collect();
+    let logits2: Vec<f32> = (0..n_vocab).map(|i| 1.8 + 0.2 * (i as f32).cos()).collect();
+    let history = [0i32, 0, 2, 4, 0, 1];
+
+    // 1. Greedy with strong repeat_penalty + frequency_penalty + presence_penalty:
+    // multi-token verify must accept/reject identically to sequential single-token steps.
+    let sp_greedy_pen = LsSampleParams {
+        temperature: 0.0,
+        repeat_penalty: 1.45,
+        frequency_penalty: 0.6,
+        presence_penalty: 0.4,
+        penalty_last_n: 4,
+        ..LsSampleParams::default()
+    };
+    let step0 = unsafe {
+        ls_sample_from_logits_with_history(
+            logits0.as_ptr(),
+            n_vocab,
+            &sp_greedy_pen,
+            history.as_ptr(),
+            history.len() as i32,
+        )
+    };
+    let mut hist_after_0 = history.to_vec();
+    hist_after_0.push(step0);
+    let step1 = unsafe {
+        ls_sample_from_logits_with_history(
+            logits1.as_ptr(),
+            n_vocab,
+            &sp_greedy_pen,
+            hist_after_0.as_ptr(),
+            hist_after_0.len() as i32,
+        )
+    };
+    let logits_ptrs = [logits0.as_ptr(), logits1.as_ptr(), logits2.as_ptr()];
+    let matching_draft = [step0, 999_999.min(n_vocab - 1)];
+    let mut acc = 0i32;
+    let mut next_tok = 0i32;
+    unsafe {
+        ls_verify_sample_from_logits_with_history(
+            logits_ptrs.as_ptr(),
+            n_vocab,
+            matching_draft.as_ptr(),
+            2,
+            &sp_greedy_pen,
+            history.as_ptr(),
+            history.len() as i32,
+            &mut acc,
+            &mut next_tok,
+        );
+    }
+    if matching_draft[1] == step1 {
+        assert_eq!(acc, 2);
+    } else {
+        assert_eq!(acc, 1);
+        assert_eq!(next_tok, step1);
+    }
+
+    // 2. Sampled (T=0.85, min_p=0.08, repeat/freq/presence penalties) 2-step joint distribution:
+    // verify that (first_emitted, second_emitted_when_accepted) matches sequential sampling.
+    let n_draws = 150_000usize;
+    let mut counts_seq = vec![0usize; n_vocab as usize];
+    let mut counts_ver = vec![0usize; n_vocab as usize];
+    let draft = [1i32, 3i32];
+
+    for i in 0..n_draws {
+        let sp1 = LsSampleParams {
+            temperature: 0.85,
+            top_p: 0.90,
+            min_p: 0.08,
+            top_k: 10,
+            repeat_penalty: 1.25,
+            frequency_penalty: 0.35,
+            presence_penalty: 0.25,
+            penalty_last_n: 5,
+            seed: (i as u32).wrapping_mul(2654435761).wrapping_add(31),
+        };
+        let t_seq = unsafe {
+            ls_sample_from_logits_with_history(
+                logits0.as_ptr(),
+                n_vocab,
+                &sp1,
+                history.as_ptr(),
+                history.len() as i32,
+            )
+        };
+        counts_seq[t_seq as usize] += 1;
+
+        let mut sp2 = sp1;
+        sp2.seed = (i as u32).wrapping_mul(2246822519).wrapping_add(73);
+        let mut v_acc = 0i32;
+        let mut v_next = 0i32;
+        unsafe {
+            ls_verify_sample_from_logits_with_history(
+                logits_ptrs.as_ptr(),
+                n_vocab,
+                draft.as_ptr(),
+                2,
+                &sp2,
+                history.as_ptr(),
+                history.len() as i32,
+                &mut v_acc,
+                &mut v_next,
+            );
+        }
+        let t_ver = if v_acc >= 1 { draft[0] } else { v_next };
+        counts_ver[t_ver as usize] += 1;
+    }
+
+    let tv: f64 = counts_seq
+        .iter()
+        .zip(counts_ver.iter())
+        .map(|(&a, &b)| ((a as f64 / n_draws as f64) - (b as f64 / n_draws as f64)).abs())
+        .sum::<f64>()
+        * 0.5;
+    assert!(
+        tv < 0.008,
+        "penalized rejection sampler TV distance too high: {tv:.5}"
+    );
 }

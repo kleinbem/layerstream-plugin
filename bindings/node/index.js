@@ -363,7 +363,12 @@ class AutoModel {
       maxTokens: opts.maxTokens ?? opts.max_tokens ?? 256,
       temperature: opts.temperature ?? 0.0,
       topP: opts.topP ?? opts.top_p ?? 0.95,
+      minP: opts.minP ?? opts.min_p ?? 0.0,
       topK: opts.topK ?? opts.top_k ?? 40,
+      repeatPenalty: opts.repeatPenalty ?? opts.repeat_penalty ?? 1.0,
+      frequencyPenalty: opts.frequencyPenalty ?? opts.frequency_penalty ?? 0.0,
+      presencePenalty: opts.presencePenalty ?? opts.presence_penalty ?? 0.0,
+      penaltyLastN: opts.penaltyLastN ?? opts.penalty_last_n ?? 64,
       seed: opts.seed ?? 42,
       stop,
       ngramSpeculation: opts.ngramSpeculation ?? opts.ngram_speculation ?? true,
@@ -692,6 +697,36 @@ class AutoModel {
         return Boolean(res.trimmed);
       }
       return await this._backend.kvTrim(posMin);
+    } catch (err) {
+      throw mapNativeError(err);
+    }
+  }
+
+  async saveState(statePath) {
+    if (typeof statePath !== "string" || statePath.trim().length === 0) {
+      throw new TypeError("path must be a non-empty string");
+    }
+    try {
+      if (this._isolated) {
+        const res = await this._backend.rpc("save_state", { path: statePath });
+        return Number(res.tokens ?? 0);
+      }
+      return await this._backend.saveState(statePath);
+    } catch (err) {
+      throw mapNativeError(err);
+    }
+  }
+
+  async loadState(statePath) {
+    if (typeof statePath !== "string" || statePath.trim().length === 0) {
+      throw new TypeError("path must be a non-empty string");
+    }
+    try {
+      if (this._isolated) {
+        const res = await this._backend.rpc("load_state", { path: statePath });
+        return Number(res.tokens ?? 0);
+      }
+      return await this._backend.loadState(statePath);
     } catch (err) {
       throw mapNativeError(err);
     }

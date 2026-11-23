@@ -2,7 +2,7 @@
 
 [package]
 name = "layerstream-py"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Native Python bindings for layerstream-core (out-of-core GGUF layer-streaming LLM engine)"
@@ -17,10 +17,16 @@ default = []
 vulkan = ["layerstream-core/vulkan"]
 cuda = ["layerstream-core/cuda"]
 metal = ["layerstream-core/metal"]
-dynamic-backends = ["layerstream-core/dynamic-backends"]
+dynamic-backends = [
+    "layerstream-core/dynamic-backends",
+    "layerstream-core/python-stage-backends",
+]
 
 [dependencies]
 anyhow = "1"
 layerstream-core = { path = "../../crates/layerstream-core", features = ["hf"] }
-pyo3 = { version = "0.30", features = ["abi3-py39"] }
+layerstream-server = { path = "../../crates/layerstream-server" }
+pyo3 = { version = "0.30", features = ["abi3-py314"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }

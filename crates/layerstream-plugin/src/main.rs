@@ -38,6 +38,9 @@ enum Command {
         /// Listen TCP port.
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        /// Optional Bearer API key for `/v1/*` routes (`Authorization: Bearer <KEY>`).
+        #[arg(long, env = "LAYERSTREAM_API_KEY")]
+        api_key: Option<String>,
         #[command(flatten)]
         engine: EngineArgs,
     },
@@ -202,7 +205,12 @@ fn main() -> Result<()> {
     let result = rt.block_on(async move {
         match cli.command {
             Some(Command::Worker) => worker::run_worker_process().await,
-            Some(Command::Serve { host, port, engine }) => {
+            Some(Command::Serve {
+                host,
+                port,
+                api_key,
+                engine,
+            }) => {
                 let in_process = engine.in_process;
                 let server_cfg = engine.into_server_config()?;
                 let addr = format!("{host}:{port}");
@@ -212,11 +220,11 @@ fn main() -> Result<()> {
                 tracing::info!(
                     addr = %addr,
                     models = server_cfg.registry.len(),
-                    worker_isolated = !in_process,
+                    worker_isolated = !in_process && api_key.is_none(),
                     "starting standalone layerstream OpenAI server (0 MB GPU memory idle)"
                 );
-                if in_process {
-                    layerstream_server::serve(listener, server_cfg).await
+                if in_process || api_key.is_some() {
+                    layerstream_server::serve_with_api_key(listener, server_cfg, api_key).await
                 } else {
                     let coordinator = worker::WorkerCoordinator::new(server_cfg)?;
                     let coord_shutdown = coordinator.clone();

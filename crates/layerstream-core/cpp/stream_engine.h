@@ -127,6 +127,7 @@ typedef struct ls_engine_stats {
     bool is_unified_memory;
     bool using_gpu;
     bool can_speculate;
+    char backend_name[32];
 } ls_engine_stats;
 
 typedef struct ls_chat_message {
@@ -137,7 +138,12 @@ typedef struct ls_chat_message {
 typedef struct ls_sample_params {
     float temperature;
     float top_p;
+    float min_p;
     int32_t top_k;
+    float repeat_penalty;
+    float frequency_penalty;
+    float presence_penalty;
+    int32_t penalty_last_n;
     uint32_t seed;
 } ls_sample_params;
 
@@ -151,14 +157,29 @@ uint32_t ls_engine_n_ctx(const ls_engine * eng);
 void ls_engine_set_cancel(ls_engine * eng, bool cancel);
 void ls_engine_set_cancel_cb(ls_engine * eng, ls_cancel_check_cb cb, const void * user_data);
 bool ls_probe_gpu_memory(bool use_gpu, uint64_t * out_free_bytes, uint64_t * out_total_bytes);
+bool ls_probe_gpu_device(
+    bool use_gpu,
+    uint64_t * out_free_bytes,
+    uint64_t * out_total_bytes,
+    char * out_backend_name,
+    size_t backend_name_cap
+);
 /** Controls llama.cpp/ggml stderr verbosity (false suppresses INFO/DEBUG logs while keeping WARN/ERROR). */
 void ls_set_log_verbose(bool verbose);
 
-/** Pure sampling helper shared by eval_sample and tests (exact top_k -> temp -> top_p). */
+/** Pure sampling helper shared by eval_sample and tests (exact penalties -> top_k -> temp -> min_p -> top_p). */
 int32_t ls_sample_from_logits(
     const float * logits,
     int32_t n_vocab,
     const ls_sample_params * sample_params
+);
+
+int32_t ls_sample_from_logits_with_history(
+    const float * logits,
+    int32_t n_vocab,
+    const ls_sample_params * sample_params,
+    const int32_t * penalty_tokens,
+    int32_t n_penalty_tokens
 );
 
 /**
@@ -174,6 +195,18 @@ void ls_verify_sample_from_logits(
     const int32_t * draft_tokens,
     int32_t k,
     const ls_sample_params * sample_params,
+    int32_t * out_accepted_count,
+    int32_t * out_next_token
+);
+
+void ls_verify_sample_from_logits_with_history(
+    const float * const * logits_per_pos,
+    int32_t n_vocab,
+    const int32_t * draft_tokens,
+    int32_t k,
+    const ls_sample_params * sample_params,
+    const int32_t * penalty_tokens,
+    int32_t n_penalty_tokens,
     int32_t * out_accepted_count,
     int32_t * out_next_token
 );
@@ -210,6 +243,27 @@ bool ls_engine_token_is_eog(const ls_engine * eng, int32_t token);
 void ls_engine_kv_clear(ls_engine * eng);
 bool ls_engine_kv_trim(ls_engine * eng, int32_t pos_min);
 
+/** Saves full KV memory state + `tokens[0..n_tokens)` to `path` via `llama_state_save_file`. */
+int ls_engine_save_state(
+    ls_engine * eng,
+    const char * path,
+    const int32_t * tokens,
+    size_t n_tokens,
+    char * err_buf,
+    size_t err_cap
+);
+
+/** Restores full KV memory state + token sequence from `path` via `llama_state_load_file`. */
+int ls_engine_load_state(
+    ls_engine * eng,
+    const char * path,
+    int32_t * out_tokens,
+    size_t cap_tokens,
+    size_t * out_n_tokens,
+    char * err_buf,
+    size_t err_cap
+);
+
 int ls_engine_eval_greedy(
     ls_engine * eng,
     const int32_t * tokens,
@@ -226,6 +280,8 @@ int ls_engine_eval_sample(
     int32_t n_tokens,
     int32_t pos_start,
     const ls_sample_params * sample_params,
+    const int32_t * penalty_tokens,
+    int32_t n_penalty_tokens,
     int32_t * out_next_token,
     char * err_buf,
     size_t err_cap
@@ -242,8 +298,9 @@ int ls_engine_eval_verify_greedy(
 );
 
 /**
- * Lossless speculative rejection sampling verification for temperature > 0.
+ * Lossless speculative rejection sampling verification for temperature > 0 (or penalized greedy).
  * `tokens[0]` is the anchor token and `tokens[1..n_tokens-1]` are K draft tokens.
+ * `penalty_tokens[0..n_penalty_tokens)` holds history up through `tokens[0]`.
  * Writes accepted draft count in `[0..K]` to `out_accepted_count` and the next
  * token (either the resampled correction token or the bonus token when all K
  * are accepted) to `out_next_token`.
@@ -254,6 +311,8 @@ int ls_engine_eval_verify_sample(
     int32_t n_tokens,
     int32_t pos_start,
     const ls_sample_params * sample_params,
+    const int32_t * penalty_tokens,
+    int32_t n_penalty_tokens,
     int32_t * out_accepted_count,
     int32_t * out_next_token,
     char * err_buf,
@@ -284,6 +343,8 @@ int ls_engine_eval_with_grammar(
     int32_t n_tokens,
     int32_t pos_start,
     const ls_sample_params * sample_params,
+    const int32_t * penalty_tokens,
+    int32_t n_penalty_tokens,
     ls_grammar * grammar,
     int32_t * out_next_token,
     char * err_buf,
@@ -296,6 +357,8 @@ int ls_engine_eval_verify_with_grammar(
     int32_t n_tokens,
     int32_t pos_start,
     const ls_sample_params * sample_params,
+    const int32_t * penalty_tokens,
+    int32_t n_penalty_tokens,
     ls_grammar * grammar,
     int32_t * out_accepted_count,
     int32_t * out_next_token,

@@ -11,10 +11,11 @@ use crate::ffi::{
     LsTensorSliceReq, ls_engine_apply_chat_template, ls_engine_create, ls_engine_eval_greedy,
     ls_engine_eval_sample, ls_engine_eval_verify_greedy, ls_engine_eval_verify_sample,
     ls_engine_eval_verify_with_grammar, ls_engine_eval_with_grammar, ls_engine_free,
-    ls_engine_get_stats, ls_engine_kv_clear, ls_engine_kv_trim, ls_engine_n_ctx,
-    ls_engine_set_cancel_cb, ls_engine_token_is_eog, ls_engine_token_to_piece, ls_engine_tokenize,
-    ls_engine_vocab_size, ls_grammar_accept, ls_grammar_create, ls_grammar_free,
-    ls_probe_gpu_memory, ls_set_log_verbose,
+    ls_engine_get_stats, ls_engine_kv_clear, ls_engine_kv_trim, ls_engine_load_state,
+    ls_engine_n_ctx, ls_engine_save_state, ls_engine_set_cancel_cb, ls_engine_token_is_eog,
+    ls_engine_token_to_piece, ls_engine_tokenize, ls_engine_vocab_size, ls_grammar_accept,
+    ls_grammar_create, ls_grammar_free, ls_probe_gpu_device, ls_probe_gpu_memory,
+    ls_set_log_verbose,
 };
 use crate::gguf_index::{GgufIndex, MAX_DRAFT_VOCAB_PAD_DELTA};
 use crate::io_reader::{IoStats, LayerIoPool};
@@ -157,7 +158,7 @@ impl Default for GenerateOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GenerateSummary {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
@@ -285,6 +286,38 @@ impl StreamEngine {
         let ok = unsafe { ls_probe_gpu_memory(use_gpu, &mut free_b, &mut total_b) };
         if ok && total_b > 0 {
             Some((free_b, total_b))
+        } else {
+            None
+        }
+    }
+
+    /// Probes `(free_bytes, total_bytes, backend_name)` on the primary GPU backend.
+    pub fn probe_gpu_device(use_gpu: bool) -> Option<(u64, u64, String)> {
+        let mut free_b = 0u64;
+        let mut total_b = 0u64;
+        let mut name_buf = [0 as c_char; 32];
+        let ok = unsafe {
+            ls_probe_gpu_device(
+                use_gpu,
+                &mut free_b,
+                &mut total_b,
+                name_buf.as_mut_ptr(),
+                name_buf.len(),
+            )
+        };
+        if ok && total_b > 0 {
+            let name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            Some((
+                free_b,
+                total_b,
+                if name.is_empty() {
+                    "GPU".to_string()
+                } else {
+                    name
+                },
+            ))
         } else {
             None
         }
@@ -504,6 +537,103 @@ impl StreamEngine {
         ok
     }
 
+    /// Returns the number of committed tokens currently tracked in the engine's KV prefix cache.
+    pub fn cached_kv_len(&self) -> usize {
+        self.cached_kv_tokens.len()
+    }
+
+    /// Saves the engine's current KV cache memory and committed token sequence to `path` on disk
+    /// (allowing instant ~20 ms prefix restore on future runs without re-streaming prompt layers).
+    /// Returns the number of KV tokens saved.
+    pub fn save_state(&mut self, path: impl AsRef<Path>) -> Result<usize> {
+        let path_ref = path.as_ref();
+        if let Some(parent) = path_ref.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create parent directory '{}'", parent.display()))?;
+        }
+        #[cfg(unix)]
+        let path_bytes = std::os::unix::ffi::OsStrExt::as_bytes(path_ref.as_os_str());
+        #[cfg(not(unix))]
+        let path_lossy = path_ref.to_string_lossy();
+        #[cfg(not(unix))]
+        let path_bytes = path_lossy.as_bytes();
+        let c_path = CString::new(path_bytes).context("state path contains interior NUL")?;
+
+        // Trim any uncommitted speculative tail above `cached_kv_tokens` before saving.
+        if self.stats().can_speculate {
+            let _ =
+                unsafe { ls_engine_kv_trim(self.raw.as_ptr(), self.cached_kv_tokens.len() as i32) };
+        }
+
+        let mut err_buf = [0 as c_char; 512];
+        let rc = unsafe {
+            ls_engine_save_state(
+                self.raw.as_ptr(),
+                c_path.as_ptr(),
+                if self.cached_kv_tokens.is_empty() {
+                    std::ptr::null()
+                } else {
+                    self.cached_kv_tokens.as_ptr()
+                },
+                self.cached_kv_tokens.len(),
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if rc != 0 {
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!("save_state failed: {msg}");
+        }
+        Ok(self.cached_kv_tokens.len())
+    }
+
+    /// Restores a previously saved KV cache snapshot and token sequence from `path`.
+    /// Subsequent `.generate()` / `.chat()` calls automatically reuse the restored KV prefix.
+    /// Returns the number of KV tokens restored.
+    pub fn load_state(&mut self, path: impl AsRef<Path>) -> Result<usize> {
+        let path_ref = path.as_ref();
+        if !path_ref.is_file() {
+            bail!("KV state file not found: '{}'", path_ref.display());
+        }
+        #[cfg(unix)]
+        let path_bytes = std::os::unix::ffi::OsStrExt::as_bytes(path_ref.as_os_str());
+        #[cfg(not(unix))]
+        let path_lossy = path_ref.to_string_lossy();
+        #[cfg(not(unix))]
+        let path_bytes = path_lossy.as_bytes();
+        let c_path = CString::new(path_bytes).context("state path contains interior NUL")?;
+
+        let cap = (self.n_ctx().max(1) as usize).max(16);
+        let mut tokens_out = vec![0i32; cap];
+        let mut n_loaded: usize = 0;
+        let mut err_buf = [0 as c_char; 512];
+        let rc = unsafe {
+            ls_engine_load_state(
+                self.raw.as_ptr(),
+                c_path.as_ptr(),
+                tokens_out.as_mut_ptr(),
+                cap,
+                &mut n_loaded,
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if rc != 0 {
+            self.cached_kv_tokens.clear();
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!("load_state failed: {msg}");
+        }
+        tokens_out.truncate(n_loaded.min(cap));
+        self.cached_kv_tokens = tokens_out;
+        Ok(self.cached_kv_tokens.len())
+    }
+
     pub fn eval_greedy(&mut self, tokens: &[i32], pos_start: i32) -> Result<i32> {
         let mut next = 0i32;
         let mut err_buf = [0 as c_char; 512];
@@ -536,8 +666,26 @@ impl StreamEngine {
         pos_start: i32,
         sample: &LsSampleParams,
     ) -> Result<i32> {
+        self.eval_sample_with_history(tokens, pos_start, sample, &[])
+    }
+
+    pub fn eval_sample_with_history(
+        &mut self,
+        tokens: &[i32],
+        pos_start: i32,
+        sample: &LsSampleParams,
+        penalty_history: &[i32],
+    ) -> Result<i32> {
         let mut next = 0i32;
         let mut err_buf = [0 as c_char; 512];
+        let (pen_ptr, pen_len) = if penalty_history.is_empty() {
+            (std::ptr::null(), 0)
+        } else {
+            (
+                penalty_history.as_ptr(),
+                penalty_history.len().min(i32::MAX as usize) as i32,
+            )
+        };
         let rc = unsafe {
             ls_engine_eval_sample(
                 self.raw.as_ptr(),
@@ -545,6 +693,8 @@ impl StreamEngine {
                 tokens.len() as i32,
                 pos_start,
                 sample,
+                pen_ptr,
+                pen_len,
                 &mut next,
                 err_buf.as_mut_ptr(),
                 err_buf.len(),
@@ -588,7 +738,7 @@ impl StreamEngine {
         Ok(out)
     }
 
-    /// Lossless speculative rejection sampling verification for `temperature > 0`.
+    /// Lossless speculative rejection sampling verification for `temperature > 0` (or penalized greedy).
     /// Returns `(accepted_draft_count, next_token)`.
     pub fn eval_verify_sample(
         &mut self,
@@ -596,9 +746,27 @@ impl StreamEngine {
         pos_start: i32,
         sample: &LsSampleParams,
     ) -> Result<(usize, i32)> {
+        self.eval_verify_sample_with_history(tokens, pos_start, sample, &[])
+    }
+
+    pub fn eval_verify_sample_with_history(
+        &mut self,
+        tokens: &[i32],
+        pos_start: i32,
+        sample: &LsSampleParams,
+        penalty_history: &[i32],
+    ) -> Result<(usize, i32)> {
         let mut accepted = 0i32;
         let mut next_tok = 0i32;
         let mut err_buf = [0 as c_char; 512];
+        let (pen_ptr, pen_len) = if penalty_history.is_empty() {
+            (std::ptr::null(), 0)
+        } else {
+            (
+                penalty_history.as_ptr(),
+                penalty_history.len().min(i32::MAX as usize) as i32,
+            )
+        };
         let rc = unsafe {
             ls_engine_eval_verify_sample(
                 self.raw.as_ptr(),
@@ -606,6 +774,8 @@ impl StreamEngine {
                 tokens.len() as i32,
                 pos_start,
                 sample,
+                pen_ptr,
+                pen_len,
                 &mut accepted,
                 &mut next_tok,
                 err_buf.as_mut_ptr(),
@@ -629,17 +799,26 @@ impl StreamEngine {
         tokens: &[i32],
         pos_start: i32,
         sample: &LsSampleParams,
+        penalty_history: &[i32],
         grammar: Option<&GrammarHandle>,
     ) -> Result<i32> {
         let Some(g) = grammar else {
-            return if sample.temperature <= 0.0 {
+            return if sample.temperature <= 0.0 && !sample.has_penalties() {
                 self.eval_greedy(tokens, pos_start)
             } else {
-                self.eval_sample(tokens, pos_start, sample)
+                self.eval_sample_with_history(tokens, pos_start, sample, penalty_history)
             };
         };
         let mut next = 0i32;
         let mut err_buf = [0 as c_char; 512];
+        let (pen_ptr, pen_len) = if penalty_history.is_empty() {
+            (std::ptr::null(), 0)
+        } else {
+            (
+                penalty_history.as_ptr(),
+                penalty_history.len().min(i32::MAX as usize) as i32,
+            )
+        };
         let rc = unsafe {
             ls_engine_eval_with_grammar(
                 self.raw.as_ptr(),
@@ -647,6 +826,8 @@ impl StreamEngine {
                 tokens.len() as i32,
                 pos_start,
                 sample,
+                pen_ptr,
+                pen_len,
                 g.raw.as_ptr(),
                 &mut next,
                 err_buf.as_mut_ptr(),
@@ -670,11 +851,20 @@ impl StreamEngine {
         tokens: &[i32],
         pos_start: i32,
         sample: &LsSampleParams,
+        penalty_history: &[i32],
         grammar: &GrammarHandle,
     ) -> Result<(usize, i32)> {
         let mut accepted = 0i32;
         let mut next_tok = 0i32;
         let mut err_buf = [0 as c_char; 512];
+        let (pen_ptr, pen_len) = if penalty_history.is_empty() {
+            (std::ptr::null(), 0)
+        } else {
+            (
+                penalty_history.as_ptr(),
+                penalty_history.len().min(i32::MAX as usize) as i32,
+            )
+        };
         let rc = unsafe {
             ls_engine_eval_verify_with_grammar(
                 self.raw.as_ptr(),
@@ -682,6 +872,8 @@ impl StreamEngine {
                 tokens.len() as i32,
                 pos_start,
                 sample,
+                pen_ptr,
+                pen_len,
                 grammar.raw.as_ptr(),
                 &mut accepted,
                 &mut next_tok,
@@ -829,11 +1021,10 @@ impl StreamEngine {
             }
             let is_last_prefill = chunk_idx + 1 == total_prefill_chunks;
             let eval_res = if is_last_prefill {
-                self.eval_step_with_grammar(chunk, pos, &opts.sample, grammar.as_ref())
-            } else if opts.sample.temperature <= 0.0 {
-                self.eval_greedy(chunk, pos)
+                self.eval_step_with_grammar(chunk, pos, &opts.sample, &history, grammar.as_ref())
             } else {
-                self.eval_sample(chunk, pos, &opts.sample)
+                // Intermediate prefill chunks discard their sampled output token, so run pure greedy.
+                self.eval_greedy(chunk, pos)
             };
             match eval_res {
                 Ok(tok) => {
@@ -994,8 +1185,8 @@ impl StreamEngine {
                     }
 
                     let verify_res = if let Some(ref g) = grammar {
-                        self.eval_verify_with_grammar(&batch, pos, &step_sample, g)
-                    } else if step_sample.temperature <= 0.0 {
+                        self.eval_verify_with_grammar(&batch, pos, &step_sample, &history, g)
+                    } else if step_sample.temperature <= 0.0 && !step_sample.has_penalties() {
                         self.eval_verify_greedy(&batch, pos).map(|verified| {
                             let mut acc = 0usize;
                             let mut next_after = verified[draft.len()];
@@ -1010,7 +1201,7 @@ impl StreamEngine {
                             (acc, next_after)
                         })
                     } else {
-                        self.eval_verify_sample(&batch, pos, &step_sample)
+                        self.eval_verify_sample_with_history(&batch, pos, &step_sample, &history)
                     };
 
                     let (accepted_n, corrected_or_bonus) = match verify_res {
@@ -1031,13 +1222,13 @@ impl StreamEngine {
                     let mut accepted = 0usize;
                     let mut early_stop = false;
                     for &d_tok in draft.iter().take(accepted_n) {
-                        accepted += 1;
                         spec_stats.accepted_tokens += 1;
                         if self.token_is_eog(d_tok) {
                             finish_reason = "stop".to_string();
                             early_stop = true;
                             break;
                         }
+                        accepted += 1;
                         if let Some(ref mut g) = grammar {
                             g.accept(d_tok)?;
                         }
@@ -1117,8 +1308,13 @@ impl StreamEngine {
             // Standard 1-token sweep fallback.
             let mut step_sample = opts.sample;
             step_sample.seed = step_sample.seed.wrapping_add(completion_tokens as u32);
-            let eval_res =
-                self.eval_step_with_grammar(&[next_tok], pos, &step_sample, grammar.as_ref());
+            let eval_res = self.eval_step_with_grammar(
+                &[next_tok],
+                pos,
+                &step_sample,
+                &history,
+                grammar.as_ref(),
+            );
             match eval_res {
                 Ok(tok) => {
                     next_tok = tok;

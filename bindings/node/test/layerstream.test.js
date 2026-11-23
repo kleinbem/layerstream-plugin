@@ -535,7 +535,7 @@ describe("layerstream Node-API SDK", () => {
           draftModel: incompatibleVocabGguf,
           useGpu: false,
         }),
-      /incompatible draftModel tokenizer/
+      /incompatible draft model tokenizer/
     );
 
     const payload = fs.readFileSync(syntheticGguf);
@@ -587,6 +587,100 @@ describe("layerstream Node-API SDK", () => {
       if (prevEndpoint === undefined) delete process.env.HF_ENDPOINT;
       else process.env.HF_ENDPOINT = prevEndpoint;
       await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  test("supports saveState, loadState, modern samplers, and draftModel='auto' across in-process and isolatedWorker", async () => {
+    const snapPath = path.join(tmpDir, "snapshots", "prefix.kv");
+    const basePrompt = "a b c d e f a b c";
+    const contPrompt = "a b c d e f a b c d e";
+
+    let savedTokens = 0;
+    let expectedCont = "";
+
+    const baseModel = await AutoModel.fromPretrained(syntheticGguf, {
+      draftModel: "auto",
+      useGpu: false,
+      ctxSize: 128,
+      batchSize: 64,
+      vramBudgetMb: 0,
+      kvCacheType: "q8_0",
+      preferDirectIo: false,
+    });
+    try {
+      const st0 = await baseModel.stats();
+      assert.equal(st0.backendName, "CPU");
+      assert.equal(st0.draftModelPath ?? null, null);
+
+      await baseModel.generate(basePrompt, {
+        maxTokens: 1,
+        temperature: 0,
+        ngramSpeculation: false,
+      });
+      savedTokens = await baseModel.saveState(snapPath);
+      assert.ok(savedTokens > 0);
+      assert.ok(fs.existsSync(snapPath));
+
+      await baseModel.kvClear();
+      expectedCont = await baseModel.generate(contPrompt, {
+        maxTokens: 10,
+        temperature: 0,
+        ngramSpeculation: false,
+      });
+
+      // Modern samplers (minP, repeatPenalty, frequencyPenalty, presencePenalty, penaltyLastN)
+      const penalized = await baseModel.generate("a a a a b c", {
+        maxTokens: 6,
+        temperature: 0.7,
+        minP: 0.08,
+        repeatPenalty: 1.25,
+        frequencyPenalty: 0.3,
+        presencePenalty: 0.2,
+        penaltyLastN: 16,
+        seed: 99,
+      });
+      assert.ok(penalized.length > 0);
+
+      await assert.rejects(
+        () => baseModel.generate("a b", { minP: 1.5 }),
+        /min_p|minP/
+      );
+      await assert.rejects(
+        () => baseModel.generate("a b", { repeatPenalty: 0 }),
+        /repeat_penalty|repeatPenalty/
+      );
+      await assert.rejects(
+        () => baseModel.loadState(path.join(tmpDir, "missing.kv")),
+        (err) => err.code === "ENOENT"
+      );
+    } finally {
+      await baseModel.unload();
+    }
+
+    for (const isolatedWorker of [false, true]) {
+      const restored = await AutoModel.fromPretrained(syntheticGguf, {
+        useGpu: false,
+        ctxSize: 128,
+        batchSize: 64,
+        vramBudgetMb: 0,
+        kvCacheType: "q8_0",
+        preferDirectIo: false,
+        isolatedWorker,
+      });
+      try {
+        const n = await restored.loadState(snapPath);
+        assert.equal(n, savedTokens);
+        const st = await restored.stats();
+        assert.equal(st.cachedKvTokens, savedTokens);
+        const gotCont = await restored.generate(contPrompt, {
+          maxTokens: 10,
+          temperature: 0,
+          ngramSpeculation: false,
+        });
+        assert.equal(gotCont, expectedCont);
+      } finally {
+        await restored.unload();
+      }
     }
   });
 });

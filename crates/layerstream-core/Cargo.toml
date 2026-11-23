@@ -12,6 +12,7 @@ vulkan = []
 cuda = []
 metal = []
 dynamic-backends = []
+python-stage-backends = []
 
 [dependencies]
 anyhow.workspace = true

@@ -24,7 +24,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::parse::{
-    StreamDelta, StreamTagParser, format_tools_system_prompt, parse_assistant_output,
+    IncomingChatMessage, StreamDelta, StreamTagParser, inject_tools_into_messages,
+    parse_assistant_output,
 };
 use crate::registry::{ModelEntry, ModelRegistry};
 
@@ -317,8 +318,36 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/unload", post(unload_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(text_completions))
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state)
+}
+
+/// Builds the standalone HTTP router enforcing an optional `Authorization: Bearer <api_key>`
+/// on `/v1/*` routes while keeping `/health` unauthenticated for liveness probes.
+pub fn build_router_with_api_key(state: AppState, api_key: Option<String>) -> Router {
+    let Some(key) = api_key.filter(|k| !k.is_empty()) else {
+        return build_router(state);
+    };
+    let expected = Arc::new(format!("Bearer {key}").into_bytes());
+    build_router(state).layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let expected = expected.clone();
+            async move {
+                if req.uri().path() == "/health" {
+                    return next.run(req).await;
+                }
+                let authorized = req
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(|v| ct_eq(v.as_bytes(), &expected))
+                    .unwrap_or(false);
+                if !authorized {
+                    return api_error(StatusCode::UNAUTHORIZED, "Unauthorized");
+                }
+                next.run(req).await
+            }
+        },
+    ))
 }
 
 /// Builds the worker router requiring a matching `x-layerstream-worker-token` header on every request.
@@ -428,7 +457,7 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionRequest {
     model: Option<String>,
-    messages: Vec<IncomingMessage>,
+    messages: Vec<IncomingChatMessage>,
     #[serde(default)]
     tools: Option<Vec<Value>>,
     #[serde(default)]
@@ -444,109 +473,21 @@ struct ChatCompletionRequest {
     #[serde(default)]
     top_p: Option<f32>,
     #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
     top_k: Option<i32>,
+    #[serde(default)]
+    repeat_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    penalty_last_n: Option<i32>,
     #[serde(default)]
     seed: Option<u32>,
     #[serde(default)]
     stop: Option<StopSpec>,
-}
-
-#[derive(Debug, Deserialize)]
-struct IncomingMessage {
-    role: String,
-    #[serde(default)]
-    content: Value,
-    #[serde(default)]
-    tool_calls: Option<Vec<Value>>,
-    #[serde(default)]
-    tool_call_id: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-}
-
-impl IncomingMessage {
-    fn to_chat_message(&self) -> std::result::Result<ChatMessage, String> {
-        let mut text = match &self.content {
-            Value::String(s) => s.clone(),
-            Value::Array(parts) => {
-                let mut texts = Vec::with_capacity(parts.len());
-                for part in parts {
-                    let kind = part.get("type").and_then(Value::as_str);
-                    match kind {
-                        Some("text") | None => {
-                            if let Some(t) = part.get("text").and_then(Value::as_str) {
-                                texts.push(t);
-                            } else {
-                                return Err(format!(
-                                    "unsupported chat message content part: {part}"
-                                ));
-                            }
-                        }
-                        Some(other) => {
-                            return Err(format!(
-                                "unsupported multimodal content part type '{other}'; only text content is supported"
-                            ));
-                        }
-                    }
-                }
-                texts.join("\n")
-            }
-            Value::Null => String::new(),
-            other => {
-                return Err(format!(
-                    "unsupported chat message content value (expected string, array, or null): {other}"
-                ));
-            }
-        };
-
-        // Preserve assistant `tool_calls` across multi-turn agent loops.
-        if let Some(calls) = &self.tool_calls
-            && !calls.is_empty()
-        {
-            for call in calls {
-                let func = call.get("function").unwrap_or(call);
-                let name = func.get("name").and_then(Value::as_str).unwrap_or("");
-                let raw_args = func.get("arguments").cloned().unwrap_or(Value::Null);
-                let args_val = match raw_args {
-                    Value::String(ref s) => {
-                        serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.clone()))
-                    }
-                    other => other,
-                };
-                if !name.is_empty() {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    let mut payload = json!({"name": name, "arguments": args_val});
-                    if let Some(call_id) = call.get("id").and_then(Value::as_str)
-                        && !call_id.is_empty()
-                    {
-                        payload["id"] = json!(call_id);
-                    }
-                    text.push_str(&format!("<tool_call>{payload}</tool_call>"));
-                }
-            }
-        }
-
-        // Preserve tool response identity (`tool_call_id` / `name`) for `role: "tool"`.
-        if self.role == "tool" {
-            let mut prefix = String::new();
-            if let Some(name) = &self.name {
-                prefix.push_str(&format!("tool={name} "));
-            }
-            if let Some(id) = &self.tool_call_id {
-                prefix.push_str(&format!("call_id={id}: "));
-            }
-            if !prefix.is_empty() {
-                text = format!("{prefix}{text}");
-            }
-        }
-
-        Ok(ChatMessage {
-            role: self.role.clone(),
-            content: text,
-        })
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,7 +519,17 @@ struct TextCompletionRequest {
     #[serde(default)]
     top_p: Option<f32>,
     #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
     top_k: Option<i32>,
+    #[serde(default)]
+    repeat_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    penalty_last_n: Option<i32>,
     #[serde(default)]
     seed: Option<u32>,
     #[serde(default)]
@@ -598,7 +549,9 @@ struct ErrorBody {
 }
 
 pub fn api_error(status: StatusCode, msg: impl Into<String>) -> Response {
-    let kind = if status == StatusCode::BAD_REQUEST
+    let kind = if status == StatusCode::UNAUTHORIZED {
+        "authentication_error"
+    } else if status == StatusCode::BAD_REQUEST
         || status == StatusCode::NOT_FOUND
         || status == StatusCode::FORBIDDEN
     {
@@ -701,6 +654,20 @@ async fn chat_completions(
         }
     };
 
+    let sample = LsSampleParams {
+        temperature: req.temperature.unwrap_or(0.0),
+        top_p: req.top_p.unwrap_or(0.95),
+        min_p: req.min_p.unwrap_or(0.0),
+        top_k: req.top_k.unwrap_or(40),
+        repeat_penalty: req.repeat_penalty.unwrap_or(1.0),
+        frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+        presence_penalty: req.presence_penalty.unwrap_or(0.0),
+        penalty_last_n: req.penalty_last_n.unwrap_or(64),
+        seed: req.seed.unwrap_or_else(next_random_seed),
+    };
+    if let Err(msg) = sample.validate() {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
     // Acquire queue admission permit SYNCHRONOUSLY before returning 200 OK SSE headers so
     // queue saturation always returns HTTP 503 Service Unavailable (never 200 OK + [DONE]).
     let permit = match state.residency.try_acquire_admission() {
@@ -711,32 +678,15 @@ async fn chat_completions(
     let mut messages: Vec<ChatMessage> = match req
         .messages
         .iter()
-        .map(IncomingMessage::to_chat_message)
+        .map(IncomingChatMessage::to_chat_message)
         .collect::<std::result::Result<Vec<_>, _>>()
     {
         Ok(msgs) => msgs,
         Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
     };
 
-    if allow_tool_calls
-        && let Some(tools) = &req.tools
-        && !tools.is_empty()
-    {
-        let tool_prompt = format_tools_system_prompt(tools);
-        if let Some(first) = messages.first_mut()
-            && first.role == "system"
-        {
-            first.content.push_str("\n\n");
-            first.content.push_str(&tool_prompt);
-        } else {
-            messages.insert(
-                0,
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: tool_prompt,
-                },
-            );
-        }
+    if allow_tool_calls && let Some(tools) = &req.tools {
+        inject_tools_into_messages(&mut messages, tools);
     }
 
     let max_tokens = req
@@ -746,12 +696,7 @@ async fn chat_completions(
         .clamp(1, state.config.n_ctx.max(1) as usize);
     let opts = GenerateOptions {
         max_tokens,
-        sample: LsSampleParams {
-            temperature: req.temperature.unwrap_or(0.0),
-            top_p: req.top_p.unwrap_or(0.95),
-            top_k: req.top_k.unwrap_or(40),
-            seed: req.seed.unwrap_or_else(next_random_seed),
-        },
+        sample,
         stop: req.stop.map(StopSpec::into_vec).unwrap_or_default(),
         enable_ngram_speculation: state.config.enable_ngram_speculation,
         max_draft_tokens: state.config.max_draft_tokens,
@@ -1040,6 +985,21 @@ async fn text_completions(
         Err(resp) => return *resp,
     };
 
+    let sample = LsSampleParams {
+        temperature: req.temperature.unwrap_or(0.0),
+        top_p: req.top_p.unwrap_or(0.95),
+        min_p: req.min_p.unwrap_or(0.0),
+        top_k: req.top_k.unwrap_or(40),
+        repeat_penalty: req.repeat_penalty.unwrap_or(1.0),
+        frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+        presence_penalty: req.presence_penalty.unwrap_or(0.0),
+        penalty_last_n: req.penalty_last_n.unwrap_or(64),
+        seed: req.seed.unwrap_or_else(next_random_seed),
+    };
+    if let Err(msg) = sample.validate() {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+
     let permit = match state.residency.try_acquire_admission() {
         Ok(p) => p,
         Err(err) => return api_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
@@ -1050,12 +1010,7 @@ async fn text_completions(
             .max_tokens
             .unwrap_or(256)
             .clamp(1, state.config.n_ctx.max(1) as usize),
-        sample: LsSampleParams {
-            temperature: req.temperature.unwrap_or(0.0),
-            top_p: req.top_p.unwrap_or(0.95),
-            top_k: req.top_k.unwrap_or(40),
-            seed: req.seed.unwrap_or_else(next_random_seed),
-        },
+        sample,
         stop: req.stop.map(StopSpec::into_vec).unwrap_or_default(),
         enable_ngram_speculation: state.config.enable_ngram_speculation,
         max_draft_tokens: state.config.max_draft_tokens,
@@ -1308,7 +1263,7 @@ mod tests {
 
     #[test]
     fn chat_message_accepts_text_parts_and_rejects_multimodal_parts() {
-        let ok_msg = IncomingMessage {
+        let ok_msg = IncomingChatMessage {
             role: "user".to_string(),
             content: json!([
                 {"type": "text", "text": "hello"},
@@ -1321,7 +1276,7 @@ mod tests {
         let converted = ok_msg.to_chat_message().unwrap();
         assert_eq!(converted.content, "hello\nworld");
 
-        let bad_msg = IncomingMessage {
+        let bad_msg = IncomingChatMessage {
             role: "user".to_string(),
             content: json!([
                 {"type": "text", "text": "describe this"},

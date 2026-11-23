@@ -83,9 +83,95 @@ fn stage_shared_libs(shared_libs: &[PathBuf], stage_dir: &Path) {
     }
 }
 
+fn is_core_soname_stem(fname: &str) -> Option<&'static str> {
+    for stem in ["libllama", "libggml-base", "libggml"] {
+        if fname == format!("{stem}.so")
+            || fname.starts_with(&format!("{stem}.so."))
+            || fname == format!("{stem}.dylib")
+            || (fname.starts_with(&format!("{stem}.")) && fname.ends_with(".dylib"))
+        {
+            return Some(stem);
+        }
+    }
+    None
+}
+
+/// Stages a single canonical copy of each shared library / backend plugin into a Python wheel's
+/// `_backends` directory (avoiding 3x zip duplication from `.so` / `.so.0` / `.so.0.x.y` symlinks).
+/// Workaround: `auditwheel repair` renames/hashes runtime-`dlopen`ed `libggml-*.so` backend plugins
+/// (upstream: pypa/auditwheel#594, upstream: PyO3/maturin#2045).
+fn stage_python_wheel_backends(shared_libs: &[PathBuf], stage_dir: &Path, target_os: &str) {
+    if let Ok(entries) = std::fs::read_dir(stage_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && (name.starts_with("libggml")
+                    || name.starts_with("libllama")
+                    || name.starts_with("ggml")
+                    || name.starts_with("llama"))
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    let _ = std::fs::create_dir_all(stage_dir);
+
+    for src in shared_libs {
+        let Some(fname) = src.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(fname.starts_with("libggml")
+            || fname.starts_with("libllama")
+            || fname.starts_with("ggml")
+            || fname.starts_with("llama"))
+        {
+            continue;
+        }
+
+        let keep = if target_os == "linux" {
+            if let Some(stem) = is_core_soname_stem(fname) {
+                // Core libraries (`libllama`, `libggml`, `libggml-base`) are linked via DT_SONAME
+                // `lib<stem>.so.<major>` (single numeric component after `.so.`).
+                let prefix = format!("{stem}.so.");
+                if let Some(rest) = fname.strip_prefix(&prefix) {
+                    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                } else {
+                    !shared_libs.iter().any(|other| {
+                        other
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .and_then(|n| n.strip_prefix(&prefix))
+                            .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+                    }) && fname == format!("{stem}.so")
+                }
+            } else {
+                // Backend plugins (`libggml-cpu.so`, `libggml-vulkan.so`, `libggml-cuda.so`) are
+                // opened by `ggml_backend_load_best` via exact unversioned `.so` name.
+                fname.ends_with(".so")
+            }
+        } else if target_os == "macos" {
+            fname.ends_with(".so") || (fname.ends_with(".dylib") && fname.matches('.').count() <= 2)
+        } else {
+            fname.ends_with(".dll")
+        };
+
+        if !keep {
+            continue;
+        }
+        let dst = stage_dir.join(fname);
+        if let Ok(meta) = std::fs::metadata(src)
+            && meta.is_file()
+        {
+            let _ = std::fs::copy(src, &dst);
+            println!("cargo:rerun-if-changed={}", dst.display());
+        }
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_DIR");
     println!("cargo:rerun-if-env-changed=LAYERSTREAM_BACKEND_STAGE_DIR");
+    println!("cargo:rerun-if-env-changed=LAYERSTREAM_PORTABLE_WHEEL");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDAToolkit_ROOT");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -123,6 +209,8 @@ fn main() {
         .define("GGML_OPENMP", "OFF")
         .define("GGML_VULKAN", if use_vulkan { "ON" } else { "OFF" })
         .define("GGML_CUDA", if use_cuda { "ON" } else { "OFF" })
+        // Workaround: ggml-cuda holds a single graph slot invalidated by per-layer cb_eval splits
+        // (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
         .define("GGML_CUDA_GRAPHS", "OFF")
         .define("GGML_METAL", if use_metal { "ON" } else { "OFF" })
         .define(
@@ -139,9 +227,10 @@ fn main() {
 
     if dynamic_backends && target_os == "linux" {
         // Ensure staged `libggml-*.so` MODULE/SHARED libraries resolve sibling `libggml-base.so`
-        // via `$ORIGIN` (relocatable tarballs) and, on NixOS, the host GPU driver directory
-        // `/run/opengl-driver/lib` without requiring `LD_LIBRARY_PATH`.
-        let has_opengl_dir = Path::new("/run/opengl-driver/lib").is_dir();
+        // via `$ORIGIN` (relocatable tarballs/wheels) and, on NixOS local dev builds (when not
+        // building portable PyPI wheels), the host GPU driver directory `/run/opengl-driver/lib`.
+        let portable_wheel = env::var("LAYERSTREAM_PORTABLE_WHEEL").ok().as_deref() == Some("1");
+        let has_opengl_dir = !portable_wheel && Path::new("/run/opengl-driver/lib").is_dir();
         let build_rpath = if has_opengl_dir {
             "$ORIGIN;/run/opengl-driver/lib"
         } else {
@@ -177,9 +266,9 @@ fn main() {
         if let Ok(host_cc) = env::var("CMAKE_CUDA_HOST_COMPILER") {
             cfg.define("CMAKE_CUDA_HOST_COMPILER", host_cc);
         }
-        // On NixOS with a live host CUDA driver, point CMake's `FindCUDAToolkit` at the real
-        // driver instead of `lib/stubs/libcuda.so` so `lib/stubs` never enters `libggml-cuda.so`'s
-        // DT_RUNPATH and shadows the real driver when launched outside `nix develop .#cuda`.
+        // Workaround: on NixOS with a live host CUDA driver, point CMake's `FindCUDAToolkit` at
+        // the real driver instead of `lib/stubs/libcuda.so` so Nix `ld-wrapper` never records
+        // `lib/stubs` into `DT_RUNPATH` (upstream: NixOS/nixpkgs#323619).
         if Path::new("/run/opengl-driver/lib/libcuda.so.1").exists() {
             cfg.define(
                 "CUDA_cuda_driver_LIBRARY",
@@ -211,10 +300,10 @@ fn main() {
         cc_build.define("LAYERSTREAM_DYNAMIC_BACKENDS", None);
     }
 
-    if use_cuda && dynamic_backends {
-        // Resolve libcudart symbols lazily via dlopen/dlsym ONLY inside the worker once
-        // `libggml-cuda.so` is loaded, keeping the parent executable free of CUDA DT_NEEDED
-        // (and avoiding libcublasLt's ~224 MiB `.init_array` RSS overhead while idle).
+    if dynamic_backends && (use_cuda || target_os == "linux") {
+        // Resolve libcudart symbols lazily via dlopen/dlsym ONLY once `libggml-cuda.so` is
+        // loaded at runtime (e.g., via `layerstream-cuda12` or `MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR`),
+        // keeping the base binary/wheel free of compile-time CUDA headers and CUDA DT_NEEDED!
         cc_build.define("LAYERSTREAM_USE_CUDA_DYNAMIC", None);
     } else if use_cuda && !dynamic_backends {
         cc_build.define("LAYERSTREAM_USE_CUDA", None);
@@ -304,6 +393,11 @@ fn main() {
             && !custom_stage.trim().is_empty()
         {
             stage_shared_libs(&shared_libs, Path::new(&custom_stage));
+        }
+        if env::var("CARGO_FEATURE_PYTHON_STAGE_BACKENDS").is_ok() {
+            let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+            let py_stage = manifest_dir.join("../../bindings/python/python/layerstream/_backends");
+            stage_python_wheel_backends(&shared_libs, &py_stage, &target_os);
         }
 
         for name in ["llama", "ggml", "ggml-base"] {

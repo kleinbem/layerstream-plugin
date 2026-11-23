@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import gc
 import hashlib
 import json
@@ -56,17 +54,13 @@ def test_load_generate_stream_chat_stats_and_unload(synthetic_gguf: Path) -> Non
         assert summary["finish_reason"] in ("length", "stop")
 
         # Streaming must match greedy output identically
-        stream = model.generate(
-            "a b c d e f", max_tokens=10, temperature=0.0, stream=True
-        )
+        stream = model.generate("a b c d e f", max_tokens=10, temperature=0.0, stream=True)
         assert isinstance(stream, TokenStream)
         chunks = list(stream)
         assert "".join(chunks) == out1
 
         # Early stream break cancels cleanly and releases the model lock
-        early_stream = model.generate(
-            "a b c d e f", max_tokens=20, temperature=0.0, stream=True
-        )
+        early_stream = model.generate("a b c d e f", max_tokens=20, temperature=0.0, stream=True)
         with early_stream as s:
             first = next(s)
             assert isinstance(first, str)
@@ -145,34 +139,28 @@ def test_from_pretrained_hf_uri_and_base_repo_resolution(
             }
         ]
     ).encode("utf-8")
-    tree_base = json.dumps(
-        [{"type": "file", "path": "model.safetensors", "size": 128}]
-    ).encode("utf-8")
+    tree_base = json.dumps([{"type": "file", "path": "model.safetensors", "size": 128}]).encode(
+        "utf-8"
+    )
 
     class MockHfHandler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: object) -> None:
             pass
 
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             if self.path == "/api/models/MockOrg/TinyBase/tree/main?recursive=true":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(tree_base)))
                 self.end_headers()
                 self.wfile.write(tree_base)
-            elif (
-                self.path
-                == "/api/models/MockOrg/TinyBase-GGUF/tree/main?recursive=true"
-            ):
+            elif self.path == "/api/models/MockOrg/TinyBase-GGUF/tree/main?recursive=true":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(tree_gguf)))
                 self.end_headers()
                 self.wfile.write(tree_gguf)
-            elif (
-                self.path
-                == "/MockOrg/TinyBase-GGUF/resolve/main/Synthetic-Q4_K_M.gguf"
-            ):
+            elif self.path == "/MockOrg/TinyBase-GGUF/resolve/main/Synthetic-Q4_K_M.gguf":
                 self.send_response(200)
                 self.send_header("ETag", f'"{sha}"')
                 self.send_header("Content-Length", str(len(payload)))
@@ -303,7 +291,7 @@ def test_draft_model_speculation_parity_and_incompatible_rejection(
         assert summary["speculation"]["accepted_tokens"] > 0
 
     # Incompatible draft vocabulary (512 vs 64) must fail closed on open.
-    with pytest.raises(RuntimeError, match="incompatible draft_model tokenizer"):
+    with pytest.raises(RuntimeError, match="incompatible draft model tokenizer"):
         AutoModel.from_pretrained(
             str(synthetic_gguf),
             draft_model=str(incompatible_vocab_gguf),
@@ -330,9 +318,7 @@ def test_stop_sequences_and_sampling_seed_determinism(synthetic_gguf: Path) -> N
         expected_prefix = full[: full.index(needle)]
 
         # Single-string stop sequence (non-streaming)
-        stopped_str = model.generate(
-            "a b c d e f", max_tokens=16, temperature=0.0, stop=needle
-        )
+        stopped_str = model.generate("a b c d e f", max_tokens=16, temperature=0.0, stop=needle)
         assert stopped_str == expected_prefix
         assert needle not in stopped_str
         assert model.last_summary is not None
@@ -375,9 +361,7 @@ def test_implicit_stream_drop_cancellation_and_concurrent_threads(
         expected = model.generate("a b c d", max_tokens=8, temperature=0.0)
 
         # Break out of a stream without `with` / `.close()` -> Drop cancels background worker
-        for chunk in model.generate(
-            "a b c d", max_tokens=24, temperature=0.0, stream=True
-        ):
+        for chunk in model.generate("a b c d", max_tokens=24, temperature=0.0, stream=True):
             assert isinstance(chunk, str)
             break
         gc.collect()
@@ -400,17 +384,23 @@ def test_implicit_stream_drop_cancellation_and_concurrent_threads(
 def test_input_validation_and_unload_idempotency(synthetic_gguf: Path) -> None:
     with pytest.raises(TypeError):
         AutoModel.from_pretrained(
-            str(synthetic_gguf), vram_budget_mb=True, use_gpu=False  # type: ignore[arg-type]
+            str(synthetic_gguf),
+            vram_budget_mb=True,
+            use_gpu=False,  # type: ignore[arg-type]
         )
     with pytest.raises(ValueError):
         AutoModel.from_pretrained(str(synthetic_gguf), vram_budget_mb=-1, use_gpu=False)
     with pytest.raises(ValueError):
         AutoModel.from_pretrained(
-            str(synthetic_gguf), vram_budget_mb="not-a-number", use_gpu=False  # type: ignore[arg-type]
+            str(synthetic_gguf),
+            vram_budget_mb="not-a-number",  # type: ignore[arg-type]
+            use_gpu=False,
         )
     with pytest.raises(ValueError):
         AutoModel.from_pretrained(
-            str(synthetic_gguf), kv_cache_type="bogus", use_gpu=False  # type: ignore[arg-type]
+            str(synthetic_gguf),
+            kv_cache_type="bogus",  # type: ignore[arg-type]
+            use_gpu=False,
         )
 
     # Explicit vram_budget_mb=None means pure streaming (resident_layers == 0)
@@ -571,8 +561,7 @@ def test_interpreter_exit_with_live_model_and_stream(synthetic_gguf: Path) -> No
         check=False,
     )
     assert proc.returncode == 0, (
-        f"subprocess exited with {proc.returncode}\n"
-        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        f"subprocess exited with {proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
 
 
@@ -661,24 +650,18 @@ def test_isolated_worker_parity_and_process_reap(synthetic_gguf: Path) -> None:
         assert iso.detokenize(expected_toks) == expected_detok
         assert iso.generate("a b c d e f", max_tokens=10, temperature=0.0) == expected_gen
 
-        streamed = "".join(
-            iso.generate("a b c d e f", max_tokens=10, temperature=0.0, stream=True)
-        )
+        streamed = "".join(iso.generate("a b c d e f", max_tokens=10, temperature=0.0, stream=True))
         assert streamed == expected_gen
         assert iso.last_summary is not None
         assert iso.last_summary["completion_tokens"] == 10
 
         # Early break cancels worker stream cleanly without wedging the engine
-        for chunk in iso.generate(
-            "a b c d e f", max_tokens=24, temperature=0.0, stream=True
-        ):
+        for chunk in iso.generate("a b c d e f", max_tokens=24, temperature=0.0, stream=True):
             assert isinstance(chunk, str)
             break
 
         assert (
-            iso.chat(
-                [{"role": "user", "content": "a b c"}], max_tokens=8, temperature=0.0
-            )
+            iso.chat([{"role": "user", "content": "a b c"}], max_tokens=8, temperature=0.0)
             == expected_chat
         )
         assert iso.kv_trim(2) is True
@@ -782,7 +765,9 @@ def test_grammar_and_json_schema_constrained_decoding(synthetic_json_gguf: Path)
             "required": ["v"],
             "additionalProperties": False,
         }
-        raw_oneof = model.generate("a b", max_tokens=64, temperature=0.0, json_schema=oneof_num_schema)
+        raw_oneof = model.generate(
+            "a b", max_tokens=64, temperature=0.0, json_schema=oneof_num_schema
+        )
         parsed_oneof = json.loads(raw_oneof)
         assert isinstance(parsed_oneof["v"], float)
         assert parsed_oneof["v"] % 1.0 != 0.0
@@ -847,7 +832,11 @@ def test_in_process_openai_and_async_openai_clients(synthetic_json_gguf: Path) -
 
     parser = StreamTagParser()
     evs: list[dict[str, object]] = []
-    for part in ["<thi", "nk>plan</think>ok <tool_", 'call>{"name":"f","arguments":{}}</tool_call>']:
+    for part in [
+        "<thi",
+        "nk>plan</think>ok <tool_",
+        'call>{"name":"f","arguments":{}}</tool_call>',
+    ]:
         evs.extend(parser.push(part))
     evs.extend(parser.flush())
     assert parser.has_tool_calls is True
@@ -1051,7 +1040,7 @@ def test_advisor_check_recommend_pull_and_inspect(
     assert report["n_layers"] == 6
 
     # Incompatible draft must fail closed in preflight check() without loading full weights
-    with pytest.raises(RuntimeError, match="incompatible draft_model tokenizer"):
+    with pytest.raises(RuntimeError, match="incompatible draft model tokenizer"):
         check(
             str(synthetic_gguf),
             draft_model=str(incompatible_vocab_gguf),
@@ -1064,18 +1053,35 @@ def test_advisor_check_recommend_pull_and_inspect(
     gib = 1024 * 1024 * 1024
     tree_gguf = json.dumps(
         [
-            {"type": "file", "path": "Model-Q4_K_M.gguf", "size": 8 * gib, "lfs": {"size": 8 * gib}},
-            {"type": "file", "path": "Model-Q8_0.gguf", "size": 16 * gib, "lfs": {"size": 16 * gib}},
-            {"type": "file", "path": "Tiny.gguf", "size": len(payload), "lfs": {"size": len(payload)}},
+            {
+                "type": "file",
+                "path": "Model-Q4_K_M.gguf",
+                "size": 8 * gib,
+                "lfs": {"size": 8 * gib},
+            },
+            {
+                "type": "file",
+                "path": "Model-Q8_0.gguf",
+                "size": 16 * gib,
+                "lfs": {"size": 16 * gib},
+            },
+            {
+                "type": "file",
+                "path": "Tiny.gguf",
+                "size": len(payload),
+                "lfs": {"size": len(payload)},
+            },
         ]
     ).encode("utf-8")
-    tree_base = json.dumps([{"type": "file", "path": "model.safetensors", "size": 64}]).encode("utf-8")
+    tree_base = json.dumps([{"type": "file", "path": "model.safetensors", "size": 64}]).encode(
+        "utf-8"
+    )
 
     class AdvisorHfHandler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: object) -> None:
             pass
 
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             if self.path == "/api/models/AdvisorOrg/Model/tree/main?recursive=true":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1123,3 +1129,381 @@ def test_advisor_check_recommend_pull_and_inspect(
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_kv_state_save_load_and_modern_samplers(
+    synthetic_gguf: Path,
+    tmp_path: Path,
+) -> None:
+    """Verify save_state/load_state token-exact resume (in-process & isolated_worker) and new samplers."""
+    snap_path = tmp_path / "snapshots" / "prefix.kv"
+    base_prompt = "a b c d e f a b c"
+    continuation_prompt = "a b c d e f a b c d e"
+
+    with AutoModel.from_pretrained(
+        str(synthetic_gguf),
+        draft_model="auto",  # gracefully skips on tiny <2 GiB synthetic GGUF
+        use_gpu=False,
+        ctx_size=128,
+        batch_size=64,
+        vram_budget_mb=0,
+        kv_cache_type="q8_0",
+        prefer_direct_io=False,
+    ) as model:
+        st0 = model.stats()
+        assert st0["backend_name"] == "CPU"
+        assert st0["draft_model_path"] is None
+
+        # Prefill base_prompt + 1 token, then snapshot KV state to disk.
+        _ = model.generate(base_prompt, max_tokens=1, temperature=0.0, ngram_speculation=False)
+        saved_tokens = model.save_state(snap_path)
+        assert saved_tokens > 0
+        assert snap_path.is_file() and snap_path.stat().st_size > 0
+
+        # Reference continuation from scratch on a clean KV cache.
+        model.kv_clear()
+        expected_cont = model.generate(
+            continuation_prompt,
+            max_tokens=10,
+            temperature=0.0,
+            ngram_speculation=False,
+        )
+
+        # Modern samplers: min_p + repeat/frequency/presence penalties (both greedy & sampled).
+        penalized_greedy = model.generate(
+            "a a a a a b c",
+            max_tokens=8,
+            temperature=0.0,
+            repeat_penalty=1.35,
+            frequency_penalty=0.4,
+            presence_penalty=0.2,
+            penalty_last_n=16,
+        )
+        assert isinstance(penalized_greedy, str) and len(penalized_greedy) > 0
+
+        sampled_min_p = model.generate(
+            "a b c d",
+            max_tokens=8,
+            temperature=0.75,
+            min_p=0.1,
+            top_p=0.9,
+            repeat_penalty=1.15,
+            seed=123,
+        )
+        assert isinstance(sampled_min_p, str) and len(sampled_min_p) > 0
+
+        # Invalid sampler arguments raise ValueError cleanly.
+        with pytest.raises(ValueError, match="min_p"):
+            model.generate("a b", min_p=1.5)
+        with pytest.raises(ValueError, match="repeat_penalty"):
+            model.generate("a b", repeat_penalty=0.0)
+
+        with pytest.raises(FileNotFoundError):
+            model.load_state(tmp_path / "missing.kv")
+
+    # Restore KV snapshot in a fresh in-process AutoModel AND in an isolated_worker AutoModel
+    # and verify continuation output matches fresh prefill bit-for-bit!
+    for use_isolated in (False, True):
+        with AutoModel.from_pretrained(
+            str(synthetic_gguf),
+            use_gpu=False,
+            ctx_size=128,
+            batch_size=64,
+            vram_budget_mb=0,
+            kv_cache_type="q8_0",
+            prefer_direct_io=False,
+            isolated_worker=use_isolated,
+        ) as restored_model:
+            restored_n = restored_model.load_state(snap_path)
+            assert restored_n == saved_tokens
+            assert restored_model.stats()["cached_kv_tokens"] == saved_tokens
+            got_cont = restored_model.generate(
+                continuation_prompt,
+                max_tokens=10,
+                temperature=0.0,
+                ngram_speculation=False,
+            )
+            assert got_cont == expected_cont
+
+            if use_isolated:
+                iso_snap = tmp_path / "snapshots" / "isolated.kv"
+                assert restored_model.save_state(iso_snap) > 0
+                assert iso_snap.is_file()
+                with pytest.raises(FileNotFoundError):
+                    restored_model.load_state(tmp_path / "does_not_exist.kv")
+
+
+def test_progress_callbacks_and_backend_discovery(
+    synthetic_gguf: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify on_progress callbacks in pull() and AutoModel.from_pretrained() (in-process & isolated)."""
+    from layerstream import configured_backend_dirs, probe_gpu_device, pull
+
+    assert isinstance(configured_backend_dirs(), list)
+    assert probe_gpu_device(use_gpu=False) is None
+
+    payload = synthetic_gguf.read_bytes()
+    sha = hashlib.sha256(payload).hexdigest()
+
+    class ProgHfHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/ProgOrg/Repo/resolve/main/"):
+                self.send_response(200)
+                self.send_header("ETag", f'"{sha}"')
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+    server = HTTPServer(("127.0.0.1", 0), ProgHfHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        monkeypatch.setenv("HF_ENDPOINT", f"http://127.0.0.1:{port}")
+        cache_dir = tmp_path / "prog-cache"
+
+        events: list[dict[str, object]] = []
+        pulled = pull(
+            "hf://ProgOrg/Repo:one.gguf",
+            cache_dir=cache_dir,
+            on_progress=lambda ev: events.append(dict(ev)),
+        )
+        assert Path(pulled).is_file()
+        assert len(events) >= 2
+        assert events[-1]["done"] is True
+        assert events[-1]["downloaded_bytes"] == len(payload)
+
+        # Isolated worker forwards live on_progress events over IPC during open!
+        iso_events: list[dict[str, object]] = []
+        with AutoModel.from_pretrained(
+            "hf://ProgOrg/Repo:two.gguf",
+            cache_dir=cache_dir,
+            use_gpu=False,
+            ctx_size=128,
+            batch_size=32,
+            vram_budget_mb=0,
+            prefer_direct_io=False,
+            isolated_worker=True,
+            on_progress=lambda ev: iso_events.append(dict(ev)),
+        ) as m:
+            assert m.is_loaded
+        assert len(iso_events) >= 2
+        assert iso_events[-1]["done"] is True
+
+        # Exception raised inside on_progress aborts download and propagates exact Python error.
+        class CustomAbortError(RuntimeError):
+            pass
+
+        def _abort_cb(_ev: dict[str, object]) -> None:
+            raise CustomAbortError("stop right here")
+
+        with pytest.raises(CustomAbortError, match="stop right here"):
+            pull("hf://ProgOrg/Repo:three.gguf", cache_dir=cache_dir, on_progress=_abort_cb)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cli_inspect_check_chat_and_rust_axum_server(
+    synthetic_gguf: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `python -m layerstream` CLI (single-turn + interactive REPL) and Rust `start_server` HTTP + SSE + `/v1/unload`."""
+    import io
+    import urllib.error
+    import urllib.request
+
+    from layerstream import start_server
+    from layerstream.__main__ import main as cli_main
+
+    # 1. inspect (human & --json), check (human & --json & failure)
+    assert cli_main(["inspect", str(synthetic_gguf)]) == 0
+    assert cli_main(["inspect", str(synthetic_gguf), "--json"]) == 0
+    assert cli_main(["check", str(synthetic_gguf), "--cpu"]) == 0
+    assert cli_main(["check", str(synthetic_gguf), "--cpu", "--json"]) == 0
+    assert cli_main(["check", str(tmp_path / "missing.gguf"), "--cpu", "--json"]) == 1
+
+    # 2. Single-turn `chat --prompt` with `--save-state` and `--load-state`
+    cli_snap = tmp_path / "cli_chat.kv"
+    assert (
+        cli_main(
+            [
+                "chat",
+                str(synthetic_gguf),
+                "--cpu",
+                "--no-direct-io",
+                "--ctx-size",
+                "128",
+                "--batch-size",
+                "32",
+                "--max-tokens",
+                "6",
+                "--prompt",
+                "a b c",
+                "--save-state",
+                str(cli_snap),
+            ]
+        )
+        == 0
+    )
+    assert cli_snap.is_file()
+
+    assert (
+        cli_main(
+            [
+                "chat",
+                str(synthetic_gguf),
+                "--cpu",
+                "--no-direct-io",
+                "--ctx-size",
+                "128",
+                "--batch-size",
+                "32",
+                "--max-tokens",
+                "6",
+                "--load-state",
+                str(cli_snap),
+                "--prompt",
+                "a b c d",
+                "--quiet-stats",
+            ]
+        )
+        == 0
+    )
+
+    # 3. Interactive REPL commands: `/stats`, `a b`, `/save`, `/clear`, `/load`, `/quit`
+    repl_snap = tmp_path / "repl.kv"
+    repl_inputs = iter(
+        [
+            "/stats",
+            "a b c",
+            f"/save {repl_snap}",
+            "/clear",
+            f"/load {repl_snap}",
+            "/quit",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(repl_inputs))
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    assert (
+        cli_main(
+            [
+                "chat",
+                str(synthetic_gguf),
+                "--cpu",
+                "--no-direct-io",
+                "--ctx-size",
+                "128",
+                "--batch-size",
+                "32",
+                "--max-tokens",
+                "4",
+                "--system",
+                "be concise",
+            ]
+        )
+        == 0
+    )
+    assert repl_snap.is_file()
+
+    # 4. Native Rust `layerstream-server` (`start_server`) HTTP + SSE + Bearer auth + `/v1/unload`
+    with start_server(
+        str(synthetic_gguf),
+        host="127.0.0.1",
+        port=0,
+        api_key="secret-test-key",
+        use_gpu=False,
+        ctx_size=128,
+        batch_size=32,
+        vram_budget_mb=0,
+        prefer_direct_io=False,
+    ) as srv:
+        assert srv.port > 0
+        base = f"http://{srv.host}:{srv.port}"
+        auth_hdr = {
+            "Authorization": "Bearer secret-test-key",
+            "Content-Type": "application/json",
+        }
+
+        # `/health` is unauthenticated and reports 0-VRAM lazy idle state (`loaded: False`).
+        with urllib.request.urlopen(f"{base}/health", timeout=5) as resp:
+            health = json.loads(resp.read().decode("utf-8"))
+            assert health["status"] == "ok"
+            assert health["loaded"] is False
+
+        # `/v1/models` rejects missing/wrong auth with 401 (`authentication_error`).
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(f"{base}/v1/models", timeout=5)
+        assert exc_info.value.code == 401
+
+        # Authenticated `/v1/models`.
+        req_models = urllib.request.Request(f"{base}/v1/models", headers=auth_hdr)
+        with urllib.request.urlopen(req_models, timeout=5) as resp:
+            models_json = json.loads(resp.read().decode("utf-8"))
+            assert len(models_json["data"]) == 1
+
+        # Invalid sampler parameter (`min_p > 1`) returns 400 Bad Request.
+        bad_body = json.dumps(
+            {"messages": [{"role": "user", "content": "a b"}], "min_p": 1.5}
+        ).encode("utf-8")
+        req_bad = urllib.request.Request(
+            f"{base}/v1/chat/completions", data=bad_body, headers=auth_hdr, method="POST"
+        )
+        with pytest.raises(urllib.error.HTTPError) as bad_exc:
+            urllib.request.urlopen(req_bad, timeout=5)
+        assert bad_exc.value.code == 400
+
+        # Non-streaming `/v1/chat/completions` with modern samplers (`min_p`, `repeat_penalty`).
+        chat_body = json.dumps(
+            {
+                "messages": [{"role": "user", "content": "a b c"}],
+                "max_tokens": 6,
+                "temperature": 0.6,
+                "min_p": 0.05,
+                "repeat_penalty": 1.15,
+            }
+        ).encode("utf-8")
+        req_chat = urllib.request.Request(
+            f"{base}/v1/chat/completions", data=chat_body, headers=auth_hdr, method="POST"
+        )
+        with urllib.request.urlopen(req_chat, timeout=15) as resp:
+            chat_resp = json.loads(resp.read().decode("utf-8"))
+            assert chat_resp["object"] == "chat.completion"
+            assert len(chat_resp["choices"][0]["message"]["content"]) > 0
+
+        # Streaming SSE `/v1/chat/completions`.
+        sse_body = json.dumps(
+            {"messages": [{"role": "user", "content": "a b c"}], "max_tokens": 6, "stream": True}
+        ).encode("utf-8")
+        req_sse = urllib.request.Request(
+            f"{base}/v1/chat/completions", data=sse_body, headers=auth_hdr, method="POST"
+        )
+        sse_lines: list[str] = []
+        with urllib.request.urlopen(req_sse, timeout=15) as resp:
+            for raw_line in resp:
+                decoded = raw_line.decode("utf-8").strip()
+                if decoded.startswith("data:"):
+                    sse_lines.append(decoded[5:].strip())
+        assert sse_lines[-1] == "[DONE]"
+        parsed_chunks = [json.loads(x) for x in sse_lines[:-1]]
+        assert any(c["choices"][0]["delta"].get("content") for c in parsed_chunks)
+
+        # Explicit `/v1/unload` evicts active model back to `loaded: False`.
+        req_unload = urllib.request.Request(
+            f"{base}/v1/unload", data=b"{}", headers=auth_hdr, method="POST"
+        )
+        with urllib.request.urlopen(req_unload, timeout=10) as resp:
+            unloaded = json.loads(resp.read().decode("utf-8"))
+            assert unloaded["unloaded"] is True
+            assert unloaded["loaded"] is False

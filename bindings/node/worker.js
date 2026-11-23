@@ -759,6 +759,12 @@ async function runChildWorkerMain(port) {
         } else if (op === "kv_trim") {
           const trimmed = await model.kvTrim(Number(params.posMin));
           sendJsonLine(sock, { id: reqId, ok: true, result: { trimmed } });
+        } else if (op === "save_state") {
+          const tokens = await model.saveState(String(params.path));
+          sendJsonLine(sock, { id: reqId, ok: true, result: { tokens } });
+        } else if (op === "load_state") {
+          const tokens = await model.loadState(String(params.path));
+          sendJsonLine(sock, { id: reqId, ok: true, result: { tokens } });
         } else if (op === "generate" || op === "chat") {
           const cancelTok = new native.NativeCancelToken();
           activeCancels.set(reqId, () => cancelTok.cancel());

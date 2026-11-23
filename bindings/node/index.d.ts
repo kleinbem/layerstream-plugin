@@ -26,6 +26,8 @@ export interface EngineStats {
   loaded: boolean;
   isolatedWorker: boolean;
   workerPid?: number | null;
+  backendName?: string | null;
+  cachedKvTokens?: number | null;
   modelPath?: string | null;
   draftModelPath?: string | null;
   sourceUri?: string | null;
@@ -180,7 +182,12 @@ export interface GenerateOptions {
   maxTokens?: number;
   temperature?: number;
   topP?: number;
+  minP?: number;
   topK?: number;
+  repeatPenalty?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  penaltyLastN?: number;
   seed?: number;
   stop?: string | string[] | null;
   stream?: boolean;
@@ -269,6 +276,8 @@ export declare class AutoModel implements AsyncDisposable {
   ): Promise<string>;
   kvClear(): Promise<void>;
   kvTrim(posMin: number): Promise<boolean>;
+  saveState(path: string): Promise<number>;
+  loadState(path: string): Promise<number>;
   stats(): Promise<EngineStats>;
 
   readonly isLoaded: boolean;
@@ -419,7 +428,12 @@ export interface OpenAIChatCreateParams {
   max_completion_tokens?: number;
   temperature?: number;
   top_p?: number;
+  min_p?: number;
   top_k?: number;
+  repeat_penalty?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  penalty_last_n?: number;
   seed?: number;
   stop?: string | string[] | null;
   stream?: boolean;
@@ -436,7 +450,12 @@ export interface OpenAICompletionsCreateParams {
   max_tokens?: number;
   temperature?: number;
   top_p?: number;
+  min_p?: number;
   top_k?: number;
+  repeat_penalty?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  penalty_last_n?: number;
   seed?: number;
   stop?: string | string[] | null;
   stream?: boolean;
