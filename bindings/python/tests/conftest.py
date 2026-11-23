@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import math
 import struct
 from pathlib import Path
@@ -91,10 +89,7 @@ def write_synthetic_mixed_dense_moe_gguf(
 
     def push_tensor(name: str, dims: list[int], is_norm: bool) -> None:
         nelems = math.prod(dims)
-        vals = [
-            (1.0 + next_f32(0.05)) if is_norm else next_f32(0.15)
-            for _ in range(nelems)
-        ]
+        vals = [(1.0 + next_f32(0.05)) if is_norm else next_f32(0.15) for _ in range(nelems)]
         if include_json_tokens:
             if name == "token_embd.weight":
                 # Keep channel 0 positive across every token embedding so output.weight[:, 0]
@@ -145,15 +140,9 @@ def write_synthetic_mixed_dense_moe_gguf(
             push_tensor(f"blk.{il}.ffn_down.weight", [n_ff, n_embd], False)
         else:
             push_tensor(f"blk.{il}.ffn_gate_inp.weight", [n_embd, n_experts], False)
-            push_tensor(
-                f"blk.{il}.ffn_gate_exps.weight", [n_embd, n_ff_exp, n_experts], False
-            )
-            push_tensor(
-                f"blk.{il}.ffn_up_exps.weight", [n_embd, n_ff_exp, n_experts], False
-            )
-            push_tensor(
-                f"blk.{il}.ffn_down_exps.weight", [n_ff_exp, n_embd, n_experts], False
-            )
+            push_tensor(f"blk.{il}.ffn_gate_exps.weight", [n_embd, n_ff_exp, n_experts], False)
+            push_tensor(f"blk.{il}.ffn_up_exps.weight", [n_embd, n_ff_exp, n_experts], False)
+            push_tensor(f"blk.{il}.ffn_down_exps.weight", [n_ff_exp, n_embd, n_experts], False)
 
     positioned: list[tuple[str, list[int], bytes, int]] = []
     cur_off = 0

@@ -13,14 +13,32 @@
 //! - All progress logs go strictly to stderr (preserving Mesh-LLM's stdout protobuf channel).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DownloadProgress {
+    pub repo_id: String,
+    pub filename: String,
+    pub shard_index: u32,
+    pub shard_count: u32,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub mib_per_s: f64,
+    pub cached: bool,
+    pub done: bool,
+}
+
+/// Callback invoked during Hugging Face model downloads. Returning `Err` aborts the download.
+pub type ProgressCallback = Arc<dyn Fn(&DownloadProgress) -> Result<()> + Send + Sync>;
 
 const HF_PREFIX: &str = "hf://";
 const DEFAULT_HF_ENDPOINT: &str = "https://huggingface.co";
@@ -266,12 +284,23 @@ pub fn resolve_path_or_hf(spec: &str, cache_root: &Path) -> Result<PathBuf> {
 
 /// Ensures the requested `hf://` GGUF (and all sibling shards if multi-part) exists in `cache_root`.
 pub fn ensure_hf_downloaded(uri: &str, cache_root: &Path) -> Result<PathBuf> {
+    ensure_hf_downloaded_with_progress(uri, cache_root, None)
+}
+
+/// Same as `ensure_hf_downloaded`, invoking `on_progress` on cache hit, periodic chunks, and completion.
+pub fn ensure_hf_downloaded_with_progress(
+    uri: &str,
+    cache_root: &Path,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<PathBuf> {
     let spec = HfSpec::parse(uri)?;
     let shards = spec.expand_shards();
+    let shard_count = shards.len().max(1) as u32;
     let token = load_hf_token();
     let mut primary_path = None;
 
     for (idx, shard) in shards.iter().enumerate() {
+        let shard_index = (idx + 1) as u32;
         let dest = shard.cache_path(cache_root);
         if idx == 0 {
             primary_path = Some(dest.clone());
@@ -282,9 +311,30 @@ pub fn ensure_hf_downloaded(uri: &str, cache_root: &Path) -> Result<PathBuf> {
                 path = %dest.display(),
                 "using cached Hugging Face GGUF"
             );
+            if let Some(cb) = on_progress {
+                let sz = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                cb(&DownloadProgress {
+                    repo_id: shard.repo_id.clone(),
+                    filename: shard.filename.clone(),
+                    shard_index,
+                    shard_count,
+                    downloaded_bytes: sz,
+                    total_bytes: Some(sz),
+                    mib_per_s: 0.0,
+                    cached: true,
+                    done: true,
+                })?;
+            }
             continue;
         }
-        download_with_resume(shard, &dest, token.as_deref())?;
+        download_with_resume(
+            shard,
+            &dest,
+            token.as_deref(),
+            shard_index,
+            shard_count,
+            on_progress,
+        )?;
     }
 
     primary_path.context("empty shard expansion")
@@ -538,17 +588,94 @@ fn load_hf_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Result<()> {
+std::thread_local! {
+    static ACTIVE_THREAD_PART_LOCKS: std::cell::RefCell<std::collections::HashSet<PathBuf>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+struct ThreadPartLockGuard(PathBuf);
+
+impl Drop for ThreadPartLockGuard {
+    fn drop(&mut self) {
+        ACTIVE_THREAD_PART_LOCKS.with(|set| {
+            set.borrow_mut().remove(&self.0);
+        });
+    }
+}
+
+fn render_tty_progress_bar(ev: &DownloadProgress) -> bool {
+    let fname = ev.filename.rsplit('/').next().unwrap_or(&ev.filename);
+    let shard_tag = if ev.shard_count > 1 {
+        format!("[{}/{}] ", ev.shard_index, ev.shard_count)
+    } else {
+        String::new()
+    };
+    let line = if let Some(total) = ev.total_bytes.filter(|&t| t > 0) {
+        let frac = (ev.downloaded_bytes as f64 / total as f64).clamp(0.0, 1.0);
+        let width = 20usize;
+        let filled = ((frac * width as f64).round() as usize).min(width);
+        let bar = format!("{}{}", "#".repeat(filled), "-".repeat(width - filled));
+        format!(
+            "\r\x1b[K[layerstream-hf] {shard_tag}{fname} [{bar}] {:5.1}% ({:.2}/{:.2} GiB, {:.1} MiB/s)",
+            frac * 100.0,
+            ev.downloaded_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            total as f64 / (1024.0 * 1024.0 * 1024.0),
+            ev.mib_per_s,
+        )
+    } else {
+        format!(
+            "\r\x1b[K[layerstream-hf] {shard_tag}{fname} {:.2} GiB ({:.1} MiB/s)",
+            ev.downloaded_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            ev.mib_per_s,
+        )
+    };
+    let mut err = std::io::stderr();
+    err.write_all(line.as_bytes()).is_ok() && err.flush().is_ok()
+}
+
+fn download_with_resume(
+    spec: &HfSpec,
+    dest: &Path,
+    token: Option<&str>,
+    shard_index: u32,
+    shard_count: u32,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create cache directory {}", parent.display()))?;
     }
 
     let lock_path = lock_path_for(dest);
+    let lock_key = lock_path
+        .canonicalize()
+        .unwrap_or_else(|_| lock_path.clone());
+    let inserted = ACTIVE_THREAD_PART_LOCKS.with(|set| set.borrow_mut().insert(lock_key.clone()));
+    if !inserted {
+        bail!(
+            "re-entrant download of '{}' from inside progress callback would deadlock",
+            dest.display()
+        );
+    }
+    let _thread_reentry_guard = ThreadPartLockGuard(lock_key);
     let _lock = PartLock::acquire(&lock_path)?;
 
     // Another concurrent process may have completed the download while we waited for the lock.
     if is_complete_cached_file(dest) {
+        if let Some(cb) = on_progress {
+            let sz = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+            cb(&DownloadProgress {
+                repo_id: spec.repo_id.clone(),
+                filename: spec.filename.clone(),
+                shard_index,
+                shard_count,
+                downloaded_bytes: sz,
+                total_bytes: Some(sz),
+                mib_per_s: 0.0,
+                cached: true,
+                done: true,
+            })?;
+        }
         return Ok(());
     }
 
@@ -782,7 +909,25 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
     let mut downloaded = existing_len;
     let start = Instant::now();
     let mut last_log = Instant::now();
+    let mut last_cb = Instant::now();
     let mut session_bytes = 0u64;
+    let tty_stderr = on_progress.is_none()
+        && std::io::stderr().is_terminal()
+        && std::env::var("LAYERSTREAM_NO_PROGRESS_BAR").is_err();
+
+    if let Some(cb) = on_progress {
+        cb(&DownloadProgress {
+            repo_id: spec.repo_id.clone(),
+            filename: spec.filename.clone(),
+            shard_index,
+            shard_count,
+            downloaded_bytes: downloaded,
+            total_bytes: total_expected,
+            mib_per_s: 0.0,
+            cached: false,
+            done: false,
+        })?;
+    }
 
     loop {
         let n = reader
@@ -799,7 +944,41 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
         downloaded += n as u64;
         session_bytes += n as u64;
 
-        if last_log.elapsed() >= Duration::from_secs(2) {
+        if let Some(cb) = on_progress {
+            if last_cb.elapsed() >= Duration::from_millis(100) {
+                let elapsed_s = start.elapsed().as_secs_f64().max(1e-3);
+                let mib_s = (session_bytes as f64 / (1024.0 * 1024.0)) / elapsed_s;
+                cb(&DownloadProgress {
+                    repo_id: spec.repo_id.clone(),
+                    filename: spec.filename.clone(),
+                    shard_index,
+                    shard_count,
+                    downloaded_bytes: downloaded,
+                    total_bytes: total_expected,
+                    mib_per_s: mib_s,
+                    cached: false,
+                    done: false,
+                })?;
+                last_cb = Instant::now();
+            }
+        } else if tty_stderr {
+            if last_log.elapsed() >= Duration::from_millis(120) {
+                let elapsed_s = start.elapsed().as_secs_f64().max(1e-3);
+                let mib_s = (session_bytes as f64 / (1024.0 * 1024.0)) / elapsed_s;
+                render_tty_progress_bar(&DownloadProgress {
+                    repo_id: spec.repo_id.clone(),
+                    filename: spec.filename.clone(),
+                    shard_index,
+                    shard_count,
+                    downloaded_bytes: downloaded,
+                    total_bytes: total_expected,
+                    mib_per_s: mib_s,
+                    cached: false,
+                    done: false,
+                });
+                last_log = Instant::now();
+            }
+        } else if last_log.elapsed() >= Duration::from_secs(2) {
             let elapsed_s = start.elapsed().as_secs_f64().max(1e-3);
             let mib_s = (session_bytes as f64 / (1024.0 * 1024.0)) / elapsed_s;
             if let Some(total) = total_expected {
@@ -827,6 +1006,9 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
     if let Some(expected) = total_expected
         && downloaded != expected
     {
+        if tty_stderr {
+            eprintln!();
+        }
         bail!(
             "truncated download for hf://{}:{} (got {} bytes, expected {})",
             spec.repo_id,
@@ -839,6 +1021,9 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
     if let (Some(expected_hex), Some(h)) = (&final_sha256, hasher) {
         let actual_hex = to_hex_lower(&h.finalize());
         if actual_hex != *expected_hex {
+            if tty_stderr {
+                eprintln!();
+            }
             let _ = fs::remove_file(&part_path);
             let _ = fs::remove_file(&meta_path);
             bail!(
@@ -860,11 +1045,33 @@ fn download_with_resume(spec: &HfSpec, dest: &Path, token: Option<&str>) -> Resu
     })?;
     let _ = fs::remove_file(&meta_path);
 
-    eprintln!(
-        "[layerstream-hf] ready: {} ({:.2} GiB)",
-        dest.display(),
-        downloaded as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
+    let elapsed_s = start.elapsed().as_secs_f64().max(1e-3);
+    let final_mib_s = (session_bytes as f64 / (1024.0 * 1024.0)) / elapsed_s;
+    if let Some(cb) = on_progress {
+        cb(&DownloadProgress {
+            repo_id: spec.repo_id.clone(),
+            filename: spec.filename.clone(),
+            shard_index,
+            shard_count,
+            downloaded_bytes: downloaded,
+            total_bytes: Some(downloaded),
+            mib_per_s: final_mib_s,
+            cached: false,
+            done: true,
+        })?;
+    } else if tty_stderr {
+        eprintln!(
+            "\r\x1b[K[layerstream-hf] ready: {} ({:.2} GiB, {final_mib_s:.1} MiB/s)",
+            dest.display(),
+            downloaded as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    } else {
+        eprintln!(
+            "[layerstream-hf] ready: {} ({:.2} GiB)",
+            dest.display(),
+            downloaded as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
     Ok(())
 }
 
@@ -1234,7 +1441,7 @@ pub fn recommend_candidates(
 }
 
 /// Options controlling `resolve_pretrained_model` resolution and hardware-aware quant selection.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PretrainedResolveOptions {
     pub revision: Option<String>,
     pub quant: Option<String>,
@@ -1242,6 +1449,21 @@ pub struct PretrainedResolveOptions {
     pub vram_budget_bytes: Option<u64>,
     pub use_gpu: bool,
     pub has_draft: bool,
+    pub on_progress: Option<ProgressCallback>,
+}
+
+impl fmt::Debug for PretrainedResolveOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PretrainedResolveOptions")
+            .field("revision", &self.revision)
+            .field("quant", &self.quant)
+            .field("cache_dir", &self.cache_dir)
+            .field("vram_budget_bytes", &self.vram_budget_bytes)
+            .field("use_gpu", &self.use_gpu)
+            .field("has_draft", &self.has_draft)
+            .field("has_on_progress", &self.on_progress.is_some())
+            .finish()
+    }
 }
 
 /// Result of resolving a local path, `hf://` URI, HF GGUF repo, or base HF repo to a local GGUF.
@@ -1368,7 +1590,8 @@ pub fn resolve_pretrained_model(
                 parsed.repo_id, parsed.filename, parsed.revision
             )
         };
-        let local_path = ensure_hf_downloaded(&uri, &cache_root)?;
+        let local_path =
+            ensure_hf_downloaded_with_progress(&uri, &cache_root, opts.on_progress.as_ref())?;
         let selected_quant = Some(extract_quant_label(&parsed.filename));
         return Ok(ResolvedModel {
             local_path,
@@ -1437,7 +1660,8 @@ pub fn resolve_pretrained_model(
         opts.has_draft,
     );
     let chosen = select_candidate_for_repo(&recs, opts.quant.as_deref(), &effective_repo)?;
-    let local_path = ensure_hf_downloaded(&chosen.hf_uri, &cache_root)?;
+    let local_path =
+        ensure_hf_downloaded_with_progress(&chosen.hf_uri, &cache_root, opts.on_progress.as_ref())?;
 
     Ok(ResolvedModel {
         local_path,
@@ -1445,6 +1669,164 @@ pub fn resolve_pretrained_model(
         resolved_repo: Some(effective_repo),
         selected_quant: Some(chosen.candidate.quant.clone()),
     })
+}
+
+/// Maps a target GGUF `(architecture, model_hint)` to a known tiny (`<= 1B`) family-matched
+/// Hugging Face GGUF draft repository for `draft_model="auto"`.
+pub fn select_auto_draft_repo(architecture: &str, model_hint: &str) -> Option<&'static str> {
+    let arch = architecture.trim().to_ascii_lowercase();
+    let hint = model_hint.trim().to_ascii_lowercase();
+
+    // Prioritize authoritative GGUF architecture keys before falling back to filename/repo hints.
+    if arch.starts_with("qwen3") {
+        return Some("Qwen/Qwen3-0.6B-GGUF");
+    }
+    if arch == "qwen2" || arch == "qwen2moe" {
+        return Some("Qwen/Qwen2.5-0.5B-Instruct-GGUF");
+    }
+    if arch.starts_with("gemma3") {
+        return Some("ggml-org/gemma-3-1b-it-GGUF");
+    }
+    if arch == "llama"
+        && (hint.contains("llama-3")
+            || hint.contains("llama3")
+            || hint.contains("deepseek-r1-distill-llama"))
+    {
+        return Some("bartowski/Llama-3.2-1B-Instruct-GGUF");
+    }
+    if arch.is_empty() {
+        if hint.contains("qwen3") {
+            return Some("Qwen/Qwen3-0.6B-GGUF");
+        }
+        if hint.contains("qwen2.5") || hint.contains("qwen2-") || hint.contains("qwq") {
+            return Some("Qwen/Qwen2.5-0.5B-Instruct-GGUF");
+        }
+        if hint.contains("gemma-3") || hint.contains("gemma3") {
+            return Some("ggml-org/gemma-3-1b-it-GGUF");
+        }
+    }
+    None
+}
+
+/// Resolves `draft_model="auto"` for an already-resolved target GGUF model:
+/// - Skips small targets (`< 2 GiB`) and targets that already fit 100% resident in GPU VRAM.
+/// - Skips when GPU VRAM headroom is too tight (`< 1.5 GiB` free).
+/// - Selects a tiny family-matched GGUF draft model (`0.5B`–`1B`), downloads it into `cache_dir`,
+///   and verifies `check_gguf_draft_compatible` against `target_path`.
+/// - Returns `Ok(None)` cleanly on network/family/tokenizer misses (only propagating `on_progress`
+///   user-cancellation errors) so `draft_model="auto"` never breaks offline or custom fine-tunes.
+pub fn resolve_auto_draft_model(
+    target: &ResolvedModel,
+    cache_dir: Option<PathBuf>,
+    vram_budget_bytes: Option<u64>,
+    use_gpu: bool,
+    on_progress: Option<ProgressCallback>,
+) -> Result<Option<ResolvedModel>> {
+    const MIN_AUTO_DRAFT_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    const MIN_AUTO_DRAFT_FREE_VRAM_BYTES: u64 = 1536 * 1024 * 1024;
+
+    let Ok(idx) = crate::GgufIndex::open(&target.local_path) else {
+        return Ok(None);
+    };
+    if idx.meta.total_file_bytes < MIN_AUTO_DRAFT_TARGET_BYTES {
+        return Ok(None);
+    }
+
+    if use_gpu {
+        let avail = vram_budget_bytes
+            .filter(|&b| b > 0)
+            .or_else(|| crate::StreamEngine::probe_gpu_memory(true).map(|(f, _)| f));
+        if let Some(free_b) = avail {
+            if free_b < MIN_AUTO_DRAFT_FREE_VRAM_BYTES {
+                return Ok(None);
+            }
+            // Target fits 100% resident in VRAM -> no out-of-core NVMe sweeps to amortize.
+            if idx.meta.total_file_bytes.saturating_add(1024 * 1024 * 1024) < free_b {
+                return Ok(None);
+            }
+        }
+    }
+
+    let hint = format!(
+        "{} {} {}",
+        idx.meta.name.as_deref().unwrap_or(""),
+        target.resolved_repo.as_deref().unwrap_or(""),
+        target
+            .local_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("")
+    );
+    let Some(draft_repo) = select_auto_draft_repo(&idx.meta.architecture, &hint) else {
+        tracing::info!(
+            architecture = %idx.meta.architecture,
+            hint = %hint.trim(),
+            "draft_model='auto': no matching tiny draft family; using zero-VRAM n-gram speculation"
+        );
+        return Ok(None);
+    };
+
+    let cancelled_by_cb = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wrapped_cb: Option<ProgressCallback> = on_progress.map(|cb| {
+        let flag = cancelled_by_cb.clone();
+        Arc::new(move |ev: &DownloadProgress| -> Result<()> {
+            if let Err(e) = cb(ev) {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(e);
+            }
+            Ok(())
+        }) as ProgressCallback
+    });
+
+    let mut draft_opts = PretrainedResolveOptions {
+        revision: None,
+        quant: Some("Q4_K_M".to_string()),
+        cache_dir,
+        vram_budget_bytes: Some(2 * 1024 * 1024 * 1024),
+        use_gpu,
+        has_draft: false,
+        on_progress: wrapped_cb,
+    };
+
+    let resolved = match resolve_pretrained_model(draft_repo, &draft_opts) {
+        Ok(r) => r,
+        Err(e) if cancelled_by_cb.load(std::sync::atomic::Ordering::SeqCst) => return Err(e),
+        Err(_) => {
+            draft_opts.quant = None;
+            match resolve_pretrained_model(draft_repo, &draft_opts) {
+                Ok(r) => r,
+                Err(e) if cancelled_by_cb.load(std::sync::atomic::Ordering::SeqCst) => {
+                    return Err(e);
+                }
+                Err(err) => {
+                    tracing::info!(
+                        draft_repo,
+                        error = %err,
+                        "draft_model='auto': could not fetch draft model; falling back to n-gram speculation"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+    };
+
+    if let Err(reason) =
+        crate::check_gguf_draft_compatible(&target.local_path, &resolved.local_path)
+    {
+        tracing::warn!(
+            draft_repo,
+            reason = %reason,
+            "draft_model='auto': auto-selected draft tokenizer incompatible; falling back to n-gram speculation"
+        );
+        return Ok(None);
+    }
+
+    tracing::info!(
+        draft_repo,
+        path = %resolved.local_path.display(),
+        "draft_model='auto': resolved compatible resident draft speculator"
+    );
+    Ok(Some(resolved))
 }
 
 #[cfg(test)]
@@ -1986,6 +2368,106 @@ mod tests {
             msg.contains("bartowski/NoGguf-GGUF"),
             "missing guidance: {msg}"
         );
+
+        unsafe { std::env::remove_var("HF_ENDPOINT") };
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn auto_draft_family_mapping_and_progress_callbacks() {
+        assert_eq!(
+            select_auto_draft_repo("qwen2", "Qwen/Qwen2.5-14B-Instruct-GGUF"),
+            Some("Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+        );
+        assert_eq!(
+            select_auto_draft_repo("qwen3moe", "unsloth/Qwen3-30B-A3B-GGUF"),
+            Some("Qwen/Qwen3-0.6B-GGUF")
+        );
+        assert_eq!(
+            select_auto_draft_repo("llama", "bartowski/Meta-Llama-3.3-70B-Instruct-GGUF"),
+            Some("bartowski/Llama-3.2-1B-Instruct-GGUF")
+        );
+        assert_eq!(
+            select_auto_draft_repo("gemma3", "ggml-org/gemma-3-27b-it-GGUF"),
+            Some("ggml-org/gemma-3-1b-it-GGUF")
+        );
+        assert_eq!(select_auto_draft_repo("unknown_arch", "custom/model"), None);
+
+        // Verify progress callback receives start + completion + cache-hit events and propagates abort.
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        use std::sync::Mutex;
+
+        let payload = vec![0x42u8; 32 * 1024];
+        let sha = to_hex_lower(&Sha256::digest(&payload));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_payload = payload.clone();
+        let srv_sha = sha.clone();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let Ok(mut sock) = stream else { break };
+                let mut reader = BufReader::new(sock.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"{srv_sha}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    srv_payload.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(&srv_payload);
+                let _ = sock.flush();
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HF_ENDPOINT", format!("http://{addr}")) };
+
+        let events: Arc<Mutex<Vec<DownloadProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev_clone = events.clone();
+        let cb: ProgressCallback = Arc::new(move |ev| {
+            ev_clone.lock().unwrap().push(ev.clone());
+            Ok(())
+        });
+
+        let p1 =
+            ensure_hf_downloaded_with_progress("hf://Org/Repo:test.gguf", tmp.path(), Some(&cb))
+                .unwrap();
+        assert!(p1.is_file());
+        {
+            let recorded = events.lock().unwrap();
+            assert!(recorded.len() >= 2);
+            assert!(!recorded.first().unwrap().done);
+            let last = recorded.last().unwrap();
+            assert!(last.done && !last.cached);
+            assert_eq!(last.downloaded_bytes, payload.len() as u64);
+        }
+
+        // Second call hits cache and emits `cached: true, done: true`.
+        events.lock().unwrap().clear();
+        let _ =
+            ensure_hf_downloaded_with_progress("hf://Org/Repo:test.gguf", tmp.path(), Some(&cb))
+                .unwrap();
+        {
+            let recorded = events.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert!(recorded[0].cached && recorded[0].done);
+        }
+
+        // Callback returning Err aborts uncached download immediately.
+        let abort_cb: ProgressCallback = Arc::new(|_ev| bail!("user aborted download"));
+        let err = ensure_hf_downloaded_with_progress(
+            "hf://Org/Repo:other.gguf",
+            tmp.path(),
+            Some(&abort_cb),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("user aborted download"));
 
         unsafe { std::env::remove_var("HF_ENDPOINT") };
         server.join().unwrap();

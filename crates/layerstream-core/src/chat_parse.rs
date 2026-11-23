@@ -2,7 +2,147 @@
 //! `<tool_call>...</tool_call>` OpenAI tool-call payloads from assistant output.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+
+use crate::engine::ChatMessage;
+
+/// Canonical OpenAI-compatible incoming chat message normalizer shared across `layerstream-server`,
+/// Python bindings, and Node.js bindings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IncomingChatMessage {
+    pub role: String,
+    #[serde(default)]
+    pub content: Value,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<Value>>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl IncomingChatMessage {
+    pub fn to_chat_message(&self) -> Result<ChatMessage, String> {
+        let mut text = match &self.content {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => {
+                let mut texts = Vec::with_capacity(parts.len());
+                for part in parts {
+                    match part {
+                        Value::String(s) => texts.push(s.as_str()),
+                        Value::Object(map) => {
+                            let kind = map.get("type").and_then(Value::as_str);
+                            match kind {
+                                Some("text" | "input_text") | None => {
+                                    if let Some(t) = map.get("text").and_then(Value::as_str) {
+                                        texts.push(t);
+                                    } else {
+                                        return Err(format!(
+                                            "unsupported chat message content part: {part}"
+                                        ));
+                                    }
+                                }
+                                Some(other) => {
+                                    return Err(format!(
+                                        "unsupported multimodal content part type '{other}'; only text content is supported"
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "unsupported chat message content part (expected string or object): {part}"
+                            ));
+                        }
+                    }
+                }
+                texts.join("\n")
+            }
+            Value::Null => String::new(),
+            other => {
+                return Err(format!(
+                    "unsupported chat message content value (expected string, array, or null): {other}"
+                ));
+            }
+        };
+
+        // Preserve assistant `tool_calls` across multi-turn agent loops.
+        if let Some(calls) = &self.tool_calls
+            && !calls.is_empty()
+        {
+            for call in calls {
+                let func = call.get("function").unwrap_or(call);
+                let name = func.get("name").and_then(Value::as_str).unwrap_or("");
+                let raw_args = func.get("arguments").cloned().unwrap_or(Value::Null);
+                let args_val = match raw_args {
+                    Value::String(ref s) => {
+                        serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.clone()))
+                    }
+                    other => other,
+                };
+                if !name.is_empty() {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    let mut payload = json!({"name": name, "arguments": args_val});
+                    if let Some(call_id) = call.get("id").and_then(Value::as_str)
+                        && !call_id.is_empty()
+                    {
+                        payload["id"] = json!(call_id);
+                    }
+                    text.push_str(&format!("<tool_call>{payload}</tool_call>"));
+                }
+            }
+        }
+
+        // Preserve tool response identity (`tool_call_id` / `name`) for `role: "tool"`.
+        if self.role == "tool" {
+            let mut prefix = String::new();
+            if let Some(name) = &self.name
+                && !name.is_empty()
+            {
+                prefix.push_str(&format!("tool={name} "));
+            }
+            if let Some(id) = &self.tool_call_id
+                && !id.is_empty()
+            {
+                prefix.push_str(&format!("call_id={id}: "));
+            }
+            if !prefix.is_empty() {
+                text = format!("{prefix}{text}");
+            }
+        }
+
+        Ok(ChatMessage {
+            role: self.role.clone(),
+            content: text,
+        })
+    }
+}
+
+/// Injects formatted OpenAI `tools` definitions into the leading system message.
+pub fn inject_tools_into_messages(messages: &mut Vec<ChatMessage>, tools: &[Value]) {
+    if tools.is_empty() {
+        return;
+    }
+    let tool_prompt = format_tools_system_prompt(tools);
+    if let Some(first) = messages.first_mut()
+        && first.role == "system"
+    {
+        if !first.content.is_empty() {
+            first.content.push_str("\n\n");
+        }
+        first.content.push_str(&tool_prompt);
+    } else {
+        messages.insert(
+            0,
+            ChatMessage {
+                role: "system".to_string(),
+                content: tool_prompt,
+            },
+        );
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenAiToolCall {

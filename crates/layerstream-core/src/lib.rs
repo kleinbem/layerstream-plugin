@@ -7,11 +7,14 @@ pub mod grammar;
 pub mod hf;
 pub mod io_reader;
 pub mod residency;
+#[cfg(feature = "hf")]
+pub mod sdk;
 pub mod speculator;
 
 pub use chat_parse::{
-    OpenAiFunctionCall, OpenAiToolCall, ParsedAssistantOutput, StreamDelta, StreamTagParser,
-    format_tools_system_prompt, parse_assistant_output,
+    IncomingChatMessage, OpenAiFunctionCall, OpenAiToolCall, ParsedAssistantOutput, StreamDelta,
+    StreamTagParser, format_tools_system_prompt, inject_tools_into_messages,
+    parse_assistant_output,
 };
 pub use engine::{
     CancelledError, ChatMessage, EngineConfig, GenerateOptions, GenerateSummary, KvCacheType,

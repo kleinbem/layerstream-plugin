@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from os import PathLike
 from types import TracebackType
 from typing import Any, Literal, TypedDict, overload
@@ -8,6 +6,17 @@ from typing import Any, Literal, TypedDict, overload
 from .openai import AsyncOpenAI as AsyncOpenAI, OpenAI as OpenAI
 
 __version__: str
+
+class ProgressEventDict(TypedDict):
+    repo_id: str
+    filename: str
+    shard_index: int
+    shard_count: int
+    downloaded_bytes: int
+    total_bytes: int | None
+    mib_per_s: float
+    cached: bool
+    done: bool
 
 class IoStatsDict(TypedDict):
     bytes_read: int
@@ -18,10 +27,12 @@ class IoStatsDict(TypedDict):
     cache_bytes_served: int
     direct_io_active: bool
 
-class EngineStatsDict(TypedDict, total=False):
+class EngineStatsDict(TypedDict):
     loaded: bool
     isolated_worker: bool
     worker_pid: int | None
+    backend_name: str
+    cached_kv_tokens: int
     model_path: str
     draft_model_path: str | None
     source_uri: str | None
@@ -100,6 +111,7 @@ class CheckReportDict(TypedDict):
     total_file_bytes: int
     storage_mib_s: float
     direct_io: bool
+    gpu_backend: str | None
     gpu_free_bytes: int | None
     gpu_total_bytes: int | None
     fits_in_vram: bool
@@ -122,6 +134,23 @@ class StreamTagParser:
     def push(self, piece: str) -> list[dict[str, Any]]: ...
     def flush(self) -> list[dict[str, Any]]: ...
 
+class ServerHandle:
+    @property
+    def host(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    @property
+    def base_url(self) -> str: ...
+    def stop(self) -> None: ...
+    def wait(self) -> None: ...
+    def __enter__(self) -> ServerHandle: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_val: BaseException | None = None,
+        exc_tb: TracebackType | None = None,
+    ) -> None: ...
+
 class TokenStream(Iterator[str], AsyncIterator[str]):
     def __iter__(self) -> TokenStream: ...
     def __next__(self) -> str: ...
@@ -131,7 +160,7 @@ class TokenStream(Iterator[str], AsyncIterator[str]):
         exc_type: type[BaseException] | None = None,
         exc_val: BaseException | None = None,
         exc_tb: TracebackType | None = None,
-    ) -> bool: ...
+    ) -> None: ...
     def close(self) -> None: ...
     @property
     def summary(self) -> GenerateSummaryDict | None: ...
@@ -143,7 +172,7 @@ class TokenStream(Iterator[str], AsyncIterator[str]):
         exc_type: type[BaseException] | None = None,
         exc_val: BaseException | None = None,
         exc_tb: TracebackType | None = None,
-    ) -> bool: ...
+    ) -> None: ...
     async def aclose(self) -> None: ...
 
 class AutoModel:
@@ -152,7 +181,7 @@ class AutoModel:
         cls,
         model: str,
         *,
-        draft_model: str | None = None,
+        draft_model: str | Literal["auto"] | None = None,
         quant: str | None = None,
         revision: str | None = None,
         cache_dir: str | PathLike[str] | None = None,
@@ -171,8 +200,8 @@ class AutoModel:
         max_draft_tokens: int = 5,
         verbose: bool = False,
         isolated_worker: bool = False,
+        on_progress: Callable[[dict[str, Any]], Any] | None = None,
     ) -> AutoModel: ...
-
     @overload
     def generate(
         self,
@@ -181,7 +210,12 @@ class AutoModel:
         max_tokens: int = 256,
         temperature: float = 0.0,
         top_p: float = 0.95,
+        min_p: float = 0.0,
         top_k: int = 40,
+        repeat_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_last_n: int = 64,
         seed: int = 42,
         stop: str | Sequence[str] | None = None,
         stream: Literal[False] = False,
@@ -190,7 +224,6 @@ class AutoModel:
         grammar: str | None = None,
         json_schema: Any = None,
     ) -> str: ...
-
     @overload
     def generate(
         self,
@@ -199,7 +232,12 @@ class AutoModel:
         max_tokens: int = 256,
         temperature: float = 0.0,
         top_p: float = 0.95,
+        min_p: float = 0.0,
         top_k: int = 40,
+        repeat_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_last_n: int = 64,
         seed: int = 42,
         stop: str | Sequence[str] | None = None,
         stream: Literal[True],
@@ -208,7 +246,6 @@ class AutoModel:
         grammar: str | None = None,
         json_schema: Any = None,
     ) -> TokenStream: ...
-
     def generate(
         self,
         prompt: str,
@@ -216,7 +253,12 @@ class AutoModel:
         max_tokens: int = 256,
         temperature: float = 0.0,
         top_p: float = 0.95,
+        min_p: float = 0.0,
         top_k: int = 40,
+        repeat_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_last_n: int = 64,
         seed: int = 42,
         stop: str | Sequence[str] | None = None,
         stream: bool = False,
@@ -225,7 +267,6 @@ class AutoModel:
         grammar: str | None = None,
         json_schema: Any = None,
     ) -> str | TokenStream: ...
-
     @overload
     def chat(
         self,
@@ -234,7 +275,12 @@ class AutoModel:
         max_tokens: int = 256,
         temperature: float = 0.0,
         top_p: float = 0.95,
+        min_p: float = 0.0,
         top_k: int = 40,
+        repeat_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_last_n: int = 64,
         seed: int = 42,
         stop: str | Sequence[str] | None = None,
         stream: Literal[False] = False,
@@ -246,7 +292,6 @@ class AutoModel:
         json_schema: Any = None,
         parse_output: Literal[False] = False,
     ) -> str: ...
-
     @overload
     def chat(
         self,
@@ -255,7 +300,12 @@ class AutoModel:
         max_tokens: int = 256,
         temperature: float = 0.0,
         top_p: float = 0.95,
+        min_p: float = 0.0,
         top_k: int = 40,
+        repeat_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_last_n: int = 64,
         seed: int = 42,
         stop: str | Sequence[str] | None = None,
         stream: Literal[False] = False,
@@ -267,7 +317,6 @@ class AutoModel:
         json_schema: Any = None,
         parse_output: Literal[True],
     ) -> ParsedAssistantOutputDict: ...
-
     @overload
     def chat(
         self,
@@ -276,7 +325,12 @@ class AutoModel:
         max_tokens: int = 256,
         temperature: float = 0.0,
         top_p: float = 0.95,
+        min_p: float = 0.0,
         top_k: int = 40,
+        repeat_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_last_n: int = 64,
         seed: int = 42,
         stop: str | Sequence[str] | None = None,
         stream: Literal[True],
@@ -288,7 +342,6 @@ class AutoModel:
         json_schema: Any = None,
         parse_output: Literal[False] = False,
     ) -> TokenStream: ...
-
     def chat(
         self,
         messages: Sequence[Mapping[str, Any]],
@@ -296,7 +349,12 @@ class AutoModel:
         max_tokens: int = 256,
         temperature: float = 0.0,
         top_p: float = 0.95,
+        min_p: float = 0.0,
         top_k: int = 40,
+        repeat_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_last_n: int = 64,
         seed: int = 42,
         stop: str | Sequence[str] | None = None,
         stream: bool = False,
@@ -308,7 +366,6 @@ class AutoModel:
         json_schema: Any = None,
         parse_output: bool = False,
     ) -> str | ParsedAssistantOutputDict | TokenStream: ...
-
     def tokenize(
         self,
         text: str,
@@ -326,6 +383,8 @@ class AutoModel:
     ) -> str: ...
     def kv_clear(self) -> None: ...
     def kv_trim(self, pos_min: int) -> bool: ...
+    def save_state(self, path: str | PathLike[str]) -> int: ...
+    def load_state(self, path: str | PathLike[str]) -> int: ...
     def stats(self) -> EngineStatsDict: ...
     @property
     def last_summary(self) -> GenerateSummaryDict | None: ...
@@ -344,18 +403,27 @@ class AutoModel:
         exc_type: type[BaseException] | None = None,
         exc_val: BaseException | None = None,
         exc_tb: TracebackType | None = None,
-    ) -> bool: ...
+    ) -> None: ...
     async def __aenter__(self) -> AutoModel: ...
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None = None,
         exc_val: BaseException | None = None,
         exc_tb: TracebackType | None = None,
-    ) -> bool: ...
+    ) -> None: ...
 
+def configured_backend_dirs() -> list[str]: ...
 def probe_gpu_memory(use_gpu: bool = True) -> tuple[int, int] | None: ...
+def probe_gpu_device(use_gpu: bool = True) -> tuple[int, int, str] | None: ...
 def inspect_gguf(path: str | PathLike[str]) -> GgufInfoDict: ...
-def pull(spec: str, *, cache_dir: str | PathLike[str] | None = None) -> str: ...
+def pull(
+    spec: str,
+    *,
+    cache_dir: str | PathLike[str] | None = None,
+    quant: str | None = None,
+    revision: str | None = None,
+    on_progress: Callable[[dict[str, Any]], Any] | None = None,
+) -> str: ...
 def recommend(
     repo: str,
     *,
@@ -369,13 +437,67 @@ def recommend(
 def check(
     model: str,
     *,
-    draft_model: str | None = None,
+    draft_model: str | Literal["auto"] | None = None,
     quant: str | None = None,
     revision: str | None = None,
     cache_dir: str | PathLike[str] | None = None,
     use_gpu: bool = True,
     allow_slow: bool = False,
 ) -> CheckReportDict: ...
+def start_server(
+    model: str,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    api_key: str | None = None,
+    draft_model: str | Literal["auto"] | None = None,
+    quant: str | None = None,
+    revision: str | None = None,
+    cache_dir: str | PathLike[str] | None = None,
+    vram_budget_mb: int | str | None = "auto",
+    resident_layers: int | None = None,
+    ctx_size: int = 4096,
+    batch_size: int = 512,
+    threads: int | None = None,
+    kv_cache_type: str = "q8_0",
+    use_gpu: bool = True,
+    prefer_direct_io: bool = True,
+    cpu_embeddings: bool = False,
+    cpu_head: bool = False,
+    stream_head: bool = False,
+    moe_active_streaming: bool = True,
+    idle_timeout_secs: int = 60,
+    max_draft_tokens: int = 5,
+    verbose: bool = False,
+    on_progress: Callable[[dict[str, Any]], Any] | None = None,
+) -> ServerHandle: ...
+def serve(
+    model: str,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    api_key: str | None = None,
+    draft_model: str | Literal["auto"] | None = None,
+    quant: str | None = None,
+    revision: str | None = None,
+    cache_dir: str | PathLike[str] | None = None,
+    vram_budget_mb: int | str | None = "auto",
+    resident_layers: int | None = None,
+    ctx_size: int = 4096,
+    batch_size: int = 512,
+    threads: int | None = None,
+    kv_cache_type: str = "q8_0",
+    use_gpu: bool = True,
+    prefer_direct_io: bool = True,
+    cpu_embeddings: bool = False,
+    cpu_head: bool = False,
+    stream_head: bool = False,
+    moe_active_streaming: bool = True,
+    idle_timeout_secs: int = 60,
+    max_draft_tokens: int = 5,
+    verbose: bool = False,
+    on_progress: Callable[[dict[str, Any]], Any] | None = None,
+) -> None: ...
 def json_schema_to_gbnf(schema: Any) -> str: ...
 def json_object_gbnf() -> str: ...
 def parse_assistant_output(raw: str) -> ParsedAssistantOutputDict: ...

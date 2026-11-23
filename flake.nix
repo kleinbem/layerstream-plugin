@@ -98,8 +98,20 @@
             packages =
               commonPackages
               ++ (with pkgs; [
-                (python3.withPackages (ps: [ ps.pytest ]))
+                (python3.withPackages (
+                  ps: with ps; [
+                    pytest
+                    pytest-asyncio
+                    pytest-timeout
+                    hypothesis
+                    pip
+                    setuptools
+                    wheel
+                  ]
+                ))
                 maturin
+                ruff
+                pyright
               ]);
 
             LLAMA_CPP_DIR = "${llama-cpp-src}";

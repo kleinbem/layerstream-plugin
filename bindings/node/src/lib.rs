@@ -6,23 +6,22 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
-use layerstream_core::hf::{self, PretrainedResolveOptions, resolve_pretrained_model};
+use layerstream_core::sdk::{
+    CheckOptions, LoadedSession, OpenSessionOptions, RecommendOptions, check_model,
+    inspect_gguf_file, pull_model, recommend_repo,
+};
 use layerstream_core::{
-    ChatMessage, DraftModelProposer, EngineConfig, GenerateOptions, GenerateSummary, GgufIndex,
-    KvCacheType, LsSampleParams, ParsedAssistantOutput, StreamDelta, StreamEngine,
-    StreamTagParser as CoreStreamTagParser, check_gguf_draft_compatible,
-    format_tools_system_prompt as core_format_tools, json_object_gbnf as core_json_object_gbnf,
+    ChatMessage, GenerateOptions, GenerateSummary, IncomingChatMessage, KvCacheType,
+    LsSampleParams, ParsedAssistantOutput, StreamDelta, StreamEngine,
+    StreamTagParser as CoreStreamTagParser, format_tools_system_prompt as core_format_tools,
+    inject_tools_into_messages as core_inject_tools, json_object_gbnf as core_json_object_gbnf,
     json_schema_to_gbnf as core_json_schema_to_gbnf,
-    parse_assistant_output as core_parse_assistant_output, probe_dir_storage_mib_per_s,
-    probe_storage_mib_per_s,
+    parse_assistant_output as core_parse_assistant_output,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-
-const MIN_STREAMING_STORAGE_MIB_S: f64 = 150.0;
-const OVERSIZE_GUARD_BYTES: u64 = 1024 * 1024 * 1024;
 
 fn invalid_arg(msg: impl Into<String>) -> Error {
     Error::new(Status::InvalidArg, msg.into())
@@ -34,7 +33,7 @@ fn generic_err(msg: impl Into<String>) -> Error {
 
 fn map_anyhow_err(err: anyhow::Error) -> Error {
     let msg = format!("{err:#}");
-    if msg.contains("local GGUF model not found") {
+    if msg.contains("local GGUF model not found") || msg.contains("KV state file not found") {
         Error::new(Status::GenericFailure, format!("ENOENT: {msg}"))
     } else {
         Error::new(Status::GenericFailure, msg)
@@ -99,6 +98,8 @@ pub struct EngineStatsJs {
     pub loaded: bool,
     pub isolated_worker: bool,
     pub worker_pid: Option<u32>,
+    pub backend_name: Option<String>,
+    pub cached_kv_tokens: Option<u32>,
     pub model_path: Option<String>,
     pub draft_model_path: Option<String>,
     pub source_uri: Option<String>,
@@ -735,17 +736,6 @@ impl EngineGate {
     }
 }
 
-struct LoadedEngine {
-    engine: StreamEngine,
-    draft: Option<DraftModelProposer>,
-    model_path: PathBuf,
-    draft_model_path: Option<PathBuf>,
-    source_uri: Option<String>,
-    resolved_repo: Option<String>,
-    selected_quant: Option<String>,
-    default_max_draft_tokens: usize,
-}
-
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct OpenOptionsWire {
@@ -776,7 +766,12 @@ struct GenerateOptionsWire {
     max_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    min_p: Option<f32>,
     top_k: Option<i32>,
+    repeat_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    penalty_last_n: Option<i32>,
     seed: Option<u32>,
     stop: Option<Vec<String>>,
     ngram_speculation: Option<bool>,
@@ -787,136 +782,25 @@ struct GenerateOptionsWire {
     parse_output: Option<bool>,
 }
 
-#[derive(Deserialize)]
-struct IncomingChatMsgWire {
-    role: String,
-    #[serde(default)]
-    content: Option<JsonValue>,
-    #[serde(default)]
-    tool_calls: Option<Vec<JsonValue>>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    tool_call_id: Option<String>,
-}
-
 fn parse_wire_messages(raw_json: &str) -> Result<Vec<ChatMessage>> {
-    let items: Vec<IncomingChatMsgWire> = serde_json::from_str(raw_json)
+    let items: Vec<IncomingChatMessage> = serde_json::from_str(raw_json)
         .map_err(|e| invalid_arg(format!("invalid chat messages payload: {e}")))?;
     if items.is_empty() {
         return Err(invalid_arg("messages must not be empty"));
     }
-    let mut out = Vec::with_capacity(items.len());
-    for m in items {
-        let mut content = match m.content {
-            None | Some(JsonValue::Null) => String::new(),
-            Some(JsonValue::String(s)) => s,
-            Some(JsonValue::Array(parts)) => {
-                let mut joined = Vec::with_capacity(parts.len());
-                for p in parts {
-                    match p {
-                        JsonValue::String(s) => joined.push(s),
-                        JsonValue::Object(map) => {
-                            let Some(t) = map.get("text").and_then(JsonValue::as_str) else {
-                                return Err(invalid_arg(
-                                    "content part object must contain a string 'text' field",
-                                ));
-                            };
-                            joined.push(t.to_string());
-                        }
-                        _ => {
-                            return Err(invalid_arg(
-                                "message 'content' array parts must be strings or {text: string} objects",
-                            ));
-                        }
-                    }
-                }
-                joined.join("")
-            }
-            Some(_) => {
-                return Err(invalid_arg(
-                    "message 'content' must be a string, null, or array of text parts",
-                ));
-            }
-        };
-
-        if m.role == "assistant"
-            && let Some(calls) = m.tool_calls
-        {
-            for tc in calls {
-                let func = tc.get("function").unwrap_or(&tc);
-                if let Some(name) = func.get("name").and_then(JsonValue::as_str)
-                    && !name.is_empty()
-                {
-                    let raw_args = func.get("arguments").cloned().unwrap_or(JsonValue::Null);
-                    let args_val = match raw_args {
-                        JsonValue::String(ref s) => serde_json::from_str::<JsonValue>(s)
-                            .unwrap_or(JsonValue::String(s.clone())),
-                        other => other,
-                    };
-                    let call_json = serde_json::json!({
-                        "name": name,
-                        "arguments": args_val,
-                    });
-                    if !content.is_empty() && !content.ends_with('\n') {
-                        content.push('\n');
-                    }
-                    content.push_str(&format!("<tool_call>{call_json}</tool_call>"));
-                }
-            }
-        }
-
-        if m.role == "tool" {
-            let mut prefix = String::new();
-            if let Some(name) = m.name
-                && !name.is_empty()
-            {
-                prefix.push_str(&format!("tool={name} "));
-            }
-            if let Some(id) = m.tool_call_id
-                && !id.is_empty()
-            {
-                prefix.push_str(&format!("call_id={id}: "));
-            }
-            if !prefix.is_empty() {
-                content = format!("{prefix}{content}");
-            }
-        }
-
-        out.push(ChatMessage {
-            role: m.role,
-            content,
-        });
-    }
-    Ok(out)
+    items
+        .iter()
+        .map(|m| m.to_chat_message().map_err(invalid_arg))
+        .collect()
 }
 
 fn inject_tools_into_messages(messages: &mut Vec<ChatMessage>, tools: &[JsonValue]) -> Result<()> {
-    if tools.is_empty() {
-        return Ok(());
-    }
     for t in tools {
         if !t.is_object() {
             return Err(invalid_arg("each entry in 'tools' must be an object"));
         }
     }
-    let tool_prompt = core_format_tools(tools);
-    if let Some(first) = messages.first_mut()
-        && first.role == "system"
-    {
-        if !first.content.is_empty() {
-            first.content.push_str("\n\n");
-        }
-        first.content.push_str(&tool_prompt);
-    } else {
-        messages.insert(
-            0,
-            ChatMessage {
-                role: "system".to_string(),
-                content: tool_prompt,
-            },
-        );
-    }
+    core_inject_tools(messages, tools);
     Ok(())
 }
 
@@ -930,14 +814,21 @@ fn build_generate_options(wire: &GenerateOptionsWire) -> Result<GenerateOptions>
             Some(raw.to_string())
         }
     };
+    let sample = LsSampleParams {
+        temperature: wire.temperature.unwrap_or(0.0),
+        top_p: wire.top_p.unwrap_or(0.95),
+        min_p: wire.min_p.unwrap_or(0.0),
+        top_k: wire.top_k.unwrap_or(40),
+        repeat_penalty: wire.repeat_penalty.unwrap_or(1.0),
+        frequency_penalty: wire.frequency_penalty.unwrap_or(0.0),
+        presence_penalty: wire.presence_penalty.unwrap_or(0.0),
+        penalty_last_n: wire.penalty_last_n.unwrap_or(64),
+        seed: wire.seed.unwrap_or(42),
+    };
+    sample.validate().map_err(invalid_arg)?;
     Ok(GenerateOptions {
         max_tokens: wire.max_tokens.unwrap_or(256),
-        sample: LsSampleParams {
-            temperature: wire.temperature.unwrap_or(0.0),
-            top_p: wire.top_p.unwrap_or(0.95),
-            top_k: wire.top_k.unwrap_or(40),
-            seed: wire.seed.unwrap_or(42),
-        },
+        sample,
         stop: wire.stop.clone().unwrap_or_default(),
         enable_ngram_speculation: wire.ngram_speculation.unwrap_or(true),
         max_draft_tokens: wire.max_draft_tokens.unwrap_or(0),
@@ -947,7 +838,7 @@ fn build_generate_options(wire: &GenerateOptionsWire) -> Result<GenerateOptions>
 
 #[napi]
 pub struct NativeAutoModel {
-    inner: Arc<Mutex<Option<LoadedEngine>>>,
+    inner: Arc<Mutex<Option<LoadedSession>>>,
     gate: Arc<EngineGate>,
     loaded: Arc<AtomicBool>,
     cached_model_path: Arc<Mutex<Option<String>>>,
@@ -962,117 +853,45 @@ impl NativeAutoModel {
         let opts: OpenOptionsWire = serde_json::from_str(&opts_json)
             .map_err(|e| invalid_arg(format!("invalid open options: {e}")))?;
 
-        let verbose = opts.verbose.unwrap_or(false);
-        StreamEngine::set_log_verbose(verbose);
-
-        let kv_str = opts.kv_cache_type.as_deref().unwrap_or("q8_0");
-        let kv_type: KvCacheType = kv_str
+        StreamEngine::set_log_verbose(opts.verbose.unwrap_or(false));
+        let kv_type: KvCacheType = opts
+            .kv_cache_type
+            .as_deref()
+            .unwrap_or("q8_0")
             .parse()
             .map_err(|e: anyhow::Error| invalid_arg(e.to_string()))?;
 
-        let use_gpu = opts.use_gpu.unwrap_or(true);
-        let ctx_size = opts.ctx_size.unwrap_or(4096);
-        let batch_size = opts.batch_size.unwrap_or(512);
-        let prefer_direct_io = opts.prefer_direct_io.unwrap_or(true);
-        let max_draft_tokens = opts.max_draft_tokens.unwrap_or(5).max(1);
-        let vram_budget_auto = opts.vram_budget_auto.unwrap_or(true);
-        let vram_budget_bytes = opts.vram_budget_bytes.unwrap_or(0);
-        let resident_layers = opts.resident_layers;
-        let cpu_embeddings = opts.cpu_embeddings.unwrap_or(false);
-        let cpu_head = opts.cpu_head.unwrap_or(false);
-        let stream_head = opts.stream_head.unwrap_or(false);
-        let moe_active_streaming = opts.moe_active_streaming.unwrap_or(true);
-
-        let n_threads = opts.threads.unwrap_or_else(|| {
-            if use_gpu {
-                2
-            } else {
-                std::thread::available_parallelism()
-                    .map(|n| n.get().min(8) as u32)
-                    .unwrap_or(4)
-            }
-        });
-
-        let cache_dir = opts.cache_dir.map(PathBuf::from);
-        let draft_owned = opts.draft_model;
-        let quant_owned = opts.quant;
-        let rev_owned = opts.revision;
+        let open_opts = OpenSessionOptions {
+            draft_model: opts.draft_model,
+            quant: opts.quant,
+            revision: opts.revision,
+            cache_dir: opts.cache_dir.map(PathBuf::from),
+            vram_budget_auto: opts.vram_budget_auto.unwrap_or(true),
+            vram_budget_bytes: opts.vram_budget_bytes.unwrap_or(0),
+            resident_layers: opts.resident_layers,
+            ctx_size: opts.ctx_size.unwrap_or(4096),
+            batch_size: opts.batch_size.unwrap_or(512),
+            threads: opts.threads,
+            kv_cache_type: kv_type,
+            use_gpu: opts.use_gpu.unwrap_or(true),
+            prefer_direct_io: opts.prefer_direct_io.unwrap_or(true),
+            cpu_embeddings: opts.cpu_embeddings.unwrap_or(false),
+            cpu_head: opts.cpu_head.unwrap_or(false),
+            stream_head: opts.stream_head.unwrap_or(false),
+            moe_active_streaming: opts.moe_active_streaming.unwrap_or(true),
+            max_draft_tokens: opts.max_draft_tokens.unwrap_or(5).max(1),
+            on_progress: None,
+        };
 
         let loaded = run_blocking(move || {
-            let res = (|| -> anyhow::Result<LoadedEngine> {
-                let target_resolve = PretrainedResolveOptions {
-                    revision: rev_owned.clone(),
-                    quant: quant_owned,
-                    cache_dir: cache_dir.clone(),
-                    vram_budget_bytes: if vram_budget_bytes > 0 {
-                        Some(vram_budget_bytes)
-                    } else {
-                        None
-                    },
-                    use_gpu,
-                    has_draft: draft_owned.is_some(),
-                };
-                let resolved_target = resolve_pretrained_model(&model, &target_resolve)?;
-
-                let (draft_proposer, draft_path) = if let Some(draft_spec) = draft_owned {
-                    let draft_resolve = PretrainedResolveOptions {
-                        revision: rev_owned,
-                        quant: None,
-                        cache_dir,
-                        vram_budget_bytes: None,
-                        use_gpu,
-                        has_draft: false,
-                    };
-                    let resolved_draft = resolve_pretrained_model(&draft_spec, &draft_resolve)?;
-                    let mut draft_cfg = EngineConfig::reference(&resolved_draft.local_path);
-                    draft_cfg.n_ctx = ctx_size;
-                    draft_cfg.n_batch = batch_size.clamp(16, 64);
-                    draft_cfg.n_threads = n_threads;
-                    draft_cfg.kv_cache_type = kv_type;
-                    draft_cfg.use_gpu = use_gpu;
-                    draft_cfg.prefer_direct_io = prefer_direct_io;
-                    let proposer = DraftModelProposer::open(draft_cfg, max_draft_tokens)?;
-                    (Some(proposer), Some(resolved_draft.local_path))
+            LoadedSession::open(&model, open_opts).map_err(|e| {
+                let msg = format!("{e:#}").replace("draft_model", "draftModel");
+                if msg.contains("local GGUF model not found") {
+                    Error::new(Status::GenericFailure, format!("ENOENT: {msg}"))
                 } else {
-                    (None, None)
-                };
-
-                let mut cfg = EngineConfig::streaming(&resolved_target.local_path);
-                cfg.n_ctx = ctx_size;
-                cfg.n_batch = batch_size.max(1);
-                cfg.n_threads = n_threads.max(1);
-                cfg.resident_layers = resident_layers;
-                cfg.vram_budget_bytes = vram_budget_bytes;
-                cfg.vram_budget_auto = vram_budget_auto && resident_layers.is_none();
-                cfg.kv_cache_type = kv_type;
-                cfg.use_gpu = use_gpu;
-                cfg.prefer_direct_io = prefer_direct_io;
-                cfg.cpu_embeddings = cpu_embeddings;
-                cfg.cpu_head = cpu_head;
-                cfg.stream_head = stream_head;
-                cfg.moe_active_streaming = moe_active_streaming;
-
-                let engine = StreamEngine::open(&cfg)?;
-                if let Some(ref proposer) = draft_proposer {
-                    engine
-                        .check_draft_compatible(proposer.engine())
-                        .map_err(|reason| {
-                            anyhow::anyhow!("incompatible draftModel tokenizer: {reason}")
-                        })?;
+                    Error::new(Status::GenericFailure, msg)
                 }
-
-                Ok(LoadedEngine {
-                    engine,
-                    draft: draft_proposer,
-                    model_path: resolved_target.local_path,
-                    draft_model_path: draft_path,
-                    source_uri: resolved_target.source_uri,
-                    resolved_repo: resolved_target.resolved_repo,
-                    selected_quant: resolved_target.selected_quant,
-                    default_max_draft_tokens: max_draft_tokens,
-                })
-            })();
-            res.map_err(map_anyhow_err)
+            })
         })
         .await?;
 
@@ -1468,6 +1287,58 @@ impl NativeAutoModel {
     }
 
     #[napi]
+    pub async fn save_state(&self, path: String) -> Result<u32> {
+        if path.trim().is_empty() {
+            return Err(invalid_arg("path must be a non-empty string"));
+        }
+        let permit = self.gate.acquire_async(None).await?;
+        let inner = self.inner.clone();
+        run_blocking(move || {
+            let _permit = permit;
+            let mut guard = inner
+                .lock()
+                .map_err(|_| generic_err("model lock poisoned"))?;
+            let loaded = guard
+                .as_mut()
+                .ok_or_else(|| generic_err("model has been unloaded"))?;
+            let n = loaded.engine.save_state(&path).map_err(map_anyhow_err)?;
+            Ok(n.min(u32::MAX as usize) as u32)
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn load_state(&self, path: String) -> Result<u32> {
+        if path.trim().is_empty() {
+            return Err(invalid_arg("path must be a non-empty string"));
+        }
+        let p = PathBuf::from(&path);
+        if !p.is_file() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!("ENOENT: KV state file not found: '{path}'"),
+            ));
+        }
+        let permit = self.gate.acquire_async(None).await?;
+        let inner = self.inner.clone();
+        run_blocking(move || {
+            let _permit = permit;
+            let mut guard = inner
+                .lock()
+                .map_err(|_| generic_err("model lock poisoned"))?;
+            let loaded = guard
+                .as_mut()
+                .ok_or_else(|| generic_err("model has been unloaded"))?;
+            let n = loaded.engine.load_state(&p).map_err(map_anyhow_err)?;
+            if let Some(ref mut d) = loaded.draft {
+                d.reset();
+            }
+            Ok(n.min(u32::MAX as usize) as u32)
+        })
+        .await
+    }
+
+    #[napi]
     pub async fn stats(&self) -> Result<EngineStatsJs> {
         let permit = self.gate.acquire_async(None).await?;
         let inner = self.inner.clone();
@@ -1481,6 +1352,8 @@ impl NativeAutoModel {
                     loaded: false,
                     isolated_worker: false,
                     worker_pid: None,
+                    backend_name: None,
+                    cached_kv_tokens: None,
                     model_path: None,
                     draft_model_path: None,
                     source_uri: None,
@@ -1514,6 +1387,8 @@ impl NativeAutoModel {
                 loaded: true,
                 isolated_worker: false,
                 worker_pid: None,
+                backend_name: Some(st.backend_name_str()),
+                cached_kv_tokens: Some(loaded.engine.cached_kv_len().min(u32::MAX as usize) as u32),
                 model_path: Some(loaded.model_path.to_string_lossy().into_owned()),
                 draft_model_path: loaded
                     .draft_model_path
@@ -1638,21 +1513,15 @@ pub async fn probe_gpu_memory(use_gpu: Option<bool>) -> Result<Option<GpuMemoryJ
 pub async fn inspect_gguf(path: String) -> Result<GgufInfoJs> {
     run_blocking(move || {
         let pb = PathBuf::from(&path);
-        if !pb.is_file() {
-            return Err(generic_err(format!(
-                "ENOENT: local GGUF model not found: '{}'",
-                pb.display()
-            )));
-        }
-        let idx = GgufIndex::open(&pb).map_err(map_anyhow_err)?;
+        let info = inspect_gguf_file(&pb).map_err(map_anyhow_err)?;
         Ok(GgufInfoJs {
-            architecture: idx.meta.architecture,
-            name: idx.meta.name,
-            n_layers: idx.meta.n_layers,
-            context_length: idx.meta.context_length,
-            total_file_bytes: idx.meta.total_file_bytes as f64,
-            shard_count: idx.shards.len() as u32,
-            tensor_count: idx.tensors.len() as u32,
+            architecture: info.architecture,
+            name: info.name,
+            n_layers: info.n_layers,
+            context_length: info.context_length,
+            total_file_bytes: info.total_file_bytes as f64,
+            shard_count: info.shard_count as u32,
+            tensor_count: info.tensor_count as u32,
         })
     })
     .await
@@ -1661,10 +1530,8 @@ pub async fn inspect_gguf(path: String) -> Result<GgufInfoJs> {
 #[napi]
 pub async fn pull(spec: String, cache_dir: Option<String>) -> Result<String> {
     run_blocking(move || {
-        let root = cache_dir
-            .map(PathBuf::from)
-            .unwrap_or_else(hf::default_cache_dir);
-        let local = hf::ensure_hf_downloaded(&spec, &root).map_err(map_anyhow_err)?;
+        let local = pull_model(&spec, cache_dir.map(PathBuf::from), None, None, None)
+            .map_err(map_anyhow_err)?;
         Ok(local.to_string_lossy().into_owned())
     })
     .await
@@ -1697,71 +1564,24 @@ pub async fn recommend(
     {
         return Err(invalid_arg("nvmeMibS must be positive"));
     }
-    let has_draft = o.has_draft.unwrap_or(true);
-    let use_gpu = o.use_gpu.unwrap_or(true);
-    let rev_owned = o.revision;
-    let cache_dir = o.cache_dir.map(PathBuf::from);
-    let free_ram_gb = o.free_ram_gb;
-    let nvme_mib_s = o.nvme_mib_s;
-
+    let rec_opts = RecommendOptions {
+        revision: o.revision,
+        free_ram_gb: o.free_ram_gb,
+        nvme_mib_s: o.nvme_mib_s,
+        has_draft: o.has_draft.unwrap_or(true),
+        cache_dir: o.cache_dir.map(PathBuf::from),
+        use_gpu: o.use_gpu.unwrap_or(true),
+    };
     run_blocking(move || {
-        let (effective_repo, recs) =
-            (|| -> anyhow::Result<(String, Vec<hf::QuantRecommendation>)> {
-                let (repo_id, rev) = hf::parse_repo_and_revision(&repo, rev_owned.as_deref())?;
-                let mut effective_repo = repo_id.clone();
-                let mut candidates = hf::list_hf_gguf_candidates(&repo_id, &rev)?;
-
-                if candidates.is_empty() && !repo_id.to_ascii_lowercase().ends_with("-gguf") {
-                    let sibling = format!("{repo_id}-GGUF");
-                    if let Ok(sib_cands) = hf::list_hf_gguf_candidates(&sibling, &rev)
-                        && !sib_cands.is_empty()
-                    {
-                        effective_repo = sibling;
-                        candidates = sib_cands;
-                    }
-                }
-                if candidates.is_empty() {
-                    anyhow::bail!(
-                        "no .gguf files found in Hugging Face repository '{repo_id}@{rev}'"
-                    );
-                }
-
-                let free_vram_bytes = if let Some(gb) = free_ram_gb {
-                    (gb.max(0.5) * 1024.0 * 1024.0 * 1024.0) as u64
-                } else if use_gpu && let Some((free, _)) = StreamEngine::probe_gpu_memory(true) {
-                    free
-                } else {
-                    4 * 1024 * 1024 * 1024
-                };
-
-                let storage_bw = if let Some(bw) = nvme_mib_s {
-                    bw.max(10.0)
-                } else {
-                    let probe_dir = cache_dir.unwrap_or_else(hf::default_cache_dir);
-                    let _ = std::fs::create_dir_all(&probe_dir);
-                    probe_dir_storage_mib_per_s(&probe_dir).unwrap_or(1500.0)
-                };
-
-                let recs = hf::recommend_candidates(
-                    &effective_repo,
-                    &rev,
-                    &candidates,
-                    free_vram_bytes,
-                    storage_bw,
-                    has_draft,
-                );
-                Ok((effective_repo, recs))
-            })()
-            .map_err(map_anyhow_err)?;
-
+        let (_effective_repo, recs) = recommend_repo(&repo, rec_opts).map_err(map_anyhow_err)?;
         Ok(recs
             .into_iter()
             .map(|r| QuantRecommendationJs {
-                resolved_repo: effective_repo.clone(),
-                quant: r.candidate.quant,
-                primary_file: r.candidate.primary_file,
-                total_bytes: r.candidate.total_bytes as f64,
-                shard_count: r.candidate.shard_count,
+                resolved_repo: r.resolved_repo,
+                quant: r.quant,
+                primary_file: r.primary_file,
+                total_bytes: r.total_bytes as f64,
+                shard_count: r.shard_count,
                 hf_uri: r.hf_uri,
                 verdict: r.verdict,
                 pinned_pct: r.pinned_pct as u32,
@@ -1790,171 +1610,41 @@ pub struct CheckOptionsJs {
 #[napi]
 pub async fn check(model: String, opts: Option<CheckOptionsJs>) -> Result<CheckReportJs> {
     let o = opts.unwrap_or_default();
-    let use_gpu = o.use_gpu.unwrap_or(true);
-    let allow_slow = o.allow_slow.unwrap_or(false);
-    let draft_owned = o.draft_model;
-    let quant_owned = o.quant;
-    let rev_owned = o.revision;
-    let cache_dir = o.cache_dir.map(PathBuf::from);
-
+    let chk_opts = CheckOptions {
+        draft_model: o.draft_model,
+        quant: o.quant,
+        revision: o.revision,
+        cache_dir: o.cache_dir.map(PathBuf::from),
+        use_gpu: o.use_gpu.unwrap_or(true),
+        allow_slow: o.allow_slow.unwrap_or(false),
+    };
     run_blocking(move || {
-        let res = (|| -> anyhow::Result<CheckReportJs> {
-            let resolve_opts = PretrainedResolveOptions {
-                revision: rev_owned.clone(),
-                quant: quant_owned,
-                cache_dir: cache_dir.clone(),
-                vram_budget_bytes: None,
-                use_gpu,
-                has_draft: draft_owned.is_some(),
-            };
-            let resolved_target = resolve_pretrained_model(&model, &resolve_opts)?;
-            let idx = GgufIndex::open(&resolved_target.local_path)?;
-
-            let (draft_path, draft_reserve) = if let Some(d_spec) = draft_owned {
-                let d_opts = PretrainedResolveOptions {
-                    revision: rev_owned,
-                    quant: None,
-                    cache_dir,
-                    vram_budget_bytes: None,
-                    use_gpu,
-                    has_draft: false,
-                };
-                let resolved_draft = resolve_pretrained_model(&d_spec, &d_opts)?;
-                check_gguf_draft_compatible(&resolved_target.local_path, &resolved_draft.local_path)
-                    .map_err(|e| anyhow::anyhow!("incompatible draftModel tokenizer: {e}"))?;
-                let draft_idx = GgufIndex::open(&resolved_draft.local_path)?;
-                let reserve = draft_idx
-                    .meta
-                    .total_file_bytes
-                    .saturating_add(64 * 1024 * 1024);
-                (Some(resolved_draft.local_path), reserve)
+        let rep = check_model(&model, chk_opts).map_err(|e| {
+            let msg = format!("{e:#}").replace("draft_model", "draftModel");
+            if msg.contains("local GGUF model not found") {
+                Error::new(Status::GenericFailure, format!("ENOENT: {msg}"))
             } else {
-                (None, 0u64)
-            };
-
-            let gpu_mem = if use_gpu {
-                let probed = StreamEngine::probe_gpu_memory(true);
-                if probed.is_none() {
-                    anyhow::bail!(
-                        "no usable GPU device found (CUDA/Vulkan/Metal); pass useGpu: false for CPU mode"
-                    );
-                }
-                probed
-            } else {
-                None
-            };
-
-            let size_bytes = idx.meta.total_file_bytes;
-            let size_gib = size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-            let fits_in_vram = gpu_mem
-                .map(|(free_b, _)| {
-                    size_bytes
-                        .saturating_add(draft_reserve)
-                        .saturating_add(768 * 1024 * 1024)
-                        < free_b
-                })
-                .unwrap_or(false);
-
-            let probe_res = probe_storage_mib_per_s(&resolved_target.local_path, true).ok();
-            let (mib_s, direct_ok) = probe_res.unwrap_or((0.0, false));
-            let is_oversize = size_bytes >= OVERSIZE_GUARD_BYTES && !fits_in_vram;
-
-            if is_oversize && use_gpu && !allow_slow {
-                if probe_res.is_none() || !mib_s.is_finite() || mib_s <= 0.0 {
-                    anyhow::bail!(
-                        "could not measure storage throughput for '{}' ({size_gib:.1} GiB) \
-                         required for out-of-core GPU streaming; pass allowSlow: true to bypass preflight.",
-                        resolved_target.local_path.display()
-                    );
-                }
-                if !direct_ok {
-                    anyhow::bail!(
-                        "storage throughput for '{}' ({size_gib:.1} GiB) is unverified because \
-                         direct I/O (O_DIRECT/F_NOCACHE) was unavailable (measured {mib_s:.0} MiB/s from page cache). \
-                         Move the GGUF to a direct-I/O filesystem or pass allowSlow: true.",
-                        resolved_target.local_path.display()
-                    );
-                }
-                if mib_s < MIN_STREAMING_STORAGE_MIB_S {
-                    anyhow::bail!(
-                        "storage for '{}' ({size_gib:.1} GiB) measured only {mib_s:.0} MiB/s \
-                         (minimum recommended {MIN_STREAMING_STORAGE_MIB_S:.0} MiB/s NVMe). \
-                         Move the GGUF to local NVMe or pass allowSlow: true.",
-                        resolved_target.local_path.display()
-                    );
-                }
+                Error::new(Status::GenericFailure, msg)
             }
-
-            let pinned_mib = gpu_mem.map_or(0.0, |(f, _)| {
-                (f.saturating_sub(draft_reserve) as f64 * 0.45) / (1024.0 * 1024.0)
-            });
-            let est_stream_mib = ((size_bytes as f64 / (1024.0 * 1024.0)) - pinned_mib).max(0.0);
-            let base_tps = if est_stream_mib > 1.0 && mib_s > 1.0 {
-                mib_s / est_stream_mib
-            } else {
-                0.0
-            };
-
-            let (verdict, est_tps_low, est_tps_high, summary) = if fits_in_vram {
-                (
-                    "GOOD",
-                    15.0,
-                    50.0,
-                    format!("GOOD (100% resident in VRAM, {size_gib:.2} GiB)"),
-                )
-            } else if draft_path.is_some() {
-                let lo = (base_tps * 2.5 * 100.0).round() / 100.0;
-                let hi = (base_tps * 5.0 * 100.0).round() / 100.0;
-                (
-                    "GOOD",
-                    lo,
-                    hi,
-                    format!(
-                        "GOOD ({size_gib:.2} GiB streamed + draft speculator, storage={mib_s:.0} MiB/s, direct_io={direct_ok}, est ~{lo:.2}-{hi:.2} tok/s)"
-                    ),
-                )
-            } else if size_bytes >= 4 * 1024 * 1024 * 1024 {
-                let tps = (base_tps * 100.0).round() / 100.0;
-                (
-                    "SLOW",
-                    tps,
-                    tps,
-                    format!(
-                        "SLOW ({size_gib:.2} GiB streamed without draftModel, storage={mib_s:.0} MiB/s, est ~{tps:.2} tok/s)"
-                    ),
-                )
-            } else {
-                let tps = (base_tps * 100.0).round() / 100.0;
-                (
-                    "OK",
-                    tps,
-                    tps,
-                    format!(
-                        "OK ({size_gib:.2} GiB, storage={mib_s:.0} MiB/s, direct_io={direct_ok})"
-                    ),
-                )
-            };
-
-            Ok(CheckReportJs {
-                ok: true,
-                verdict: verdict.to_string(),
-                summary,
-                model_path: resolved_target.local_path.to_string_lossy().into_owned(),
-                draft_model_path: draft_path.map(|p| p.to_string_lossy().into_owned()),
-                architecture: idx.meta.architecture,
-                n_layers: idx.meta.n_layers,
-                context_length: idx.meta.context_length,
-                total_file_bytes: size_bytes as f64,
-                storage_mib_s: mib_s,
-                direct_io: direct_ok,
-                gpu_free_bytes: gpu_mem.map(|(f, _)| f as f64),
-                gpu_total_bytes: gpu_mem.map(|(_, t)| t as f64),
-                fits_in_vram,
-                est_tps_low,
-                est_tps_high,
-            })
-        })();
-        res.map_err(map_anyhow_err)
+        })?;
+        Ok(CheckReportJs {
+            ok: rep.ok,
+            verdict: rep.verdict,
+            summary: rep.summary,
+            model_path: rep.model_path,
+            draft_model_path: rep.draft_model_path,
+            architecture: rep.architecture,
+            n_layers: rep.n_layers,
+            context_length: rep.context_length,
+            total_file_bytes: rep.total_file_bytes as f64,
+            storage_mib_s: rep.storage_mib_s,
+            direct_io: rep.direct_io,
+            gpu_free_bytes: rep.gpu_free_bytes.map(|b| b as f64),
+            gpu_total_bytes: rep.gpu_total_bytes.map(|b| b as f64),
+            fits_in_vram: rep.fits_in_vram,
+            est_tps_low: rep.est_tps_low,
+            est_tps_high: rep.est_tps_high,
+        })
     })
     .await
 }

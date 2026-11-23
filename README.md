@@ -141,18 +141,18 @@ Endpoints:
 
 ## Python API (AirLLM-style, Native Rust/C++)
 
-Standalone native Python bindings (`PyO3` + `maturin`) live in [bindings/python/](bindings/python/README.md) (excluded from the default Cargo workspace so `layerstream-plugin` stays Python-free):
+Standalone native Python bindings (`PyO3` + `maturin`) live in [bindings/python/](bindings/python/README.md) (excluded from the default Cargo workspace so `layerstream-plugin` stays Python-free), with prebuilt GPU wheels (`Vulkan` + `dynamic-backends` on Linux, `Metal` on Apple Silicon, and zero-compile CUDA 12 via `pip install "layerstream[cuda]"`):
 
 ```python
 from layerstream import AutoModel
 
-with AutoModel.from_pretrained("Qwen/Qwen2.5-14B-Instruct") as model:
+with AutoModel.from_pretrained("Qwen/Qwen2.5-14B-Instruct", draft_model="auto") as model:
     for chunk in model.generate("Explain NVMe O_DIRECT streaming.", stream=True):
         print(chunk, end="", flush=True)
-    print("\n", model.stats())
+    model.save_state("session.kv")  # instant ~20 ms NVMe KV-cache snapshot
 ```
 
-Accepts local `.gguf` paths, `hf://org/repo:file.gguf` URIs, HF `-GGUF` repos (hardware-aware auto-quant selection), and official base HF repos (`{org}/{name}-GGUF`), with full GIL release (`py.detach`), `isolated_worker=True` for **true 0 MB VRAM / CUDA context handoff back to PyTorch** on `.unload()`, drop-in in-process `layerstream.OpenAI` / `AsyncOpenAI` clients, native GBNF / JSON Schema / Pydantic structured decoding (`response_format` / `json_schema`), `<think>` & `<tool_call>` parsing, `recommend()` / `check()` / `inspect_gguf()`, and `.tokenize()` / `.kv_trim()`. Build locally via `nix develop .#python` (see [bindings/python/README.md](bindings/python/README.md)).
+Includes a built-in `layerstream` CLI (`layerstream chat`, `serve`, `recommend`, `check`, `pull`, `inspect`), full GIL release (`py.detach`), `isolated_worker=True` for **true 0 MB VRAM / CUDA context handoff back to PyTorch** on `.unload()`, drop-in in-process `layerstream.OpenAI` / `AsyncOpenAI` clients, native GBNF / JSON Schema / Pydantic structured decoding (`response_format` / `json_schema`), modern samplers (`min_p`, `repeat_penalty`, `frequency_penalty`, `presence_penalty`), NVMe KV snapshots (`save_state` / `load_state`), live `on_progress` download callbacks, `<think>` & `<tool_call>` parsing, and `recommend()` / `check()` / `inspect_gguf()`. Build locally via `nix develop .#python` (see [bindings/python/README.md](bindings/python/README.md)).
 
 ## Node.js / TypeScript API (`napi-rs`, Native Rust/C++)
 
