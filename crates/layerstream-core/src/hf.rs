@@ -202,7 +202,8 @@ pub fn expand_gguf_shard_filename(filename: &str) -> Vec<String> {
 
 // Host-managed `[[models]]` (`provider = "layerstream"`) use `model_assets.v1` and share
 // mesh-llm's Hugging Face cache directly. Standalone CLI / `--model hf://...` args fall back
-// to `LAYERSTREAM_CACHE_DIR` / XDG cache (tracking: Mesh-LLM/mesh-llm#3192).
+// to `LAYERSTREAM_CACHE_DIR` / XDG cache (tracking: Mesh-LLM/mesh-llm#3192,
+// upstream: Mesh-LLM/mesh-llm#3215).
 pub fn default_cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LAYERSTREAM_CACHE_DIR")
         && !dir.trim().is_empty()
