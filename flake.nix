@@ -78,6 +78,7 @@
                   (lib.getLib cudaPkgs.cuda_cudart)
                   (lib.getDev cudaPkgs.libcublas)
                   (lib.getLib cudaPkgs.libcublas)
+                  (lib.getDev cudaPkgs.cuda_nvml_dev)
                   cudaPkgs.cccl
                 ];
               }
@@ -137,6 +138,7 @@
               cudaPkgs.cuda_nvcc
               cudaPkgs.cuda_cudart
               cudaPkgs.libcublas
+              cudaPkgs.cuda_nvml_dev
               cudaPkgs.cccl
             ];
 
