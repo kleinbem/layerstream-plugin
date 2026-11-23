@@ -322,7 +322,7 @@ fn main() {
 
     if dynamic_backends && (use_cuda || target_os == "linux") {
         // Resolve libcudart symbols lazily via dlopen/dlsym ONLY once `libggml-cuda.so` is
-        // loaded at runtime (e.g., via `layerstream-cuda12` or `MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR`),
+        // loaded at runtime (e.g., via `layerstream-cuda13` or `MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR`),
         // keeping the base binary/wheel free of compile-time CUDA headers and CUDA DT_NEEDED!
         cc_build.define("LAYERSTREAM_USE_CUDA_DYNAMIC", None);
     } else if use_cuda && !dynamic_backends {

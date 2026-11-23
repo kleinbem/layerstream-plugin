@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - "bindings/python/**"
-      - "bindings/python-cuda12/**"
+      - "bindings/python-cuda13/**"
       - "crates/layerstream-core/**"
       - "crates/layerstream-server/**"
       - "Cargo.toml"
@@ -14,7 +14,7 @@ on:
       - main
     paths:
       - "bindings/python/**"
-      - "bindings/python-cuda12/**"
+      - "bindings/python-cuda13/**"
       - "crates/layerstream-core/**"
       - "crates/layerstream-server/**"
       - "Cargo.toml"
@@ -62,20 +62,20 @@ jobs:
         working-directory: bindings/python
         run: |
           python -m pip install --upgrade pip ruff pyright pytest pytest-asyncio pytest-timeout hypothesis
-          ruff check python tests scripts ../python-cuda12/python ../python-cuda12/scripts
-          ruff format --check python tests scripts ../python-cuda12/python ../python-cuda12/scripts
+          ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts
+          ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts
           pyright python/layerstream tests
 
-      - name: Smoke-test layerstream-cuda12 companion wheel packaging & metadata
+      - name: Smoke-test layerstream-cuda13 companion wheel packaging & metadata
         run: |
           python -m pip install --upgrade pip setuptools wheel twine
-          mkdir -p bindings/python-cuda12/python/layerstream_cuda12/_backends
+          mkdir -p bindings/python-cuda13/python/layerstream_cuda13/_backends
           gcc -shared -fPIC -Wl,-soname,libggml-cuda.so -Wl,-rpath,'$ORIGIN' \
-            -o bindings/python-cuda12/python/layerstream_cuda12/_backends/libggml-cuda.so -xc /dev/null
-          python bindings/python-cuda12/scripts/build_wheel.py --skip-cmake --out dist
-          python -m twine check --strict bindings/python-cuda12/dist/*.whl
-          python -m pip install --no-deps --force-reinstall bindings/python-cuda12/dist/*.whl
-          python -c 'import os, layerstream_cuda12; assert os.path.isfile(os.path.join(layerstream_cuda12.backend_dir(), "libggml-cuda.so"))'
+            -o bindings/python-cuda13/python/layerstream_cuda13/_backends/libggml-cuda.so -xc /dev/null
+          python bindings/python-cuda13/scripts/build_wheel.py --skip-cmake --out dist
+          python -m twine check --strict bindings/python-cuda13/dist/*.whl
+          python -m pip install --no-deps --force-reinstall bindings/python-cuda13/dist/*.whl
+          python -c 'import os, layerstream_cuda13; assert os.path.isfile(os.path.join(layerstream_cuda13.backend_dir(), "libggml-cuda.so"))'
 
   build-wheels:
     strategy:

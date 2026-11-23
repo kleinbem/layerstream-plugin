@@ -37,7 +37,7 @@ jobs:
           plugin_ver=$(awk -F'"' '/^version =/{print $2; exit}' plugin.toml)
           py_cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python/Cargo.toml)
           py_proj_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python/pyproject.toml)
-          py_cuda_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python-cuda12/pyproject.toml)
+          py_cuda_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python-cuda13/pyproject.toml)
           node_cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/node/Cargo.toml)
           node_pkg_ver=$(python3 -c 'import json; print(json.load(open("bindings/node/package.json"))["version"])')
           echo "Cargo=${cargo_ver} plugin=${plugin_ver} py_cargo=${py_cargo_ver} py_proj=${py_proj_ver} py_cuda=${py_cuda_ver} node_cargo=${node_cargo_ver} node_pkg=${node_pkg_ver}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict ELF & PyPI compliance auditor for Linux `layerstream` and `layerstream-cuda12` wheels.
+"""Strict ELF & PyPI compliance auditor for Linux `layerstream` and `layerstream-cuda13` wheels.
 
 Workaround: `auditwheel repair` hashes/renames runtime-`dlopen`ed `libggml-*.so` backend plugins
 (upstream: pypa/auditwheel#594), so Linux wheels build with `--auditwheel skip` and enforce

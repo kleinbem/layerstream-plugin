@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build `libggml-cuda.so` from pinned `llama.cpp` and package `layerstream-cuda12` wheel."""
+"""Build `libggml-cuda.so` from pinned `llama.cpp` and package `layerstream-cuda13` wheel."""
 
 import argparse
 import os
@@ -27,8 +27,9 @@ def resolve_llama_dir(pkg_root: Path) -> Path:
 def default_cuda_archs() -> str:
     arch = platform.machine().lower()
     if arch in ("aarch64", "arm64"):
-        return "87-real"
-    # Turing/Ampere/Hopper+ PTX plus native Ada SASS keeps the compressed CUDA 12.8 wheel well under PyPI's 100 MiB cap.
+        # Native Jetson Orin (sm_87) SASS plus Ampere/Hopper/Blackwell CUDA 13.0 PTX.
+        return "80-virtual;87-real;90-virtual"
+    # Native Ada (sm_89) SASS plus Turing/Ampere/Hopper/Blackwell CUDA 13.0 PTX keeps the wheel well under PyPI's 100 MiB cap.
     return "75-virtual;80-virtual;89-real;90-virtual"
 
 
@@ -38,12 +39,12 @@ def main() -> int:
     parser.add_argument(
         "--skip-cmake",
         action="store_true",
-        help="Package an already-staged python/layerstream_cuda12/_backends/libggml-cuda.so",
+        help="Package an already-staged python/layerstream_cuda13/_backends/libggml-cuda.so",
     )
     args = parser.parse_args()
 
     pkg_root = Path(__file__).resolve().parent.parent
-    stage_dir = pkg_root / "python" / "layerstream_cuda12" / "_backends"
+    stage_dir = pkg_root / "python" / "layerstream_cuda13" / "_backends"
     stage_dir.mkdir(parents=True, exist_ok=True)
     staged_so = stage_dir / "libggml-cuda.so"
 
@@ -114,7 +115,7 @@ def main() -> int:
 
     out_dir = (pkg_root / args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    for old_whl in out_dir.glob("layerstream_cuda12-*.whl"):
+    for old_whl in out_dir.glob("layerstream_cuda13-*.whl"):
         old_whl.unlink()
 
     subprocess.run(
@@ -132,7 +133,7 @@ def main() -> int:
         check=True,
     )
 
-    built = sorted(out_dir.glob("layerstream_cuda12-*.whl"))
+    built = sorted(out_dir.glob("layerstream_cuda13-*.whl"))
     if not built:
         raise SystemExit(f"ERROR: no wheel built in {out_dir}")
     print(f"Built CUDA plugin wheel: {built[0]}")

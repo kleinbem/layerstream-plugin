@@ -3,15 +3,15 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "layerstream-cuda12"
+name = "layerstream-cuda13"
 version = "0.4.0"
-description = "CUDA 12 dynamic ggml backend plugin for layerstream (zero-compile NVIDIA GPU support via PyPI)"
+description = "CUDA 13 dynamic ggml backend plugin for layerstream (zero-compile NVIDIA GPU support via PyPI)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.14"
 dependencies = [
-    "nvidia-cuda-runtime-cu12>=12.8,<13",
-    "nvidia-cublas-cu12>=12.8,<13",
+    "nvidia-cuda-runtime>=13.0,<14",
+    "nvidia-cublas>=13.0,<14",
 ]
 keywords = ["llm", "gguf", "cuda", "layerstream", "inference"]
 classifiers = [
@@ -34,11 +34,11 @@ Issues = "https://github.com/kleinbem/layerstream-plugin/issues"
 
 [tool.setuptools]
 package-dir = { "" = "python" }
-packages = ["layerstream_cuda12"]
+packages = ["layerstream_cuda13"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-layerstream_cuda12 = ["_backends/*.so*", "py.typed"]
+layerstream_cuda13 = ["_backends/*.so*", "py.typed"]
 
 [tool.ruff]
 extend = "../python/pyproject.toml"
