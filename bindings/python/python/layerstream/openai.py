@@ -295,13 +295,6 @@ def _resolve_dataclass_field_types(dc_cls: type[Any]) -> dict[str, Any]:
 
 
 def _dataclass_to_json_schema(dc_cls: type[Any]) -> JsonDict:
-    try:
-        from pydantic import TypeAdapter  # type: ignore[import-not-found]
-
-        return dict(TypeAdapter(dc_cls).json_schema())
-    except ImportError:
-        pass
-
     resolved_types = _resolve_dataclass_field_types(dc_cls)
     props: JsonDict = {}
     required: list[str] = []
@@ -310,6 +303,12 @@ def _dataclass_to_json_schema(dc_cls: type[Any]) -> JsonDict:
         props[f.name] = _annotation_to_json_schema(py_t, f"{dc_cls.__name__}.{f.name}")
         if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:
             required.append(f.name)
+    try:
+        from pydantic import TypeAdapter  # type: ignore[import-not-found]
+
+        return dict(TypeAdapter(dc_cls).json_schema())
+    except ImportError:
+        pass
     return {
         "type": "object",
         "properties": props,

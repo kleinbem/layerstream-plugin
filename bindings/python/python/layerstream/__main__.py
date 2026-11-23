@@ -7,6 +7,7 @@ and model diagnostics / downloads / inference to `layerstream-core`.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
@@ -159,10 +160,26 @@ def _format_turn_telemetry(
     return " | ".join(parts)
 
 
-def _resolve_use_gpu(cpu_flag: bool) -> bool:
+def _resolve_use_gpu(cpu_flag: bool, *, isolated: bool = False) -> bool:
     if cpu_flag:
         return False
-    if probe_gpu_device(True) is not None:
+    if isolated:
+        # Probe GPU availability in a short-lived child process so the parent coordinator
+        # never initializes CUDA/Vulkan/Metal driver contexts.
+        res = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import layerstream; raise SystemExit(0 if layerstream.probe_gpu_device(True) is not None else 1)",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=15,
+        )
+        if res.returncode == 0:
+            return True
+    elif probe_gpu_device(True) is not None:
         return True
     print("[layerstream] no GPU device detected; falling back to CPU mode", file=sys.stderr)
     return False
@@ -170,7 +187,7 @@ def _resolve_use_gpu(cpu_flag: bool) -> bool:
 
 def _cmd_chat(args: argparse.Namespace) -> int:
     vram_budget = _parse_vram_budget(args.vram_budget_mb)
-    use_gpu = _resolve_use_gpu(args.cpu)
+    use_gpu = _resolve_use_gpu(args.cpu, isolated=args.isolated_worker)
 
     with AutoModel.from_pretrained(
         args.model,
@@ -271,13 +288,19 @@ def _cmd_chat(args: argparse.Namespace) -> int:
                     continue
             if user_line.startswith("/save "):
                 target = user_line[6:].strip()
-                n_tok = model.save_state(target)
-                print(f"[layerstream] saved {n_tok} KV tokens -> {target}", file=sys.stderr)
+                try:
+                    n_tok = model.save_state(target)
+                    print(f"[layerstream] saved {n_tok} KV tokens -> {target}", file=sys.stderr)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    print(f"[layerstream] save failed: {exc}", file=sys.stderr)
                 continue
             if user_line.startswith("/load "):
                 target = user_line[6:].strip()
-                n_tok = model.load_state(target)
-                print(f"[layerstream] restored {n_tok} KV tokens <- {target}", file=sys.stderr)
+                try:
+                    n_tok = model.load_state(target)
+                    print(f"[layerstream] restored {n_tok} KV tokens <- {target}", file=sys.stderr)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    print(f"[layerstream] load failed: {exc}", file=sys.stderr)
                 continue
 
             messages.append({"role": "user", "content": user_line})
@@ -321,8 +344,8 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
 def _cmd_serve(args: argparse.Namespace) -> int:
     vram_budget = _parse_vram_budget(args.vram_budget_mb)
-    use_gpu = _resolve_use_gpu(args.cpu)
-    api_key = args.api_key or os.environ.get("LAYERSTREAM_API_KEY") or None
+    use_gpu = _resolve_use_gpu(args.cpu, isolated=True)
+    api_key = args.api_key if args.api_key is not None else os.environ.get("LAYERSTREAM_API_KEY")
 
     with start_server(
         args.model,

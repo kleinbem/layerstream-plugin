@@ -324,11 +324,26 @@ pub fn build_router(state: AppState) -> Router {
 
 /// Builds the standalone HTTP router enforcing an optional `Authorization: Bearer <api_key>`
 /// on `/v1/*` routes while keeping `/health` unauthenticated for liveness probes.
+/// An explicitly provided empty/whitespace `Some("")` fails closed (`401`) rather than disabling auth.
 pub fn build_router_with_api_key(state: AppState, api_key: Option<String>) -> Router {
-    let Some(key) = api_key.filter(|k| !k.is_empty()) else {
+    let Some(raw_key) = api_key else {
         return build_router(state);
     };
-    let expected = Arc::new(format!("Bearer {key}").into_bytes());
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return build_router(state).layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.uri().path() == "/health" {
+                    return next.run(req).await;
+                }
+                api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "Unauthorized (empty API key configured)",
+                )
+            },
+        ));
+    }
+    let expected = Arc::new(format!("Bearer {trimmed}").into_bytes());
     build_router(state).layer(axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
             let expected = expected.clone();

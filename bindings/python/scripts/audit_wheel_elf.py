@@ -2,8 +2,8 @@
 """Strict ELF & PyPI compliance auditor for Linux `layerstream` and `layerstream-cuda12` wheels.
 
 Workaround: `auditwheel repair` hashes/renames runtime-`dlopen`ed `libggml-*.so` backend plugins
-(upstream: pypa/auditwheel#594, upstream: PyO3/maturin#2045), so Linux wheels build with
-`--auditwheel skip` and enforce manylinux_2_31 symbol/RUNPATH bounds here.
+(upstream: pypa/auditwheel#594), so Linux wheels build with `--auditwheel skip` and enforce
+manylinux_2_31 symbol/RUNPATH bounds here.
 """
 
 import re

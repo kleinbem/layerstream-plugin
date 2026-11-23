@@ -1303,6 +1303,7 @@ struct ServerThreadState {
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     state: Option<AppState>,
     worker: Option<JoinHandle<()>>,
+    finished: Arc<AtomicBool>,
 }
 
 /// Running handle to `layerstream-server`'s native Rust `axum` + `tokio` OpenAI HTTP/SSE server.
@@ -1343,7 +1344,11 @@ impl ServerHandle {
 
     #[getter]
     fn base_url(&self) -> String {
-        format!("http://{}:{}/v1", self.host, self.port)
+        if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("http://[{}]:{}/v1", self.host, self.port)
+        } else {
+            format!("http://{}:{}/v1", self.host, self.port)
+        }
     }
 
     fn stop(&self, py: Python<'_>) -> PyResult<()> {
@@ -1380,10 +1385,10 @@ impl ServerHandle {
             }
             let finished = py.detach(|| {
                 let guard = self.inner.lock().ok()?;
-                match guard.worker.as_ref() {
-                    Some(w) => Some(w.is_finished()),
-                    None => Some(true),
+                if guard.finished.load(Ordering::Acquire) {
+                    return Some(true);
                 }
+                Some(guard.worker.as_ref().is_some_and(|w| w.is_finished()))
             });
             if finished.unwrap_or(true) {
                 self.stop(py)?;
@@ -1469,6 +1474,13 @@ fn start_server(
     on_progress: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<ServerHandle> {
     StreamEngine::set_log_verbose(verbose);
+    if let Some(ref k) = api_key
+        && k.trim().is_empty()
+    {
+        return Err(PyValueError::new_err(
+            "api_key must not be empty; pass None to run unauthenticated",
+        ));
+    }
     let kv_type: KvCacheType = kv_cache_type
         .parse()
         .map_err(|e: anyhow::Error| PyValueError::new_err(e.to_string()))?;
@@ -1523,12 +1535,16 @@ fn start_server(
             None
         };
 
-        let spec_str = format!(
-            "{}={}",
-            model_owned,
-            resolved_target.local_path.to_string_lossy()
-        );
-        let registry = ModelRegistry::from_sources(&[spec_str], None, resolved_draft_path)?;
+        let mut registry = ModelRegistry::default();
+        let alias = {
+            let t = model_owned.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+        registry.register_file(&resolved_target.local_path, alias, resolved_draft_path)?;
         let n_threads = threads.unwrap_or_else(|| {
             if use_gpu {
                 2
@@ -1570,8 +1586,17 @@ fn start_server(
 
     let (ready_tx, ready_rx) = mpsc::sync_channel::<anyhow::Result<(String, u16, AppState)>>(1);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_finished = finished.clone();
 
     let worker = std::thread::spawn(move || {
+        struct MarkDone(Arc<AtomicBool>);
+        impl Drop for MarkDone {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _done = MarkDone(worker_finished);
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -1623,6 +1648,7 @@ fn start_server(
             shutdown_tx: Some(shutdown_tx),
             state: Some(app_state),
             worker: Some(worker),
+            finished,
         }),
     })
 }

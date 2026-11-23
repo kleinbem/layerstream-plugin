@@ -211,6 +211,13 @@ fn main() -> Result<()> {
                 api_key,
                 engine,
             }) => {
+                if let Some(ref k) = api_key
+                    && k.trim().is_empty()
+                {
+                    anyhow::bail!(
+                        "--api-key / LAYERSTREAM_API_KEY must not be empty; unset it to run unauthenticated"
+                    );
+                }
                 let in_process = engine.in_process;
                 let server_cfg = engine.into_server_config()?;
                 let addr = format!("{host}:{port}");

@@ -168,6 +168,7 @@ def test_json_schema_to_gbnf_properties(
         ({"repeat_penalty": -1.0}, "repeat_penalty"),
         ({"frequency_penalty": math.inf}, "frequency_penalty"),
         ({"presence_penalty": math.nan}, "presence_penalty"),
+        ({"penalty_last_n": -2}, "penalty_last_n"),
     ],
 )
 def test_sampler_validation_boundaries_inproc_and_isolated(

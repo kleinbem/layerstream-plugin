@@ -125,8 +125,13 @@ impl LoadedSession {
         };
         let resolved_target = resolve_pretrained_model(model, &target_resolve)?;
 
-        let (draft_proposer, draft_path) = if let Some(draft_spec) = opts.draft_model {
-            if draft_spec.trim().eq_ignore_ascii_case("auto") {
+        let is_auto_draft = opts
+            .draft_model
+            .as_deref()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("auto"));
+
+        let (mut draft_proposer, mut draft_path) = if let Some(draft_spec) = opts.draft_model {
+            if is_auto_draft {
                 match hf::resolve_auto_draft_model(
                     &resolved_target,
                     opts.cache_dir,
@@ -190,12 +195,19 @@ impl LoadedSession {
         cfg.moe_active_streaming = opts.moe_active_streaming;
 
         let engine = StreamEngine::open(&cfg)?;
-        if let Some(ref proposer) = draft_proposer {
-            engine
-                .check_draft_compatible(proposer.engine())
-                .map_err(|reason| {
-                    anyhow::anyhow!("incompatible draft model tokenizer: {reason}")
-                })?;
+        if let Some(ref proposer) = draft_proposer
+            && let Err(reason) = engine.check_draft_compatible(proposer.engine())
+        {
+            if is_auto_draft {
+                tracing::warn!(
+                    reason = %reason,
+                    "draft_model='auto' failed live tokenizer probe; falling back to n-gram speculation"
+                );
+                draft_proposer = None;
+                draft_path = None;
+            } else {
+                bail!("incompatible draft model tokenizer: {reason}");
+            }
         }
 
         Ok(Self {
@@ -286,9 +298,25 @@ pub fn pull_model(
     on_progress: Option<ProgressCallback>,
 ) -> Result<PathBuf> {
     let root = cache_dir.unwrap_or_else(hf::default_cache_dir);
-    if spec.starts_with("hf://") && hf::HfSpec::parse(spec).is_ok() {
-        hf::ensure_hf_downloaded_with_progress(spec, &root, on_progress.as_ref())
-    } else if !spec.starts_with("hf://") && spec.contains('/') {
+    let trimmed = spec.trim();
+    if trimmed.starts_with("hf://")
+        && let Ok(mut parsed) = hf::HfSpec::parse(trimmed)
+    {
+        if let Some(rev) = revision.as_deref().filter(|s| !s.trim().is_empty())
+            && !trimmed.contains('@')
+        {
+            parsed.revision = rev.trim().to_string();
+        }
+        let uri = if parsed.revision == "main" {
+            format!("hf://{}:{}", parsed.repo_id, parsed.filename)
+        } else {
+            format!(
+                "hf://{}:{}@{}",
+                parsed.repo_id, parsed.filename, parsed.revision
+            )
+        };
+        hf::ensure_hf_downloaded_with_progress(&uri, &root, on_progress.as_ref())
+    } else if !trimmed.starts_with("hf://") && trimmed.contains('/') {
         let opts = PretrainedResolveOptions {
             revision,
             quant,
@@ -298,9 +326,9 @@ pub fn pull_model(
             has_draft: false,
             on_progress,
         };
-        Ok(resolve_pretrained_model(spec, &opts)?.local_path)
+        Ok(resolve_pretrained_model(trimmed, &opts)?.local_path)
     } else {
-        hf::ensure_hf_downloaded_with_progress(spec, &root, on_progress.as_ref())
+        hf::ensure_hf_downloaded_with_progress(trimmed, &root, on_progress.as_ref())
     }
 }
 

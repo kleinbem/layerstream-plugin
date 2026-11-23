@@ -9,6 +9,7 @@ so the OS kernel immediately reclaims 100% of VRAM/UMA, CUDA primary driver cont
 """
 
 import contextlib
+import ctypes
 import json
 import math
 import os
@@ -579,6 +580,10 @@ def serialize_schema_arg(json_schema: Any) -> str | None:
     return json_schema_to_gbnf(json_schema)
 
 
+def _as_f32(v: float) -> float:
+    return ctypes.c_float(v).value if math.isfinite(v) else v
+
+
 def _validate_sample_args(
     *,
     temperature: float,
@@ -587,7 +592,14 @@ def _validate_sample_args(
     repeat_penalty: float,
     frequency_penalty: float,
     presence_penalty: float,
+    penalty_last_n: int = 64,
 ) -> None:
+    temperature = _as_f32(temperature)
+    top_p = _as_f32(top_p)
+    min_p = _as_f32(min_p)
+    repeat_penalty = _as_f32(repeat_penalty)
+    frequency_penalty = _as_f32(frequency_penalty)
+    presence_penalty = _as_f32(presence_penalty)
     if not math.isfinite(temperature) or temperature < 0.0:
         raise ValueError("temperature must be a finite non-negative number")
     if not math.isfinite(top_p) or top_p <= 0.0 or top_p > 1.0:
@@ -600,6 +612,8 @@ def _validate_sample_args(
         raise ValueError("frequency_penalty must be finite")
     if not math.isfinite(presence_penalty):
         raise ValueError("presence_penalty must be finite")
+    if penalty_last_n < -1:
+        raise ValueError("penalty_last_n must be >= -1 (-1 = full context, 0 = disabled)")
 
 
 def _normalize_stop_and_grammar(
@@ -648,6 +662,7 @@ def prepare_generate_params(
         repeat_penalty=repeat_penalty,
         frequency_penalty=frequency_penalty,
         presence_penalty=presence_penalty,
+        penalty_last_n=penalty_last_n,
     )
     stop_val, eff_grammar = _normalize_stop_and_grammar(stop, grammar, json_schema)
     return {
@@ -697,6 +712,7 @@ def prepare_chat_params(
         repeat_penalty=repeat_penalty,
         frequency_penalty=frequency_penalty,
         presence_penalty=presence_penalty,
+        penalty_last_n=penalty_last_n,
     )
     stop_val, eff_grammar = _normalize_stop_and_grammar(stop, grammar, json_schema)
     clean_msgs = serialize_messages_arg(messages)

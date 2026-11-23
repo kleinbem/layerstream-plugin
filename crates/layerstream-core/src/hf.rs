@@ -588,33 +588,49 @@ fn load_hf_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn render_tty_progress_bar(ev: &DownloadProgress) {
+std::thread_local! {
+    static ACTIVE_THREAD_PART_LOCKS: std::cell::RefCell<std::collections::HashSet<PathBuf>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+struct ThreadPartLockGuard(PathBuf);
+
+impl Drop for ThreadPartLockGuard {
+    fn drop(&mut self) {
+        ACTIVE_THREAD_PART_LOCKS.with(|set| {
+            set.borrow_mut().remove(&self.0);
+        });
+    }
+}
+
+fn render_tty_progress_bar(ev: &DownloadProgress) -> bool {
     let fname = ev.filename.rsplit('/').next().unwrap_or(&ev.filename);
     let shard_tag = if ev.shard_count > 1 {
         format!("[{}/{}] ", ev.shard_index, ev.shard_count)
     } else {
         String::new()
     };
-    if let Some(total) = ev.total_bytes.filter(|&t| t > 0) {
+    let line = if let Some(total) = ev.total_bytes.filter(|&t| t > 0) {
         let frac = (ev.downloaded_bytes as f64 / total as f64).clamp(0.0, 1.0);
         let width = 20usize;
         let filled = ((frac * width as f64).round() as usize).min(width);
         let bar = format!("{}{}", "#".repeat(filled), "-".repeat(width - filled));
-        eprint!(
+        format!(
             "\r\x1b[K[layerstream-hf] {shard_tag}{fname} [{bar}] {:5.1}% ({:.2}/{:.2} GiB, {:.1} MiB/s)",
             frac * 100.0,
             ev.downloaded_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             total as f64 / (1024.0 * 1024.0 * 1024.0),
             ev.mib_per_s,
-        );
+        )
     } else {
-        eprint!(
+        format!(
             "\r\x1b[K[layerstream-hf] {shard_tag}{fname} {:.2} GiB ({:.1} MiB/s)",
             ev.downloaded_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             ev.mib_per_s,
-        );
-    }
-    let _ = std::io::stderr().flush();
+        )
+    };
+    let mut err = std::io::stderr();
+    err.write_all(line.as_bytes()).is_ok() && err.flush().is_ok()
 }
 
 fn download_with_resume(
@@ -631,6 +647,17 @@ fn download_with_resume(
     }
 
     let lock_path = lock_path_for(dest);
+    let lock_key = lock_path
+        .canonicalize()
+        .unwrap_or_else(|_| lock_path.clone());
+    let inserted = ACTIVE_THREAD_PART_LOCKS.with(|set| set.borrow_mut().insert(lock_key.clone()));
+    if !inserted {
+        bail!(
+            "re-entrant download of '{}' from inside progress callback would deadlock",
+            dest.display()
+        );
+    }
+    let _thread_reentry_guard = ThreadPartLockGuard(lock_key);
     let _lock = PartLock::acquire(&lock_path)?;
 
     // Another concurrent process may have completed the download while we waited for the lock.
@@ -1650,16 +1677,15 @@ pub fn select_auto_draft_repo(architecture: &str, model_hint: &str) -> Option<&'
     let arch = architecture.trim().to_ascii_lowercase();
     let hint = model_hint.trim().to_ascii_lowercase();
 
-    if arch.starts_with("qwen3") || hint.contains("qwen3") {
+    // Prioritize authoritative GGUF architecture keys before falling back to filename/repo hints.
+    if arch.starts_with("qwen3") {
         return Some("Qwen/Qwen3-0.6B-GGUF");
     }
-    if arch == "qwen2"
-        || arch == "qwen2moe"
-        || hint.contains("qwen2.5")
-        || hint.contains("qwen2-")
-        || hint.contains("qwq")
-    {
+    if arch == "qwen2" || arch == "qwen2moe" {
         return Some("Qwen/Qwen2.5-0.5B-Instruct-GGUF");
+    }
+    if arch.starts_with("gemma3") {
+        return Some("ggml-org/gemma-3-1b-it-GGUF");
     }
     if arch == "llama"
         && (hint.contains("llama-3")
@@ -1668,8 +1694,16 @@ pub fn select_auto_draft_repo(architecture: &str, model_hint: &str) -> Option<&'
     {
         return Some("bartowski/Llama-3.2-1B-Instruct-GGUF");
     }
-    if arch.starts_with("gemma3") || hint.contains("gemma-3") || hint.contains("gemma3") {
-        return Some("ggml-org/gemma-3-1b-it-GGUF");
+    if arch.is_empty() {
+        if hint.contains("qwen3") {
+            return Some("Qwen/Qwen3-0.6B-GGUF");
+        }
+        if hint.contains("qwen2.5") || hint.contains("qwen2-") || hint.contains("qwq") {
+            return Some("Qwen/Qwen2.5-0.5B-Instruct-GGUF");
+        }
+        if hint.contains("gemma-3") || hint.contains("gemma3") {
+            return Some("ggml-org/gemma-3-1b-it-GGUF");
+        }
     }
     None
 }

@@ -33,7 +33,7 @@ impl IncomingChatMessage {
                         Value::Object(map) => {
                             let kind = map.get("type").and_then(Value::as_str);
                             match kind {
-                                Some("text") | None => {
+                                Some("text" | "input_text") | None => {
                                     if let Some(t) = map.get("text").and_then(Value::as_str) {
                                         texts.push(t);
                                     } else {

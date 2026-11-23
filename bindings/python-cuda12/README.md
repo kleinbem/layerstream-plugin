@@ -2,7 +2,7 @@
 
 Companion CUDA 12 backend plugin package (`libggml-cuda.so`) for [`layerstream`](https://pypi.org/project/layerstream/).
 
-Install via the `cuda` extra on Linux with an NVIDIA GPU (no local CUDA Toolkit or `nvcc` required):
+Install via the `cuda` extra on Linux `x86_64` with an NVIDIA GPU (no local CUDA Toolkit or `nvcc` required):
 
 ```bash
 pip install "layerstream[cuda]"

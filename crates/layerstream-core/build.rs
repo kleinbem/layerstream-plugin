@@ -99,10 +99,16 @@ fn is_core_soname_stem(fname: &str) -> Option<&'static str> {
 /// Stages a single canonical copy of each shared library / backend plugin into a Python wheel's
 /// `_backends` directory (avoiding 3x zip duplication from `.so` / `.so.0` / `.so.0.x.y` symlinks).
 /// Workaround: `auditwheel repair` renames/hashes runtime-`dlopen`ed `libggml-*.so` backend plugins
-/// (upstream: pypa/auditwheel#594, upstream: PyO3/maturin#2045).
+/// (upstream: pypa/auditwheel#594).
 fn stage_python_wheel_backends(shared_libs: &[PathBuf], stage_dir: &Path, target_os: &str) {
     if let Ok(entries) = std::fs::read_dir(stage_dir) {
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| {
+                panic!(
+                    "failed reading staged backend dir {}: {e}",
+                    stage_dir.display()
+                )
+            });
             let p = entry.path();
             if let Some(name) = p.file_name().and_then(|n| n.to_str())
                 && (name.starts_with("libggml")
@@ -110,11 +116,18 @@ fn stage_python_wheel_backends(shared_libs: &[PathBuf], stage_dir: &Path, target
                     || name.starts_with("ggml")
                     || name.starts_with("llama"))
             {
-                let _ = std::fs::remove_file(&p);
+                std::fs::remove_file(&p).unwrap_or_else(|e| {
+                    panic!("failed removing stale staged library {}: {e}", p.display())
+                });
             }
         }
     }
-    let _ = std::fs::create_dir_all(stage_dir);
+    std::fs::create_dir_all(stage_dir).unwrap_or_else(|e| {
+        panic!(
+            "failed creating Python wheel _backends stage dir {}: {e}",
+            stage_dir.display()
+        )
+    });
 
     for src in shared_libs {
         let Some(fname) = src.file_name().and_then(|n| n.to_str()) else {
@@ -159,10 +172,16 @@ fn stage_python_wheel_backends(shared_libs: &[PathBuf], stage_dir: &Path, target
             continue;
         }
         let dst = stage_dir.join(fname);
-        if let Ok(meta) = std::fs::metadata(src)
-            && meta.is_file()
-        {
-            let _ = std::fs::copy(src, &dst);
+        let meta = std::fs::metadata(src)
+            .unwrap_or_else(|e| panic!("failed statting shared library {}: {e}", src.display()));
+        if meta.is_file() {
+            std::fs::copy(src, &dst).unwrap_or_else(|e| {
+                panic!(
+                    "failed staging shared library {} -> {}: {e}",
+                    src.display(),
+                    dst.display()
+                )
+            });
             println!("cargo:rerun-if-changed={}", dst.display());
         }
     }
@@ -238,6 +257,7 @@ fn main() {
         };
         cfg.define("CMAKE_BUILD_RPATH", build_rpath);
         cfg.define("CMAKE_INSTALL_RPATH", build_rpath);
+        cfg.define("CMAKE_BUILD_WITH_INSTALL_RPATH", "ON");
         for var in ["CMAKE_SHARED_LINKER_FLAGS", "CMAKE_MODULE_LINKER_FLAGS"] {
             let mut flags = env::var(var).unwrap_or_default();
             if !flags.contains("$ORIGIN") {
@@ -349,10 +369,16 @@ fn main() {
 
     if dynamic_backends {
         let mut shared_libs = Vec::new();
-        for subdir in ["lib", "lib64", "bin", "build"] {
+        for subdir in ["lib", "lib64", "bin"] {
             let dir = dst.join(subdir);
             if dir.is_dir() {
                 find_libs_with_filter(&dir, &mut shared_libs, &is_shared_lib);
+            }
+        }
+        if shared_libs.is_empty() {
+            let build_dir = dst.join("build");
+            if build_dir.is_dir() {
+                find_libs_with_filter(&build_dir, &mut shared_libs, &is_shared_lib);
             }
         }
         let mut link_dirs = std::collections::BTreeSet::new();

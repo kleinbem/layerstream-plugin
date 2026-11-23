@@ -369,4 +369,39 @@ async fn bearer_api_key_middleware_protects_v1_and_allows_health() {
         .await
         .unwrap();
     assert_eq!(authed.status(), StatusCode::OK);
+
+    // Explicit empty `Some("")` API key fails closed (401) rather than disabling auth.
+    let empty_key_app = layerstream_server::build_router_with_api_key(
+        AppState::new(ServerConfig {
+            registry: ModelRegistry::default(),
+            n_ctx: 512,
+            n_batch: 128,
+            n_threads: 2,
+            resident_layers: Some(0),
+            vram_budget_bytes: 0,
+            vram_budget_auto: false,
+            kv_cache_type: KvCacheType::F16,
+            use_gpu: false,
+            prefer_direct_io: true,
+            cpu_embeddings: false,
+            cpu_head: false,
+            stream_head: false,
+            moe_active_streaming: true,
+            idle_timeout: Duration::ZERO,
+            enable_ngram_speculation: true,
+            max_draft_tokens: 4,
+            max_queued_requests: 4,
+        }),
+        Some(String::new()),
+    );
+    let empty_resp = empty_key_app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_resp.status(), StatusCode::UNAUTHORIZED);
 }

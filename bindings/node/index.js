@@ -1,5 +1,6 @@
 "use strict";
 
+const path = require("node:path");
 const native = require("./native.js");
 const { IsolatedWorkerClient } = require("./worker.js");
 const { OpenAI } = require("./openai.js");
@@ -375,6 +376,27 @@ class AutoModel {
       maxDraftTokens: opts.maxDraftTokens ?? opts.max_draft_tokens ?? undefined,
       grammar,
     };
+    if (typeof wire.temperature !== "number" || !Number.isFinite(wire.temperature) || wire.temperature < 0) {
+      throw new RangeError("temperature must be a finite non-negative number");
+    }
+    if (typeof wire.topP !== "number" || !Number.isFinite(wire.topP) || wire.topP <= 0 || wire.topP > 1) {
+      throw new RangeError("top_p must be in (0.0, 1.0]");
+    }
+    if (typeof wire.minP !== "number" || !Number.isFinite(wire.minP) || wire.minP < 0 || wire.minP > 1) {
+      throw new RangeError("min_p must be in [0.0, 1.0]");
+    }
+    if (typeof wire.repeatPenalty !== "number" || !Number.isFinite(wire.repeatPenalty) || wire.repeatPenalty <= 0) {
+      throw new RangeError("repeat_penalty must be a finite positive number");
+    }
+    if (typeof wire.frequencyPenalty !== "number" || !Number.isFinite(wire.frequencyPenalty)) {
+      throw new RangeError("frequency_penalty must be finite");
+    }
+    if (typeof wire.presencePenalty !== "number" || !Number.isFinite(wire.presencePenalty)) {
+      throw new RangeError("presence_penalty must be finite");
+    }
+    if (typeof wire.penaltyLastN !== "number" || !Number.isInteger(wire.penaltyLastN) || wire.penaltyLastN < -1) {
+      throw new RangeError("penalty_last_n must be >= -1");
+    }
     if (allowChatExtras) {
       wire.addGenerationPrompt =
         opts.addGenerationPrompt ?? opts.add_generation_prompt ?? true;
@@ -706,12 +728,13 @@ class AutoModel {
     if (typeof statePath !== "string" || statePath.trim().length === 0) {
       throw new TypeError("path must be a non-empty string");
     }
+    const resolvedPath = path.resolve(statePath);
     try {
       if (this._isolated) {
-        const res = await this._backend.rpc("save_state", { path: statePath });
+        const res = await this._backend.rpc("save_state", { path: resolvedPath });
         return Number(res.tokens ?? 0);
       }
-      return await this._backend.saveState(statePath);
+      return await this._backend.saveState(resolvedPath);
     } catch (err) {
       throw mapNativeError(err);
     }
@@ -721,12 +744,13 @@ class AutoModel {
     if (typeof statePath !== "string" || statePath.trim().length === 0) {
       throw new TypeError("path must be a non-empty string");
     }
+    const resolvedPath = path.resolve(statePath);
     try {
       if (this._isolated) {
-        const res = await this._backend.rpc("load_state", { path: statePath });
+        const res = await this._backend.rpc("load_state", { path: resolvedPath });
         return Number(res.tokens ?? 0);
       }
-      return await this._backend.loadState(statePath);
+      return await this._backend.loadState(resolvedPath);
     } catch (err) {
       throw mapNativeError(err);
     }

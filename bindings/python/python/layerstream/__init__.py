@@ -1,11 +1,13 @@
 """Native Python 3.14+ SDK for `layerstream-core` and `layerstream-server`."""
 
 import asyncio
+import atexit
 import contextlib
 import ctypes
 import glob
 import importlib.util
 import os
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
 from types import TracebackType
@@ -178,11 +180,28 @@ def serve(
         handle.wait()
 
 
+_LIVE_STREAMS: weakref.WeakSet[TokenStream] = weakref.WeakSet()
+_LIVE_MODELS: weakref.WeakSet[AutoModel] = weakref.WeakSet()
+
+
+@atexit.register
+def _cleanup_live_resources() -> None:
+    """Close active streams and unload live models during `Py_FinalizeEx()` before C `exit()`
+    runs native C++ static destructors (e.g. `ggml-metal` residency sets on macOS)."""
+    for s in list(_LIVE_STREAMS):
+        with contextlib.suppress(Exception):
+            s.close()
+    for m in list(_LIVE_MODELS):
+        with contextlib.suppress(Exception):
+            m.unload()
+
+
 class TokenStream(_AsyncStreamMixin[str]):
     """Synchronous (`for chunk in s`) and asynchronous (`async for chunk in s`) token stream."""
 
     def __init__(self, inner: _NativeTokenStream | _WorkerTokenStream) -> None:
         self._inner = inner
+        _LIVE_STREAMS.add(self)
 
     @override
     def __next__(self) -> str:
@@ -208,6 +227,7 @@ class AutoModel:
     ) -> None:
         self._backend = backend
         self._isolated = isolated_worker
+        _LIVE_MODELS.add(self)
 
     @classmethod
     def from_pretrained(
@@ -532,7 +552,7 @@ class AutoModel:
 
     def save_state(self, path: str | PathLike[str]) -> int:
         """Persist KV cache memory and committed token sequence to `path` on disk."""
-        raw_path = os.fspath(path)
+        raw_path = os.path.abspath(os.fspath(path))
         if isinstance(self._backend, _NativeAutoModel):
             return int(self._backend.save_state(raw_path))
         res = self._backend._rpc("save_state", {"path": raw_path})
@@ -540,7 +560,7 @@ class AutoModel:
 
     def load_state(self, path: str | PathLike[str]) -> int:
         """Restore a KV cache snapshot and committed token sequence from `path`."""
-        raw_path = os.fspath(path)
+        raw_path = os.path.abspath(os.fspath(path))
         if not os.path.isfile(raw_path):
             raise FileNotFoundError(f"KV state file not found: '{raw_path}'")
         if isinstance(self._backend, _NativeAutoModel):

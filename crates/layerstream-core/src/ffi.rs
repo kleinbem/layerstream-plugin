@@ -196,6 +196,9 @@ impl LsSampleParams {
         if !self.presence_penalty.is_finite() {
             return Err("presence_penalty must be finite");
         }
+        if self.penalty_last_n < -1 {
+            return Err("penalty_last_n must be >= -1 (-1 = full context, 0 = disabled)");
+        }
         Ok(())
     }
 }

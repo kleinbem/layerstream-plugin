@@ -420,24 +420,55 @@ static void ensure_llama_initialized() {
             append_unique_dir(search_dirs, exe_dir);
         }
 
+        // 1. Probe highest-priority CUDA / Metal plugins across all candidate directories first
+        //    so CUDA always wins over Vulkan regardless of directory order, without initializing
+        //    a redundant Vulkan context on the same GPU.
         for (const auto & dir : search_dirs) {
-            if (!has_registered_gpu_device()) {
-                ggml_backend_load_all_from_path(dir.c_str());
-            } else if (!has_registered_cpu_device()) {
-                // A higher-priority GPU backend (e.g. CUDA from layerstream-cuda12 or mesh-llm)
-                // is already registered; load only the CPU backend from fallback dirs so we do
-                // not initialize a redundant Vulkan context on the same GPU.
 #ifdef _WIN32
-                const std::string cpu_plugin = dir + "\\ggml-cpu.dll";
+            const char * hi_plugins[] = {"\\ggml-cuda.dll"};
+#elif defined(__APPLE__)
+            const char * hi_plugins[] = {"/libggml-metal.dylib", "/libggml-metal.so"};
 #else
-                const std::string cpu_plugin = dir + "/libggml-cpu.so";
+            const char * hi_plugins[] = {"/libggml-cuda.so"};
 #endif
-                if (file_exists(cpu_plugin)) {
-                    ggml_backend_load(cpu_plugin.c_str());
+            for (const char * suffix : hi_plugins) {
+                const std::string plugin = dir + suffix;
+                if (file_exists(plugin)) {
+                    ggml_backend_load(plugin.c_str());
                 }
             }
-            if (has_registered_gpu_device() && has_registered_cpu_device()) {
+            if (has_registered_gpu_device()) {
                 break;
+            }
+        }
+        // 2. Fall back to Vulkan / remaining GPU plugins only if no CUDA/Metal device registered.
+        if (!has_registered_gpu_device()) {
+            for (const auto & dir : search_dirs) {
+                ggml_backend_load_all_from_path(dir.c_str());
+                if (has_registered_gpu_device()) {
+                    break;
+                }
+            }
+        }
+        // 3. Ensure the CPU backend is registered for embeddings / host fallbacks.
+        if (!has_registered_cpu_device()) {
+            for (const auto & dir : search_dirs) {
+#ifdef _WIN32
+                const char * cpu_plugins[] = {"\\ggml-cpu.dll"};
+#elif defined(__APPLE__)
+                const char * cpu_plugins[] = {"/libggml-cpu.dylib", "/libggml-cpu.so"};
+#else
+                const char * cpu_plugins[] = {"/libggml-cpu.so"};
+#endif
+                for (const char * suffix : cpu_plugins) {
+                    const std::string plugin = dir + suffix;
+                    if (file_exists(plugin)) {
+                        ggml_backend_load(plugin.c_str());
+                    }
+                }
+                if (has_registered_cpu_device()) {
+                    break;
+                }
             }
         }
         if (ggml_backend_dev_count() == 0) {
@@ -3165,10 +3196,10 @@ static SamplerHandle make_penalties_sampler(
         return SamplerHandle{};
     }
     const int32_t b_len = (base_tokens && n_base > 0) ? n_base : 0;
-    const int32_t max_total = b_len + std::max<int32_t>(max_extra, 0);
+    const int32_t max_total = std::max<int32_t>(b_len + std::max<int32_t>(max_extra, 0), 1);
     const int32_t eff_last_n = (sp->penalty_last_n < 0)
-        ? std::max<int32_t>(max_total, 1)
-        : sp->penalty_last_n;
+        ? max_total
+        : std::min<int32_t>(sp->penalty_last_n, max_total);
     if (eff_last_n <= 0) {
         return SamplerHandle{};
     }
@@ -3402,6 +3433,13 @@ void ls_verify_sample_from_logits_with_history(
             *out_next_token = 0;
         }
         return;
+    }
+    for (int32_t i = 0; i <= k; ++i) {
+        if (!logits_per_pos[i]) {
+            *out_accepted_count = 0;
+            *out_next_token = 0;
+            return;
+        }
     }
     const bool is_greedy = (sample_params->temperature <= 0.0f);
     SamplerHandle pen = make_penalties_sampler(n_vocab, sample_params, penalty_tokens, n_penalty_tokens, k);

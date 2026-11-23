@@ -33,7 +33,7 @@ fn generic_err(msg: impl Into<String>) -> Error {
 
 fn map_anyhow_err(err: anyhow::Error) -> Error {
     let msg = format!("{err:#}");
-    if msg.contains("local GGUF model not found") {
+    if msg.contains("local GGUF model not found") || msg.contains("KV state file not found") {
         Error::new(Status::GenericFailure, format!("ENOENT: {msg}"))
     } else {
         Error::new(Status::GenericFailure, msg)

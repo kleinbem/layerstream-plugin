@@ -84,7 +84,7 @@ jobs:
         include:
           # Workaround: `--auditwheel skip` preserves unhashed `libggml-*.so` names for runtime
           # `dlopen` plugin loading; `audit_wheel_elf.py` enforces manylinux_2_31 ELF bounds
-          # (upstream: pypa/auditwheel#594, upstream: PyO3/maturin#2045).
+          # (upstream: pypa/auditwheel#594).
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             container: "2_28"
@@ -138,7 +138,7 @@ jobs:
             arch=$(uname -m)
             if [ "$arch" = "aarch64" ]; then mamba_plat="linux-aarch64"; else mamba_plat="linux-64"; fi
             curl -fsSL "https://micro.mamba.pm/api/micromamba/${mamba_plat}/latest" | tar -xj -C /usr/local/bin --strip-components=1 bin/micromamba
-            MAMBA_ROOT_PREFIX=/opt/mamba micromamba create -y -p /opt/vk -c conda-forge shaderc vulkan-headers vulkan-loader spirv-headers cmake ninja
+            MAMBA_ROOT_PREFIX=/opt/mamba micromamba create -y -p /opt/vk -c conda-forge shaderc libvulkan-headers libvulkan-loader spirv-headers cmake ninja
             ln -sf /opt/vk/bin/glslc /opt/vk/bin/cmake /opt/vk/bin/ninja /usr/local/bin/
           args: ${{ matrix.args }}
 

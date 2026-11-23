@@ -547,16 +547,29 @@ impl StreamEngine {
     /// Returns the number of KV tokens saved.
     pub fn save_state(&mut self, path: impl AsRef<Path>) -> Result<usize> {
         let path_ref = path.as_ref();
-        if let Some(parent) = path_ref.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create parent directory '{}'", parent.display()))?;
-        }
+        let parent_dir = path_ref
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent_dir)
+            .with_context(|| format!("create parent directory '{}'", parent_dir.display()))?;
+
+        // Write to a sibling temporary file first and atomically rename on completion so a
+        // mid-save I/O error or worker exit never truncates an existing KV snapshot.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base_name = path_ref
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("state.kv");
+        let tmp_path = parent_dir.join(format!(".{base_name}.tmp.{}.{nonce}", std::process::id()));
+
         #[cfg(unix)]
-        let path_bytes = std::os::unix::ffi::OsStrExt::as_bytes(path_ref.as_os_str());
+        let path_bytes = std::os::unix::ffi::OsStrExt::as_bytes(tmp_path.as_os_str());
         #[cfg(not(unix))]
-        let path_lossy = path_ref.to_string_lossy();
+        let path_lossy = tmp_path.to_string_lossy();
         #[cfg(not(unix))]
         let path_bytes = path_lossy.as_bytes();
         let c_path = CString::new(path_bytes).context("state path contains interior NUL")?;
@@ -583,10 +596,21 @@ impl StreamEngine {
             )
         };
         if rc != 0 {
+            let _ = std::fs::remove_file(&tmp_path);
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
             bail!("save_state failed: {msg}");
+        }
+        if let Err(rename_err) = std::fs::rename(&tmp_path, path_ref) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(rename_err).with_context(|| {
+                format!(
+                    "replace KV state snapshot '{}' from '{}'",
+                    path_ref.display(),
+                    tmp_path.display()
+                )
+            });
         }
         Ok(self.cached_kv_tokens.len())
     }
@@ -598,6 +622,12 @@ impl StreamEngine {
         let path_ref = path.as_ref();
         if !path_ref.is_file() {
             bail!("KV state file not found: '{}'", path_ref.display());
+        }
+        if !self.stats().can_speculate {
+            bail!(
+                "KV state restore requires a KV-trimmable transformer architecture \
+                 (unsupported for hybrid recurrent/SSM models)"
+            );
         }
         #[cfg(unix)]
         let path_bytes = std::os::unix::ffi::OsStrExt::as_bytes(path_ref.as_os_str());
