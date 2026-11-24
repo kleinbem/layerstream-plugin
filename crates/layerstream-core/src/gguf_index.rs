@@ -41,6 +41,63 @@ pub struct TensorLocation {
     pub dims: Vec<u64>,
 }
 
+/// Returns `(block_elems, block_bytes)` for standard GGML tensor types, or `None` for unknown
+/// future types so callers can fail-open on unrecognized quant formats.
+fn ggml_type_block_layout(ggml_type: u32) -> Option<(u64, u64)> {
+    match ggml_type {
+        0 => Some((1, 4)),      // F32
+        1 => Some((1, 2)),      // F16
+        2 => Some((32, 18)),    // Q4_0
+        3 => Some((32, 20)),    // Q4_1
+        6 => Some((32, 22)),    // Q5_0
+        7 => Some((32, 24)),    // Q5_1
+        8 => Some((32, 34)),    // Q8_0
+        9 => Some((32, 36)),    // Q8_1
+        10 => Some((256, 84)),  // Q2_K
+        11 => Some((256, 110)), // Q3_K
+        12 => Some((256, 144)), // Q4_K
+        13 => Some((256, 176)), // Q5_K
+        14 => Some((256, 210)), // Q6_K
+        15 => Some((256, 292)), // Q8_K
+        16 => Some((256, 66)),  // IQ2_XXS
+        17 => Some((256, 74)),  // IQ2_XS
+        18 => Some((256, 98)),  // IQ3_XXS
+        19 => Some((256, 50)),  // IQ1_S
+        20 => Some((32, 18)),   // IQ4_NL
+        21 => Some((256, 110)), // IQ3_S
+        22 => Some((256, 82)),  // IQ2_S
+        23 => Some((256, 136)), // IQ4_XS
+        24 => Some((1, 1)),     // I8
+        25 => Some((1, 2)),     // I16
+        26 => Some((1, 4)),     // I32
+        27 => Some((1, 8)),     // I64
+        28 => Some((1, 8)),     // F64
+        29 => Some((256, 56)),  // IQ1_M
+        30 => Some((1, 2)),     // BF16
+        34 => Some((256, 54)),  // TQ1_0
+        35 => Some((256, 66)),  // TQ2_0
+        39 => Some((32, 17)),   // MXFP4
+        _ => None,
+    }
+}
+
+impl TensorLocation {
+    /// Returns the exact encoded byte length of this tensor when its `ggml_type` is known.
+    pub fn encoded_byte_len(&self) -> Option<u64> {
+        let (blck, type_size) = ggml_type_block_layout(self.ggml_type)?;
+        let ne0 = *self.dims.first().unwrap_or(&1);
+        if blck == 0 || !ne0.is_multiple_of(blck) {
+            return None;
+        }
+        let row_bytes = (ne0 / blck).checked_mul(type_size)?;
+        let mut total = row_bytes;
+        for &d in self.dims.iter().skip(1) {
+            total = total.checked_mul(d)?;
+        }
+        Some(total)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SpanSlice {
     pub dst_offset: usize,
@@ -170,13 +227,25 @@ impl GgufIndex {
                 .get(name)
                 .with_context(|| format!("tensor '{name}' missing from GGUF index"))?;
             let shard_size = self.shard_sizes[loc.shard_idx];
-            let abs_offset = loc.abs_offset.saturating_add(src_off);
-            if abs_offset.saturating_add(len as u64) > shard_size {
+            if let Some(tensor_bytes) = loc.encoded_byte_len() {
+                let Some(rel_end) = src_off.checked_add(len as u64) else {
+                    bail!("tensor slice '{name}' offset {src_off} + len {len} overflows u64");
+                };
+                if rel_end > tensor_bytes {
+                    bail!(
+                        "tensor slice '{name}' [{src_off}, {rel_end}) exceeds tensor byte length {tensor_bytes}"
+                    );
+                }
+            }
+            let Some(abs_offset) = loc.abs_offset.checked_add(src_off) else {
+                bail!("tensor slice '{name}' absolute offset overflows u64");
+            };
+            let Some(abs_end) = abs_offset.checked_add(len as u64) else {
+                bail!("tensor slice '{name}' absolute end overflows u64");
+            };
+            if abs_end > shard_size {
                 bail!(
-                    "tensor slice '{name}' [{}, {}) exceeds shard size {}",
-                    abs_offset,
-                    abs_offset.saturating_add(len as u64),
-                    shard_size
+                    "tensor slice '{name}' [{abs_offset}, {abs_end}) exceeds shard size {shard_size}"
                 );
             }
             items.push(Item {
@@ -802,5 +871,41 @@ mod tests {
         let nested_len = nested.len() as u64;
         let mut cur = Cursor::new(nested);
         assert!(parse_single_header(&mut cur, 0, nested_len, false).is_err());
+    }
+
+    #[test]
+    fn sub_slice_rejects_range_past_tensor_end_even_within_shard() {
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "t0".to_string(),
+            TensorLocation {
+                name: "t0".to_string(),
+                shard_idx: 0,
+                abs_offset: 64,
+                ggml_type: 0, // F32 (4 bytes/elem) -> 64 elems = 256 bytes
+                dims: vec![64],
+            },
+        );
+        let idx = GgufIndex {
+            shards: vec![PathBuf::from("dummy.gguf")],
+            shard_sizes: vec![4096],
+            meta: ModelMeta {
+                architecture: "llama".to_string(),
+                name: None,
+                n_layers: 1,
+                context_length: None,
+                total_file_bytes: 4096,
+            },
+            tensors,
+        };
+        assert_eq!(idx.tensors["t0"].encoded_byte_len(), Some(256));
+        assert!(
+            idx.plan_coalesced_sub_slices(&[("t0", 240, 0, 16, 0)])
+                .is_ok()
+        );
+        assert!(
+            idx.plan_coalesced_sub_slices(&[("t0", 240, 0, 32, 0)])
+                .is_err()
+        );
     }
 }
