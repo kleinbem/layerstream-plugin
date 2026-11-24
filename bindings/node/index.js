@@ -1,5 +1,3 @@
-"use strict";
-
 const path = require("node:path");
 const native = require("./native.js");
 const { IsolatedWorkerClient } = require("./worker.js");
@@ -57,7 +55,7 @@ function extractJsonSchemaString(schema) {
     }
   }
   throw new TypeError(
-    "jsonSchema must be a JSON Schema object, JSON string, boolean schema, or schema with toJSONSchema()"
+    "jsonSchema must be a JSON Schema object, JSON string, boolean schema, or schema with toJSONSchema()",
   );
 }
 
@@ -153,7 +151,12 @@ function validateMessages(messages) {
 }
 
 function resolveGrammarOption(grammar, jsonSchema) {
-  if (grammar !== undefined && grammar !== null && jsonSchema !== undefined && jsonSchema !== null) {
+  if (
+    grammar !== undefined &&
+    grammar !== null &&
+    jsonSchema !== undefined &&
+    jsonSchema !== null
+  ) {
     throw new RangeError("pass at most one of 'grammar' or 'jsonSchema', not both");
   }
   if (grammar !== undefined && grammar !== null) {
@@ -181,7 +184,7 @@ function normalizeOpenOptions(opts = {}) {
   if (vramRaw !== undefined) {
     if (typeof vramRaw === "boolean") {
       throw new TypeError(
-        "vramBudgetMb must be 'auto', null, or a non-negative integer MiB (not boolean)"
+        "vramBudgetMb must be 'auto', null, or a non-negative integer MiB (not boolean)",
       );
     }
     if (vramRaw === null) {
@@ -196,7 +199,7 @@ function normalizeOpenOptions(opts = {}) {
         const parsed = Number(trimmed);
         if (!Number.isInteger(parsed) || parsed < 0) {
           throw new RangeError(
-            `Invalid vramBudgetMb '${trimmed}' (expected 'auto' or non-negative integer MiB)`
+            `Invalid vramBudgetMb '${trimmed}' (expected 'auto' or non-negative integer MiB)`,
           );
         }
         vramBudgetAuto = false;
@@ -357,7 +360,7 @@ class AutoModel {
     }
     const grammar = resolveGrammarOption(
       opts.grammar,
-      opts.jsonSchema !== undefined ? opts.jsonSchema : opts.json_schema
+      opts.jsonSchema !== undefined ? opts.jsonSchema : opts.json_schema,
     );
     const stop = validateStop(opts.stop);
     const wire = {
@@ -376,16 +379,34 @@ class AutoModel {
       maxDraftTokens: opts.maxDraftTokens ?? opts.max_draft_tokens ?? undefined,
       grammar,
     };
-    if (typeof wire.temperature !== "number" || !Number.isFinite(wire.temperature) || wire.temperature < 0) {
+    if (
+      typeof wire.temperature !== "number" ||
+      !Number.isFinite(wire.temperature) ||
+      wire.temperature < 0
+    ) {
       throw new RangeError("temperature must be a finite non-negative number");
     }
-    if (typeof wire.topP !== "number" || !Number.isFinite(wire.topP) || wire.topP <= 0 || wire.topP > 1) {
+    if (
+      typeof wire.topP !== "number" ||
+      !Number.isFinite(wire.topP) ||
+      wire.topP <= 0 ||
+      wire.topP > 1
+    ) {
       throw new RangeError("top_p must be in (0.0, 1.0]");
     }
-    if (typeof wire.minP !== "number" || !Number.isFinite(wire.minP) || wire.minP < 0 || wire.minP > 1) {
+    if (
+      typeof wire.minP !== "number" ||
+      !Number.isFinite(wire.minP) ||
+      wire.minP < 0 ||
+      wire.minP > 1
+    ) {
       throw new RangeError("min_p must be in [0.0, 1.0]");
     }
-    if (typeof wire.repeatPenalty !== "number" || !Number.isFinite(wire.repeatPenalty) || wire.repeatPenalty <= 0) {
+    if (
+      typeof wire.repeatPenalty !== "number" ||
+      !Number.isFinite(wire.repeatPenalty) ||
+      wire.repeatPenalty <= 0
+    ) {
       throw new RangeError("repeat_penalty must be a finite positive number");
     }
     if (typeof wire.frequencyPenalty !== "number" || !Number.isFinite(wire.frequencyPenalty)) {
@@ -394,12 +415,15 @@ class AutoModel {
     if (typeof wire.presencePenalty !== "number" || !Number.isFinite(wire.presencePenalty)) {
       throw new RangeError("presence_penalty must be finite");
     }
-    if (typeof wire.penaltyLastN !== "number" || !Number.isInteger(wire.penaltyLastN) || wire.penaltyLastN < -1) {
+    if (
+      typeof wire.penaltyLastN !== "number" ||
+      !Number.isInteger(wire.penaltyLastN) ||
+      wire.penaltyLastN < -1
+    ) {
       throw new RangeError("penalty_last_n must be >= -1");
     }
     if (allowChatExtras) {
-      wire.addGenerationPrompt =
-        opts.addGenerationPrompt ?? opts.add_generation_prompt ?? true;
+      wire.addGenerationPrompt = opts.addGenerationPrompt ?? opts.add_generation_prompt ?? true;
       wire.tools = validateTools(opts.tools);
       wire.parseOutput = Boolean(opts.parseOutput ?? opts.parse_output ?? false);
     }
@@ -460,7 +484,7 @@ class AutoModel {
       const { result, summary } = await this._backend.rpcWithSummary(
         "generate",
         { prompt, wire },
-        signal
+        signal,
       );
       if (signal && signal.aborted) {
         throw createAbortError(signal);
@@ -508,7 +532,7 @@ class AutoModel {
       const wire = this._buildGenWire(opts, true);
       if (wire.parseOutput) {
         throw new RangeError(
-          "parseOutput=true cannot be combined with stream=true (use StreamTagParser or OpenAI)"
+          "parseOutput=true cannot be combined with stream=true (use StreamTagParser or OpenAI)",
         );
       }
       const messagesJson = JSON.stringify(cleanMessages);
@@ -559,7 +583,7 @@ class AutoModel {
                 void lateStream.close().catch(() => {});
               }
             },
-            () => {}
+            () => {},
           );
           inner = await Promise.race([startPromise, abortPromise]);
         } else {
@@ -603,7 +627,7 @@ class AutoModel {
       const { result, summary } = await this._backend.rpcWithSummary(
         "chat",
         { messages: cleanMessages, wire },
-        signal
+        signal,
       );
       if (signal && signal.aborted) {
         throw createAbortError(signal);
@@ -690,7 +714,7 @@ class AutoModel {
       return await this._backend.applyChatTemplate(
         JSON.stringify(cleanMessages),
         addGen,
-        tools ? JSON.stringify(tools) : undefined
+        tools ? JSON.stringify(tools) : undefined,
       );
     } catch (err) {
       throw mapNativeError(err);

@@ -1,5 +1,3 @@
-"use strict";
-
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -33,13 +31,12 @@ let incompatibleVocabGguf;
 before(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "layerstream-node-test-"));
   syntheticGguf = writeSyntheticMixedDenseMoeGguf(path.join(tmpDir, "synthetic.gguf"));
-  syntheticJsonGguf = writeSyntheticMixedDenseMoeGguf(
-    path.join(tmpDir, "synthetic-json.gguf"),
-    { includeJsonTokens: true }
-  );
+  syntheticJsonGguf = writeSyntheticMixedDenseMoeGguf(path.join(tmpDir, "synthetic-json.gguf"), {
+    includeJsonTokens: true,
+  });
   incompatibleVocabGguf = writeSyntheticMixedDenseMoeGguf(
     path.join(tmpDir, "incompatible-512.gguf"),
-    { nVocab: 512 }
+    { nVocab: 512 },
   );
 });
 
@@ -113,10 +110,7 @@ describe("layerstream Node-API SDK", () => {
       assert.ok(tmpl.includes("42"));
 
       assert.equal(typeof (await model.kvTrim(1)), "boolean");
-      await assert.rejects(
-        () => model.kvTrim(4294967296),
-        RangeError
-      );
+      await assert.rejects(() => model.kvTrim(4294967296), RangeError);
       await model.kvClear();
 
       const st = await model.stats();
@@ -127,7 +121,9 @@ describe("layerstream Node-API SDK", () => {
       // Unread stream with filled buffer does not block lastSummary or unload()
       const unreadStream = await model.generate("a b c", { maxTokens: 16, stream: true });
       void unreadStream;
-      assert.ok(model.lastSummary === null || typeof model.lastSummary.completionTokens === "number");
+      assert.ok(
+        model.lastSummary === null || typeof model.lastSummary.completionTokens === "number",
+      );
     } finally {
       await model.unload();
       // Idempotent second unload
@@ -159,7 +155,7 @@ describe("layerstream Node-API SDK", () => {
       preCtrl.abort();
       await assert.rejects(
         () => model.generate("a b c", { maxTokens: 16, signal: preCtrl.signal }),
-        (err) => err.name === "AbortError"
+        (err) => err.name === "AbortError",
       );
 
       // Engine remains usable immediately after early stream break + abort
@@ -293,7 +289,7 @@ describe("layerstream Node-API SDK", () => {
       // Invalid grammar and unsupported schema constraints fail closed
       await assert.rejects(
         () => model.generate("a b", { maxTokens: 8, grammar: "not valid gbnf ===" }),
-        /grammar/i
+        /grammar/i,
       );
       assert.throws(() => jsonSchemaToGbnf({ type: "integer", minimum: 1 }), /minimum/);
     } finally {
@@ -303,7 +299,7 @@ describe("layerstream Node-API SDK", () => {
 
   test("supports drop-in in-process OpenAI client, .parse() with Zod-like schema, and tag parsing", async () => {
     const parsedTags = parseAssistantOutput(
-      '<think>step 1</think>Result <tool_call>{"name":"ping","arguments":{"x":1}}</tool_call>'
+      '<think>step 1</think>Result <tool_call>{"name":"ping","arguments":{"x":1}}</tool_call>',
     );
     assert.equal(parsedTags.reasoningContent, "step 1");
     assert.equal(parsedTags.content, "Result");
@@ -409,7 +405,7 @@ describe("layerstream Node-API SDK", () => {
             response_format: { type: "json_schema", json_schema: { name: "missing" } },
             max_tokens: 8,
           }),
-        RangeError
+        RangeError,
       );
 
       // Abort inside toJSONSchema() is observed before inference starts
@@ -427,7 +423,7 @@ describe("layerstream Node-API SDK", () => {
             signal: prepAbortCtrl.signal,
             max_tokens: 8,
           }),
-        (err) => err.name === "AbortError"
+        (err) => err.name === "AbortError",
       );
 
       // Explicit close before first read emits zero chunks (no queued role chunk)
@@ -455,8 +451,8 @@ describe("layerstream Node-API SDK", () => {
       assert.equal(streamChunks[0].choices[0].delta.role, "assistant");
       assert.ok(
         ["stop", "length", "tool_calls"].includes(
-          streamChunks[streamChunks.length - 1].choices[0].finish_reason
-        )
+          streamChunks[streamChunks.length - 1].choices[0].finish_reason,
+        ),
       );
 
       const compStream = await client.completions.create({
@@ -491,7 +487,7 @@ describe("layerstream Node-API SDK", () => {
             messages: [{ role: "user", content: "hi" }],
             signal: preAborted.signal,
           }),
-        (err) => err.name === "AbortError"
+        (err) => err.name === "AbortError",
       );
       await assert.rejects(
         () =>
@@ -499,7 +495,7 @@ describe("layerstream Node-API SDK", () => {
             messages: [{ role: "user", content: "hi" }],
             max_tokens: 2,
           }),
-        (err) => err.code === "ENOENT"
+        (err) => err.code === "ENOENT",
       );
       fs.copyFileSync(syntheticGguf, delayedGguf);
       const [c1, c2] = await Promise.all([
@@ -535,7 +531,7 @@ describe("layerstream Node-API SDK", () => {
           draftModel: incompatibleVocabGguf,
           useGpu: false,
         }),
-      /incompatible draft model tokenizer/
+      /incompatible draft model tokenizer/,
     );
 
     const payload = fs.readFileSync(syntheticGguf);
@@ -641,17 +637,14 @@ describe("layerstream Node-API SDK", () => {
       });
       assert.ok(penalized.length > 0);
 
-      await assert.rejects(
-        () => baseModel.generate("a b", { minP: 1.5 }),
-        /min_p|minP/
-      );
+      await assert.rejects(() => baseModel.generate("a b", { minP: 1.5 }), /min_p|minP/);
       await assert.rejects(
         () => baseModel.generate("a b", { repeatPenalty: 0 }),
-        /repeat_penalty|repeatPenalty/
+        /repeat_penalty|repeatPenalty/,
       );
       await assert.rejects(
         () => baseModel.loadState(path.join(tmpDir, "missing.kv")),
-        (err) => err.code === "ENOENT"
+        (err) => err.code === "ENOENT",
       );
     } finally {
       await baseModel.unload();

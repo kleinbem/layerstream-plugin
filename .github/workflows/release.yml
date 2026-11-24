@@ -244,6 +244,8 @@ jobs:
         with:
           python-version: "3.14"
 
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
       - name: Verify PyPI wheel ELF symbols, metadata, CLI, pytest + hypothesis, and SHA-256
         working-directory: bindings/python
         shell: bash
@@ -252,7 +254,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" dist python/layerstream/_backends || true
             python scripts/audit_wheel_elf.py dist/*.whl
           fi
-          python -m pip install --upgrade pip pytest pytest-asyncio pytest-timeout hypothesis twine
+          uv pip install --system pytest pytest-asyncio pytest-timeout hypothesis twine
           python -m twine check --strict dist/*.whl
           for whl in dist/*.whl; do
             case "$whl" in
@@ -262,7 +264,7 @@ jobs:
                 ;;
             esac
           done
-          python -m pip install --force-reinstall dist/*.whl
+          uv pip install --system --reinstall dist/*.whl
           layerstream --version
           python -m pytest -v
           (

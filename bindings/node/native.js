@@ -1,5 +1,3 @@
-"use strict";
-
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -28,7 +26,7 @@ function loadNativeAddon() {
 
   throw new Error(
     `Could not find native layerstream Node-API binary ('layerstream.${triple}.node'). ` +
-      `Run 'npm run build' in bindings/node or set LAYERSTREAM_NATIVE_PATH.`
+      `Run 'npm run build' in bindings/node or set LAYERSTREAM_NATIVE_PATH.`,
   );
 }
 

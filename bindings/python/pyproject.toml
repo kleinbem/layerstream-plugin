@@ -37,6 +37,8 @@ cuda = [
 cuda13 = [
     "layerstream-cuda13==0.4.1; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
+
+[dependency-groups]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -89,3 +91,7 @@ extraPaths = ["python"]
 include = ["python/layerstream", "tests"]
 typeCheckingMode = "standard"
 reportMissingModuleSource = "none"
+reportUnusedImport = "error"
+reportUnusedVariable = "error"
+reportUnnecessaryCast = "error"
+reportMatchNotExhaustive = "error"

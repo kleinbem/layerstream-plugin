@@ -37,6 +37,6 @@ test("native.js rejects unsupported darwin/x64 platform cleanly", () => {
   `;
   assert.throws(
     () => execFileSync(process.execPath, ["-e", script], { stdio: "pipe" }),
-    /Unsupported platform\/arch for layerstream native addon: darwin\/x64/
+    /Unsupported platform\/arch for layerstream native addon: darwin\/x64/,
   );
 });

@@ -1,5 +1,3 @@
-"use strict";
-
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const net = require("node:net");
@@ -451,8 +449,8 @@ class IsolatedWorkerClient {
         const onEarlyProcExit = (code, sig) => {
           fail(
             new Error(
-              `isolated worker exited before handshake (code=${code ?? "null"}, signal=${sig ?? "null"})`
-            )
+              `isolated worker exited before handshake (code=${code ?? "null"}, signal=${sig ?? "null"})`,
+            ),
           );
         };
 
@@ -623,7 +621,7 @@ class IsolatedWorkerClient {
   get isLoaded() {
     const proc = this._state.proc;
     return Boolean(
-      this._state.loaded && proc && proc.exitCode === null && proc.signalCode === null
+      this._state.loaded && proc && proc.exitCode === null && proc.signalCode === null,
     );
   }
 
@@ -724,7 +722,7 @@ async function runChildWorkerMain(port) {
         if (op === "open") {
           model = await native.NativeAutoModel.open(
             params.model,
-            JSON.stringify(params.wire || {})
+            JSON.stringify(params.wire || {}),
           );
           sendJsonLine(sock, {
             id: reqId,
@@ -740,7 +738,7 @@ async function runChildWorkerMain(port) {
           const tokens = await model.tokenize(
             params.text,
             Boolean(params.addSpecial),
-            Boolean(params.parseSpecial)
+            Boolean(params.parseSpecial),
           );
           sendJsonLine(sock, { id: reqId, ok: true, result: { tokens } });
         } else if (op === "detokenize") {
@@ -750,7 +748,7 @@ async function runChildWorkerMain(port) {
           const prompt = await model.applyChatTemplate(
             JSON.stringify(params.messages),
             Boolean(params.addGenerationPrompt),
-            params.tools ? JSON.stringify(params.tools) : undefined
+            params.tools ? JSON.stringify(params.tools) : undefined,
           );
           sendJsonLine(sock, { id: reqId, ok: true, result: { prompt } });
         } else if (op === "kv_clear") {
@@ -775,7 +773,7 @@ async function runChildWorkerMain(port) {
             const out = await model.generateWithSummary(
               params.prompt,
               JSON.stringify(params.wire || {}),
-              cancelTok
+              cancelTok,
             );
             sendJsonLine(sock, {
               id: reqId,
@@ -787,7 +785,7 @@ async function runChildWorkerMain(port) {
             const out = await model.chatWithSummary(
               JSON.stringify(params.messages),
               JSON.stringify(params.wire || {}),
-              cancelTok
+              cancelTok,
             );
             sendJsonLine(sock, {
               id: reqId,
@@ -808,7 +806,7 @@ async function runChildWorkerMain(port) {
               : await model.chatStream(
                   JSON.stringify(params.messages),
                   JSON.stringify(params.wire || {}),
-                  cancelTok
+                  cancelTok,
                 );
           activeCancels.set(reqId, () => stream.cancel());
           if (cancelledIds.has(reqId)) {

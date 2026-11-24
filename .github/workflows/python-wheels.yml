@@ -50,6 +50,8 @@ jobs:
         with:
           python-version: "3.14"
 
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
       - name: Rust format & clippy check (bindings/python)
         working-directory: bindings/python
         env:
@@ -61,20 +63,20 @@ jobs:
       - name: Python static lint & type check (ruff + pyright)
         working-directory: bindings/python
         run: |
-          python -m pip install --upgrade pip ruff pyright pytest pytest-asyncio pytest-timeout hypothesis
+          uv pip install --system ruff pyright pytest pytest-asyncio pytest-timeout hypothesis
           ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts
           ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts
           pyright python/layerstream tests
 
       - name: Smoke-test layerstream-cuda13 companion wheel packaging & metadata
         run: |
-          python -m pip install --upgrade pip setuptools wheel twine
+          uv pip install --system "setuptools>=77" wheel twine
           mkdir -p bindings/python-cuda13/python/layerstream_cuda13/_backends
           gcc -shared -fPIC -Wl,-soname,libggml-cuda.so -Wl,-rpath,'$ORIGIN' \
             -o bindings/python-cuda13/python/layerstream_cuda13/_backends/libggml-cuda.so -xc /dev/null
           python bindings/python-cuda13/scripts/build_wheel.py --skip-cmake --out dist
           python -m twine check --strict bindings/python-cuda13/dist/*.whl
-          python -m pip install --no-deps --force-reinstall bindings/python-cuda13/dist/*.whl
+          uv pip install --system --no-deps --reinstall bindings/python-cuda13/dist/*.whl
           python -c 'import os, layerstream_cuda13; assert os.path.isfile(os.path.join(layerstream_cuda13.backend_dir(), "libggml-cuda.so"))'
 
   build-wheels:
@@ -170,6 +172,8 @@ jobs:
         with:
           python-version: "3.14"
 
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
       - name: Verify PyPI wheel ELF symbols, metadata, CLI, and pytest + hypothesis suite
         working-directory: bindings/python
         shell: bash
@@ -178,7 +182,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" dist python/layerstream/_backends || true
             python scripts/audit_wheel_elf.py dist/*.whl
           fi
-          python -m pip install --upgrade pip pytest pytest-asyncio pytest-timeout hypothesis twine
+          uv pip install --system pytest pytest-asyncio pytest-timeout hypothesis twine
           python -m twine check --strict dist/*.whl
           for whl in dist/*.whl; do
             echo "Built wheel: $whl"
@@ -189,7 +193,7 @@ jobs:
                 ;;
             esac
           done
-          python -m pip install --force-reinstall dist/*.whl
+          uv pip install --system --reinstall dist/*.whl
           layerstream --version
           python -m pytest -v
 
@@ -202,7 +206,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         working-directory: bindings/python
         run: |
-          python -m pip install --force-reinstall dist/*.whl
+          uv pip install --system --reinstall dist/*.whl
           layerstream --version
           expected=$(awk -F'"' '/^version =/{print $2; exit}' ../../Cargo.toml)
           python -c "import layerstream, sys; assert layerstream.__version__ == sys.argv[1], (layerstream.__version__, sys.argv[1])" "$expected"

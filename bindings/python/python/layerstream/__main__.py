@@ -286,6 +286,8 @@ def _cmd_chat(args: argparse.Namespace) -> int:
                 case "/stats":
                     print(json.dumps(model.stats(), indent=2), file=sys.stderr)
                     continue
+                case _:
+                    pass
             if user_line.startswith("/save "):
                 target = user_line[6:].strip()
                 try:

@@ -57,6 +57,8 @@
               rust-analyzer
               clang-tools
               sccache
+              cargo-nextest
+              cargo-audit
               cmake
               ninja
               pkg-config
@@ -115,6 +117,7 @@
                 maturin
                 ruff
                 pyright
+                uv
               ]);
 
             LLAMA_CPP_DIR = "${llama-cpp-src}";
@@ -128,6 +131,7 @@
               ++ (with pkgs; [
                 nodejs_24
                 typescript
+                biome
               ]);
 
             LLAMA_CPP_DIR = "${llama-cpp-src}";
