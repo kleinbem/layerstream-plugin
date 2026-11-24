@@ -4,11 +4,7 @@ export declare const version: string;
 export interface AbortSignalLike {
   readonly aborted: boolean;
   readonly reason?: unknown;
-  addEventListener(
-    type: "abort",
-    listener: () => void,
-    options?: { once?: boolean }
-  ): void;
+  addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
   removeEventListener(type: "abort", listener: () => void): void;
 }
 
@@ -198,10 +194,7 @@ export interface GenerateOptions {
   signal?: AbortSignalLike;
 }
 
-export type ChatMessageContent =
-  | string
-  | Array<string | { type?: string; text: string }>
-  | null;
+export type ChatMessageContent = string | Array<string | { type?: string; text: string }> | null;
 
 export interface ChatMessageToolCallInput {
   id?: string;
@@ -257,23 +250,20 @@ export declare class AutoModel implements AsyncDisposable {
 
   chat(
     messages: ChatMessageInput[],
-    opts: ChatOptions & { stream: true; parseOutput?: false }
+    opts: ChatOptions & { stream: true; parseOutput?: false },
   ): Promise<TokenStream>;
   chat(
     messages: ChatMessageInput[],
-    opts: ChatOptions & { stream?: false; parseOutput: true }
+    opts: ChatOptions & { stream?: false; parseOutput: true },
   ): Promise<ParsedAssistantOutput>;
   chat(
     messages: ChatMessageInput[],
-    opts?: ChatOptions & { stream?: false; parseOutput?: false }
+    opts?: ChatOptions & { stream?: false; parseOutput?: false },
   ): Promise<string>;
 
   tokenize(text: string, opts?: TokenizeOptions): Promise<number[]>;
   detokenize(tokens: number[]): Promise<string>;
-  applyChatTemplate(
-    messages: ChatMessageInput[],
-    opts?: ApplyChatTemplateOptions
-  ): Promise<string>;
+  applyChatTemplate(messages: ChatMessageInput[], opts?: ApplyChatTemplateOptions): Promise<string>;
   kvClear(): Promise<void>;
   kvTrim(posMin: number): Promise<boolean>;
   saveState(path: string): Promise<number>;
@@ -313,12 +303,12 @@ export declare function inspectGguf(path: string): Promise<GgufInfo>;
 export declare function pull(spec: string, opts?: { cacheDir?: string }): Promise<string>;
 export declare function recommend(
   repo: string,
-  opts?: RecommendOptions
+  opts?: RecommendOptions,
 ): Promise<QuantRecommendation[]>;
 export declare function check(model: string, opts?: CheckOptions): Promise<CheckReport>;
 export declare function jsonObjectGbnf(): string;
 export declare function jsonSchemaToGbnf(
-  schema: Record<string, unknown> | string | boolean | SchemaWithToJsonSchema
+  schema: Record<string, unknown> | string | boolean | SchemaWithToJsonSchema,
 ): string;
 export declare function parseAssistantOutput(raw: string): ParsedAssistantOutput;
 export declare function formatToolsSystemPrompt(tools: Array<Record<string, unknown>>): string;
@@ -399,9 +389,7 @@ export interface ChatCompletionStream
   [Symbol.asyncIterator](): AsyncIterator<OpenAIChatCompletionChunk>;
 }
 
-export interface CompletionStream
-  extends AsyncIterable<OpenAICompletion>,
-    AsyncDisposable {
+export interface CompletionStream extends AsyncIterable<OpenAICompletion>, AsyncDisposable {
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
   [Symbol.asyncIterator](): AsyncIterator<OpenAICompletion>;
@@ -413,7 +401,11 @@ export type ResponseFormatSpec<T = unknown> =
   | { type: "gbnf"; grammar: string }
   | {
       type: "json_schema";
-      json_schema?: { name?: string; schema: Record<string, unknown> | boolean; parse?: (v: unknown) => T };
+      json_schema?: {
+        name?: string;
+        schema: Record<string, unknown> | boolean;
+        parse?: (v: unknown) => T;
+      };
       schema?: Record<string, unknown> | boolean;
       parse?: (v: unknown) => T;
     }
@@ -473,23 +465,26 @@ export interface OpenAIClientOptions extends FromPretrainedOptions {
 }
 
 export declare class OpenAI implements AsyncDisposable {
-  constructor(modelOrOptions?: string | AutoModel | OpenAIClientOptions, extraOptions?: FromPretrainedOptions);
+  constructor(
+    modelOrOptions?: string | AutoModel | OpenAIClientOptions,
+    extraOptions?: FromPretrainedOptions,
+  );
 
   readonly chat: {
     completions: {
       create(
         params: OpenAIChatCreateParams & { stream: true },
-        callOpts?: { signal?: AbortSignalLike }
+        callOpts?: { signal?: AbortSignalLike },
       ): Promise<ChatCompletionStream>;
       create(
         params: OpenAIChatCreateParams & { stream?: false },
-        callOpts?: { signal?: AbortSignalLike }
+        callOpts?: { signal?: AbortSignalLike },
       ): Promise<OpenAIChatCompletion>;
       parse<T = Record<string, unknown>>(
         params: Omit<OpenAIChatCreateParams, "stream" | "response_format"> & {
           response_format: ResponseFormatSpec<T>;
         },
-        callOpts?: { signal?: AbortSignalLike }
+        callOpts?: { signal?: AbortSignalLike },
       ): Promise<OpenAIChatCompletion<T>>;
     };
   };
@@ -497,11 +492,11 @@ export declare class OpenAI implements AsyncDisposable {
   readonly completions: {
     create(
       params: OpenAICompletionsCreateParams & { stream: true },
-      callOpts?: { signal?: AbortSignalLike }
+      callOpts?: { signal?: AbortSignalLike },
     ): Promise<CompletionStream>;
     create(
       params: OpenAICompletionsCreateParams & { stream?: false },
-      callOpts?: { signal?: AbortSignalLike }
+      callOpts?: { signal?: AbortSignalLike },
     ): Promise<OpenAICompletion>;
   };
 

@@ -47,9 +47,7 @@ export declare class ChatCompletionStream
   [Symbol.asyncIterator](): AsyncIterator<OpenAIChatCompletionChunk>;
 }
 
-export declare class CompletionStream
-  implements AsyncIterable<OpenAICompletion>, AsyncDisposable
-{
+export declare class CompletionStream implements AsyncIterable<OpenAICompletion>, AsyncDisposable {
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
   [Symbol.asyncIterator](): AsyncIterator<OpenAICompletion>;
@@ -58,24 +56,24 @@ export declare class CompletionStream
 export declare class OpenAI implements AsyncDisposable {
   constructor(
     modelOrOptions?: string | AutoModel | OpenAIClientOptions,
-    extraOptions?: FromPretrainedOptions
+    extraOptions?: FromPretrainedOptions,
   );
 
   readonly chat: {
     completions: {
       create(
         params: OpenAIChatCreateParams & { stream: true },
-        callOpts?: { signal?: AbortSignalLike }
+        callOpts?: { signal?: AbortSignalLike },
       ): Promise<ChatCompletionStream>;
       create(
         params: OpenAIChatCreateParams & { stream?: false },
-        callOpts?: { signal?: AbortSignalLike }
+        callOpts?: { signal?: AbortSignalLike },
       ): Promise<OpenAIChatCompletion>;
       parse<T = Record<string, unknown>>(
         params: Omit<OpenAIChatCreateParams, "stream" | "response_format"> & {
           response_format: ResponseFormatSpec<T>;
         },
-        callOpts?: { signal?: AbortSignalLike }
+        callOpts?: { signal?: AbortSignalLike },
       ): Promise<OpenAIChatCompletion<T>>;
     };
   };
@@ -83,11 +81,11 @@ export declare class OpenAI implements AsyncDisposable {
   readonly completions: {
     create(
       params: OpenAICompletionsCreateParams & { stream: true },
-      callOpts?: { signal?: AbortSignalLike }
+      callOpts?: { signal?: AbortSignalLike },
     ): Promise<CompletionStream>;
     create(
       params: OpenAICompletionsCreateParams & { stream?: false },
-      callOpts?: { signal?: AbortSignalLike }
+      callOpts?: { signal?: AbortSignalLike },
     ): Promise<OpenAICompletion>;
   };
 

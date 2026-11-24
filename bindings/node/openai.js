@@ -1,5 +1,3 @@
-"use strict";
-
 const crypto = require("node:crypto");
 const native = require("./native.js");
 
@@ -110,7 +108,7 @@ function compileResponseFormat(responseFormat) {
   }
 
   throw new TypeError(
-    "response_format must be undefined, a response_format object, a JSON Schema, or a schema with toJSONSchema()"
+    "response_format must be undefined, a response_format object, a JSON Schema, or a schema with toJSONSchema()",
   );
 }
 
@@ -256,7 +254,9 @@ class ChatCompletionStream {
                   object: "chat.completion.chunk",
                   created: this._created,
                   model: this._modelId,
-                  choices: [{ index: 0, delta: { content: piece }, finish_reason: null, logprobs: null }],
+                  choices: [
+                    { index: 0, delta: { content: piece }, finish_reason: null, logprobs: null },
+                  ],
                   usage: null,
                 });
               }
@@ -414,7 +414,7 @@ class ModelManager {
     const key = requestedModel || this._defaultId;
     if (!key) {
       throw new RangeError(
-        "No model specified; pass `model` to new OpenAI({ model }) or `create({ model })`"
+        "No model specified; pass `model` to new OpenAI({ model }) or `create({ model })`",
       );
     }
     const existing = this._models.get(key);
@@ -507,8 +507,7 @@ class ChatCompletionsResource {
     throwIfAborted(signal);
 
     const { grammar } =
-      precompiledFormat ??
-      compileResponseFormat(params.response_format ?? params.responseFormat);
+      precompiledFormat ?? compileResponseFormat(params.response_format ?? params.responseFormat);
     throwIfAborted(signal);
 
     const { modelId, engine } = await this._mgr.resolve(params.model);
@@ -544,13 +543,7 @@ class ChatCompletionsResource {
 
     if (params.stream) {
       const tokStream = await engine.chat(params.messages, { ...genOpts, stream: true });
-      return new ChatCompletionStream(
-        tokStream,
-        reqId,
-        created,
-        modelId,
-        grammar !== undefined
-      );
+      return new ChatCompletionStream(tokStream, reqId, created, modelId, grammar !== undefined);
     }
 
     let raw;
@@ -707,7 +700,7 @@ class OpenAI {
       delete rawOpts.model;
     } else if (modelOrOptions !== undefined && modelOrOptions !== null) {
       throw new TypeError(
-        "OpenAI constructor expects an options object, model spec string, or AutoModel instance"
+        "OpenAI constructor expects an options object, model spec string, or AutoModel instance",
       );
     }
 

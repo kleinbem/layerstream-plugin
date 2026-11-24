@@ -1,9 +1,10 @@
-"use strict";
-
 const fs = require("node:fs");
 const path = require("node:path");
 
-function writeSyntheticMixedDenseMoeGguf(destPath, { nVocab = 64, includeJsonTokens = false } = {}) {
+function writeSyntheticMixedDenseMoeGguf(
+  destPath,
+  { nVocab = 64, includeJsonTokens = false } = {},
+) {
   const nEmbd = 64;
   const nHead = 2;
   const nHeadKv = 2;
@@ -111,14 +112,14 @@ function writeSyntheticMixedDenseMoeGguf(destPath, { nVocab = 64, includeJsonTok
           '"': 2.4,
           ",": 1.8,
           ".": 1.5,
-          "1": 1.2,
+          1: 1.2,
           "\n": -1.5,
         };
         for (let idxE = 0; idxE < jsonExtras.length; idxE += 1) {
           const tid = 29 + idxE;
           if (tid < nVocab) {
             const ch = jsonExtras[idxE];
-            tokBias.set(tid, Object.prototype.hasOwnProperty.call(extraBias, ch) ? extraBias[ch] : -1.2);
+            tokBias.set(tid, Object.hasOwn(extraBias, ch) ? extraBias[ch] : -1.2);
           }
         }
         for (const [tid, bval] of tokBias.entries()) {

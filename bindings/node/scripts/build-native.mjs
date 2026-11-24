@@ -71,8 +71,7 @@ for (const line of (res.stdout || "").split("\n")) {
   ) {
     const cdylib = rec.filenames.find(
       (f) =>
-        typeof f === "string" &&
-        (f.endsWith(".so") || f.endsWith(".dylib") || f.endsWith(".dll"))
+        typeof f === "string" && (f.endsWith(".so") || f.endsWith(".dylib") || f.endsWith(".dll")),
     );
     if (cdylib) {
       builtPath = cdylib;
@@ -81,9 +80,7 @@ for (const line of (res.stdout || "").split("\n")) {
 }
 
 if (!builtPath || !fs.existsSync(builtPath)) {
-  throw new Error(
-    "Cargo succeeded without reporting a built layerstream_node cdylib artifact"
-  );
+  throw new Error("Cargo succeeded without reporting a built layerstream_node cdylib artifact");
 }
 
 const destPath = path.join(pkgRoot, `layerstream.${triple}.node`);

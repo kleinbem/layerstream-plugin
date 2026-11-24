@@ -12,8 +12,6 @@ Examples:
         --vram-budget-mb 2048
 """
 
-from __future__ import annotations
-
 import argparse
 import time
 

@@ -21,21 +21,23 @@ check-versions:
     test "$cargo_ver" = "$node_cargo_ver"; \
     test "$cargo_ver" = "$node_pkg_ver"
 
-# Run fast local preflight checks (versions, formatting, lint, flake eval)
+# Run fast local preflight checks (versions, formatting, lint, types, flake eval)
 preflight: check-versions
     cargo fmt --all -- --check
     (cd bindings/python && cargo fmt -- --check)
     (cd bindings/node && cargo fmt -- --check)
-    nix develop .#python -c bash -c 'cd bindings/python && ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py && ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py'
+    nix develop .#python -c bash -c 'cd bindings/python && ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py && ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py && pyright python/layerstream tests'
+    nix develop .#node -c bash -c 'cd bindings/node && biome check .'
     nix fmt -- --ci
     if command -v nix-check-workarounds >/dev/null; then nix-check-workarounds .; fi
 
-# Format Rust, Python, and Nix files
+# Format Rust, Python, Node/TS, and Nix files
 fmt:
     cargo fmt --all
     (cd bindings/python && cargo fmt)
     (cd bindings/node && cargo fmt)
     nix develop .#python -c bash -c 'cd bindings/python && ruff format python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py'
+    nix develop .#node -c bash -c 'cd bindings/node && biome check --write .'
     nix fmt
 
 # Run Rust workspace clippy + tests at idle priority using a cache target dir

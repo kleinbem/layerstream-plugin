@@ -1,7 +1,5 @@
 """Unit tests for `scripts/audit_wheel_elf.py` PyPI size-cap and ELF/RUNPATH guards."""
 
-from __future__ import annotations
-
 import importlib.util
 import sys
 import zipfile

@@ -7,8 +7,6 @@ Demonstrates:
   3. Residency, speculation, sparse MoE active-expert ratio, and O_DIRECT I/O counters
 """
 
-from __future__ import annotations
-
 import argparse
 import time
 
