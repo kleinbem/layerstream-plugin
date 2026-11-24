@@ -536,7 +536,6 @@ pub struct LayerIoPool {
     scratch: Mutex<Option<AlignedBuf>>,
     moe_scratches: Mutex<Vec<AlignedBuf>>,
     span_cache: Mutex<HashMap<i32, Arc<[CoalescedSpan]>>>,
-    tensor_loc_cache: Mutex<Vec<Option<ResolvedTensorLoc>>>,
     expert_cache: Mutex<ExpertSliceLru>,
     bytes_read: AtomicU64,
     span_reads: AtomicU64,
@@ -640,7 +639,6 @@ impl LayerIoPool {
             scratch: Mutex::new(None),
             moe_scratches: Mutex::new(Vec::new()),
             span_cache: Mutex::new(HashMap::new()),
-            tensor_loc_cache: Mutex::new(Vec::new()),
             expert_cache: Mutex::new(ExpertSliceLru::new(explicit_expert_cache)),
             bytes_read: AtomicU64::new(0),
             span_reads: AtomicU64::new(0),
@@ -902,37 +900,18 @@ impl LayerIoPool {
             }
         }
 
-        // Resolve each request's tensor location once (O(1) cached by `tensor_idx` on sweeps 2..N).
+        // Resolve each request's tensor location once so expert cache lookup and span planning
+        // share the same `ResolvedTensorLoc` without double-hashing tensor names.
         let mut resolved_reqs: Vec<(ResolvedTensorLoc, u64, usize, usize, u32)> =
             Vec::with_capacity(requests.len());
-        {
-            let mut loc_cache = self
-                .tensor_loc_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for &(name, src_off, dst_off, len, tidx) in requests {
-                let idx = tidx as usize;
-                let loc = if idx < loc_cache.len()
-                    && let Some(cached) = loc_cache[idx]
-                {
-                    cached
-                } else {
-                    let found = self
-                        .index
-                        .tensors
-                        .get(name)
-                        .with_context(|| format!("tensor '{name}' missing from GGUF index"))?
-                        .resolved();
-                    if idx < 65_536 {
-                        if idx >= loc_cache.len() {
-                            loc_cache.resize(idx + 1, None);
-                        }
-                        loc_cache[idx] = Some(found);
-                    }
-                    found
-                };
-                resolved_reqs.push((loc, src_off, dst_off, len, tidx));
-            }
+        for &(name, src_off, dst_off, len, tidx) in requests {
+            let loc = self
+                .index
+                .tensors
+                .get(name)
+                .with_context(|| format!("tensor '{name}' missing from GGUF index"))?
+                .resolved();
+            resolved_reqs.push((loc, src_off, dst_off, len, tidx));
         }
 
         // 1. Check bounded hot-expert RAM LRU cache first.
