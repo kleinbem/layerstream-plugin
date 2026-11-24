@@ -17,7 +17,8 @@ use layerstream_core::{
     ChatMessage, GenerateOptions, GenerateSummary, IncomingChatMessage, KvCacheType,
     LsSampleParams, StreamDelta, StreamEngine, StreamTagParser, compile_response_format,
     format_tools_system_prompt, inject_tools_into_messages, json_object_gbnf, json_schema_to_gbnf,
-    parse_assistant_output,
+    normalize_kv_cache_type, normalize_vram_budget_mb, parse_assistant_output,
+    validate_sample_params,
 };
 use layerstream_server::{AppState, ModelRegistry, ServerConfig, serve_with_state_until};
 use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyTypeError, PyValueError};
@@ -2144,6 +2145,47 @@ fn py_compile_response_format(
     Ok((compiled.grammar, compiled.expects_json))
 }
 
+#[pyfunction(name = "validate_sample_params")]
+#[pyo3(signature = (temperature, top_p, min_p, repeat_penalty, frequency_penalty, presence_penalty, penalty_last_n=64))]
+fn py_validate_sample_params(
+    temperature: f64,
+    top_p: f64,
+    min_p: f64,
+    repeat_penalty: f64,
+    frequency_penalty: f64,
+    presence_penalty: f64,
+    penalty_last_n: i32,
+) -> PyResult<()> {
+    validate_sample_params(
+        temperature,
+        top_p,
+        min_p,
+        repeat_penalty,
+        frequency_penalty,
+        presence_penalty,
+        penalty_last_n,
+    )
+    .map_err(|e| PyValueError::new_err(format!("{e:#}")))
+}
+
+#[pyfunction(name = "normalize_open_budget_and_kv")]
+fn py_normalize_open_budget_and_kv(
+    vram_budget_mb: &Bound<'_, PyAny>,
+    kv_cache_type: &str,
+) -> PyResult<(bool, u64, &'static str)> {
+    if vram_budget_mb.is_instance_of::<pyo3::types::PyBool>() {
+        return Err(PyTypeError::new_err(
+            "vram_budget_mb must be 'auto', None, or a non-negative integer MiB (not bool)",
+        ));
+    }
+    let val = pyany_to_json_value(vram_budget_mb, 0)?;
+    let (auto, bytes) =
+        normalize_vram_budget_mb(&val).map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+    let kv = normalize_kv_cache_type(kv_cache_type)
+        .map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+    Ok((auto, bytes, kv))
+}
+
 #[pyfunction(name = "run_worker_server")]
 fn py_run_worker_server(py: Python<'_>, port: u16) -> PyResult<()> {
     py.detach(move || run_worker_server(port))
@@ -2171,6 +2213,8 @@ fn _layerstream(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_json_schema_to_gbnf, m)?)?;
     m.add_function(wrap_pyfunction!(py_json_object_gbnf, m)?)?;
     m.add_function(wrap_pyfunction!(py_compile_response_format, m)?)?;
+    m.add_function(wrap_pyfunction!(py_validate_sample_params, m)?)?;
+    m.add_function(wrap_pyfunction!(py_normalize_open_budget_and_kv, m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_assistant_output, m)?)?;
     m.add_function(wrap_pyfunction!(py_format_tools_system_prompt, m)?)?;
     Ok(())

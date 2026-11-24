@@ -5,9 +5,7 @@ live in `layerstream-core::worker_ipc` (Rust), exposed via `NativeWorkerClient`,
 `NativeWorkerStream`, and `run_worker_server`.
 """
 
-import ctypes
 import json
-import math
 import os
 import sys
 import typing
@@ -19,27 +17,19 @@ from ._layerstream import (
     NativeWorkerClient,
     NativeWorkerStream,
     json_schema_to_gbnf,
+    normalize_open_budget_and_kv,
     run_worker_server,
+    validate_sample_params,
 )
 
 WorkerTokenStream = NativeWorkerStream
 
 
 def _to_worker_open_payload(open_kwargs: Mapping[str, Any]) -> dict[str, Any]:
-    vram_raw = open_kwargs.get("vram_budget_mb", "auto")
-    vram_budget_auto = False
-    vram_budget_bytes = 0
-    if vram_raw is None:
-        vram_budget_auto = False
-        vram_budget_bytes = 0
-    elif isinstance(vram_raw, str):
-        raw = vram_raw.strip()
-        if raw.lower() == "auto":
-            vram_budget_auto = True
-        else:
-            vram_budget_bytes = int(raw) * 1024 * 1024
-    else:
-        vram_budget_bytes = int(vram_raw) * 1024 * 1024
+    vram_budget_auto, vram_budget_bytes, kv_cache_type = normalize_open_budget_and_kv(
+        open_kwargs.get("vram_budget_mb", "auto"),
+        str(open_kwargs.get("kv_cache_type", "f16")),
+    )
 
     return {
         "model": str(open_kwargs["model"]),
@@ -53,7 +43,7 @@ def _to_worker_open_payload(open_kwargs: Mapping[str, Any]) -> dict[str, Any]:
         "ctx_size": int(open_kwargs.get("ctx_size", 4096)),
         "batch_size": int(open_kwargs.get("batch_size", 512)),
         "threads": open_kwargs.get("threads"),
-        "kv_cache_type": str(open_kwargs.get("kv_cache_type", "f16")).strip().lower(),
+        "kv_cache_type": kv_cache_type,
         "use_gpu": bool(open_kwargs.get("use_gpu", True)),
         "prefer_direct_io": bool(open_kwargs.get("prefer_direct_io", True)),
         "cpu_embeddings": bool(open_kwargs.get("cpu_embeddings", False)),
@@ -215,25 +205,7 @@ def normalize_open_kwargs(
     max_draft_tokens: int,
     verbose: bool,
 ) -> dict[str, Any]:
-    if isinstance(vram_budget_mb, bool):
-        raise TypeError(
-            "vram_budget_mb must be 'auto', None, or a non-negative integer MiB (not bool)"
-        )
-    if isinstance(vram_budget_mb, int) and vram_budget_mb < 0:
-        raise ValueError("vram_budget_mb must be non-negative")
-    if isinstance(vram_budget_mb, str):
-        raw = vram_budget_mb.strip()
-        if raw.lower() != "auto":
-            try:
-                parsed_mb = int(raw)
-            except ValueError as exc:
-                raise ValueError(
-                    f"invalid vram_budget_mb '{raw}' (expected 'auto' or non-negative integer MiB)"
-                ) from exc
-            if parsed_mb < 0:
-                raise ValueError("vram_budget_mb must be non-negative")
-    if kv_cache_type.strip().lower() not in ("f16", "q8_0", "q4_0"):
-        raise ValueError(f"invalid kv_cache_type '{kv_cache_type}' (expected f16, q8_0, or q4_0)")
+    normalize_open_budget_and_kv(vram_budget_mb, kv_cache_type)
 
     return {
         "model": model,
@@ -265,10 +237,6 @@ def serialize_schema_arg(json_schema: Any) -> str | None:
     return json_schema_to_gbnf(json_schema)
 
 
-def _as_f32(v: float) -> float:
-    return ctypes.c_float(v).value if math.isfinite(v) else v
-
-
 def _validate_sample_args(
     *,
     temperature: float,
@@ -279,26 +247,15 @@ def _validate_sample_args(
     presence_penalty: float,
     penalty_last_n: int = 64,
 ) -> None:
-    temperature = _as_f32(temperature)
-    top_p = _as_f32(top_p)
-    min_p = _as_f32(min_p)
-    repeat_penalty = _as_f32(repeat_penalty)
-    frequency_penalty = _as_f32(frequency_penalty)
-    presence_penalty = _as_f32(presence_penalty)
-    if not math.isfinite(temperature) or temperature < 0.0:
-        raise ValueError("temperature must be a finite non-negative number")
-    if not math.isfinite(top_p) or top_p <= 0.0 or top_p > 1.0:
-        raise ValueError("top_p must be in (0.0, 1.0]")
-    if not math.isfinite(min_p) or min_p < 0.0 or min_p > 1.0:
-        raise ValueError("min_p must be in [0.0, 1.0]")
-    if not math.isfinite(repeat_penalty) or repeat_penalty <= 0.0:
-        raise ValueError("repeat_penalty must be a finite positive number")
-    if not math.isfinite(frequency_penalty) or frequency_penalty < -2.0 or frequency_penalty > 2.0:
-        raise ValueError("frequency_penalty must be in [-2.0, 2.0]")
-    if not math.isfinite(presence_penalty) or presence_penalty < -2.0 or presence_penalty > 2.0:
-        raise ValueError("presence_penalty must be in [-2.0, 2.0]")
-    if penalty_last_n < -1:
-        raise ValueError("penalty_last_n must be >= -1")
+    validate_sample_params(
+        temperature,
+        top_p,
+        min_p,
+        repeat_penalty,
+        frequency_penalty,
+        presence_penalty,
+        penalty_last_n,
+    )
 
 
 def _normalize_stop_and_grammar(

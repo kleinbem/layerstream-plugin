@@ -179,47 +179,36 @@ function normalizeOpenOptions(opts = {}) {
     throw new TypeError("options must be an object");
   }
   const vramRaw = opts.vramBudgetMb !== undefined ? opts.vramBudgetMb : opts.vram_budget_mb;
-  let vramBudgetAuto = true;
-  let vramBudgetBytes = 0;
-  if (vramRaw !== undefined) {
-    if (typeof vramRaw === "boolean") {
-      throw new TypeError(
-        "vramBudgetMb must be 'auto', null, or a non-negative integer MiB (not boolean)",
-      );
-    }
-    if (vramRaw === null) {
-      vramBudgetAuto = false;
-      vramBudgetBytes = 0;
-    } else if (typeof vramRaw === "string") {
-      const trimmed = vramRaw.trim();
-      if (trimmed.toLowerCase() === "auto") {
-        vramBudgetAuto = true;
-        vramBudgetBytes = 0;
-      } else {
-        const parsed = Number(trimmed);
-        if (!Number.isInteger(parsed) || parsed < 0) {
-          throw new RangeError(
-            `Invalid vramBudgetMb '${trimmed}' (expected 'auto' or non-negative integer MiB)`,
-          );
-        }
-        vramBudgetAuto = false;
-        vramBudgetBytes = parsed * 1024 * 1024;
-      }
-    } else if (typeof vramRaw === "number") {
-      if (!Number.isFinite(vramRaw) || vramRaw < 0) {
-        throw new RangeError("vramBudgetMb must be non-negative");
-      }
-      vramBudgetAuto = false;
-      vramBudgetBytes = Math.floor(vramRaw * 1024 * 1024);
-    } else {
-      throw new TypeError("vramBudgetMb must be 'auto', null, or a non-negative number MiB");
-    }
+  if (typeof vramRaw === "boolean") {
+    throw new TypeError(
+      "vramBudgetMb must be 'auto', null, or a non-negative integer MiB (not boolean)",
+    );
   }
-
+  if (
+    vramRaw !== undefined &&
+    vramRaw !== null &&
+    typeof vramRaw !== "string" &&
+    typeof vramRaw !== "number"
+  ) {
+    throw new TypeError("vramBudgetMb must be 'auto', null, or a non-negative number MiB");
+  }
+  if (typeof vramRaw === "number" && (!Number.isFinite(vramRaw) || vramRaw < 0)) {
+    throw new RangeError("vramBudgetMb must be non-negative");
+  }
   const kvRaw = opts.kvCacheType ?? opts.kv_cache_type ?? "q8_0";
-  if (typeof kvRaw !== "string" || !["f16", "q8_0", "q4_0"].includes(kvRaw.trim().toLowerCase())) {
+  if (typeof kvRaw !== "string") {
     throw new RangeError(`Invalid kvCacheType '${kvRaw}' (expected 'f16', 'q8_0', or 'q4_0')`);
   }
+  let normalized;
+  try {
+    normalized = native.normalizeOpenBudgetAndKv(
+      JSON.stringify(vramRaw === undefined ? "auto" : vramRaw),
+      kvRaw,
+    );
+  } catch (err) {
+    throw new RangeError(err instanceof Error ? err.message : String(err));
+  }
+  const { vramBudgetAuto, vramBudgetBytes, kvCacheType } = normalized;
 
   const isolatedWorker = Boolean(opts.isolatedWorker ?? opts.isolated_worker ?? false);
 
@@ -236,7 +225,7 @@ function normalizeOpenOptions(opts = {}) {
       ctxSize: opts.ctxSize ?? opts.ctx_size ?? 4096,
       batchSize: opts.batchSize ?? opts.batch_size ?? 512,
       threads: opts.threads ?? undefined,
-      kvCacheType: kvRaw.trim().toLowerCase(),
+      kvCacheType,
       useGpu: opts.useGpu ?? opts.use_gpu ?? true,
       preferDirectIo: opts.preferDirectIo ?? opts.prefer_direct_io ?? true,
       cpuEmbeddings: opts.cpuEmbeddings ?? opts.cpu_embeddings ?? false,

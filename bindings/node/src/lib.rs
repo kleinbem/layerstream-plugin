@@ -22,6 +22,8 @@ use layerstream_core::{
     format_tools_system_prompt as core_format_tools,
     inject_tools_into_messages as core_inject_tools, json_object_gbnf as core_json_object_gbnf,
     json_schema_to_gbnf as core_json_schema_to_gbnf,
+    normalize_kv_cache_type as core_normalize_kv_cache_type,
+    normalize_vram_budget_mb as core_normalize_vram_budget_mb,
     parse_assistant_output as core_parse_assistant_output,
 };
 use napi::bindgen_prelude::*;
@@ -2136,6 +2138,31 @@ impl NativeWorkerClient {
 pub struct CompiledResponseFormatJs {
     pub grammar: Option<String>,
     pub expects_json: bool,
+}
+
+#[napi(object)]
+pub struct NormalizedBudgetAndKvJs {
+    pub vram_budget_auto: bool,
+    pub vram_budget_bytes: f64,
+    pub kv_cache_type: String,
+}
+
+#[napi]
+pub fn normalize_open_budget_and_kv(
+    vram_budget_json: String,
+    kv_cache_type: String,
+) -> Result<NormalizedBudgetAndKvJs> {
+    let val: JsonValue = serde_json::from_str(&vram_budget_json)
+        .map_err(|e| invalid_arg(format!("invalid vramBudgetMb JSON: {e}")))?;
+    let (vram_budget_auto, bytes) =
+        core_normalize_vram_budget_mb(&val).map_err(|e| invalid_arg(format!("{e:#}")))?;
+    let kv =
+        core_normalize_kv_cache_type(&kv_cache_type).map_err(|e| invalid_arg(format!("{e:#}")))?;
+    Ok(NormalizedBudgetAndKvJs {
+        vram_budget_auto,
+        vram_budget_bytes: bytes as f64,
+        kv_cache_type: kv.to_string(),
+    })
 }
 
 #[napi]

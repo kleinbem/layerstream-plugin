@@ -46,6 +46,104 @@ pub fn normalize_finish_reason(raw: &str, has_tool_calls: bool) -> &'static str 
     }
 }
 
+/// Validates sampling parameters with `f32` precision (matching native FFI),
+/// enforcing canonical bounds across Python, Node.js, and Rust callers.
+pub fn validate_sample_params(
+    temperature: f64,
+    top_p: f64,
+    min_p: f64,
+    repeat_penalty: f64,
+    frequency_penalty: f64,
+    presence_penalty: f64,
+    penalty_last_n: i32,
+) -> Result<()> {
+    let as_f32 = |v: f64| if v.is_finite() { v as f32 } else { f32::NAN };
+    let temperature = as_f32(temperature);
+    let top_p = as_f32(top_p);
+    let min_p = as_f32(min_p);
+    let repeat_penalty = as_f32(repeat_penalty);
+    let frequency_penalty = as_f32(frequency_penalty);
+    let presence_penalty = as_f32(presence_penalty);
+
+    if !temperature.is_finite() || temperature < 0.0 {
+        bail!("temperature must be a finite non-negative number");
+    }
+    if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
+        bail!("top_p must be in (0.0, 1.0]");
+    }
+    if !min_p.is_finite() || !(0.0..=1.0).contains(&min_p) {
+        bail!("min_p must be in [0.0, 1.0]");
+    }
+    if !repeat_penalty.is_finite() || repeat_penalty <= 0.0 {
+        bail!("repeat_penalty must be a finite positive number");
+    }
+    if !frequency_penalty.is_finite() || !(-2.0..=2.0).contains(&frequency_penalty) {
+        bail!("frequency_penalty must be in [-2.0, 2.0]");
+    }
+    if !presence_penalty.is_finite() || !(-2.0..=2.0).contains(&presence_penalty) {
+        bail!("presence_penalty must be in [-2.0, 2.0]");
+    }
+    if penalty_last_n < -1 {
+        bail!("penalty_last_n must be >= -1");
+    }
+    Ok(())
+}
+
+/// Normalizes a `vram_budget_mb` JSON value (`"auto"`, `null`, non-negative number, or integer
+/// string) into `(vram_budget_auto, vram_budget_bytes)`.
+pub fn normalize_vram_budget_mb(raw: &Value) -> Result<(bool, u64)> {
+    match raw {
+        Value::Null => Ok((false, 0)),
+        Value::Bool(_) => {
+            bail!("vram_budget_mb must be 'auto', None, or a non-negative integer MiB (not bool)")
+        }
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.eq_ignore_ascii_case("auto") {
+                Ok((true, 0))
+            } else {
+                let parsed: i64 = trimmed.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "invalid vram_budget_mb '{trimmed}' (expected 'auto' or non-negative integer MiB)"
+                    )
+                })?;
+                if parsed < 0 {
+                    bail!("vram_budget_mb must be non-negative");
+                }
+                Ok((false, (parsed as u64).saturating_mul(1024 * 1024)))
+            }
+        }
+        Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Ok((false, u.saturating_mul(1024 * 1024)))
+            } else if let Some(i) = n.as_i64() {
+                if i < 0 {
+                    bail!("vram_budget_mb must be non-negative");
+                }
+                Ok((false, (i as u64).saturating_mul(1024 * 1024)))
+            } else if let Some(f) = n.as_f64() {
+                if !f.is_finite() || f < 0.0 {
+                    bail!("vram_budget_mb must be non-negative");
+                }
+                Ok((false, (f * 1024.0 * 1024.0).floor() as u64))
+            } else {
+                bail!("vram_budget_mb must be non-negative");
+            }
+        }
+        _ => bail!("vram_budget_mb must be 'auto', None, or a non-negative integer MiB"),
+    }
+}
+
+/// Normalizes and validates `kv_cache_type` (`"f16"`, `"q8_0"`, or `"q4_0"`).
+pub fn normalize_kv_cache_type(raw: &str) -> Result<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "f16" => Ok("f16"),
+        "q8_0" => Ok("q8_0"),
+        "q4_0" => Ok("q4_0"),
+        _ => bail!("invalid kv_cache_type '{raw}' (expected f16, q8_0, or q4_0)"),
+    }
+}
+
 /// Compile an OpenAI `response_format` JSON value into a GBNF grammar.
 ///
 /// Supports:
@@ -198,5 +296,44 @@ mod tests {
         assert_eq!(normalize_finish_reason("length", false), "length");
         assert_eq!(normalize_finish_reason("stop", false), "stop");
         assert_eq!(normalize_finish_reason("eos", false), "stop");
+    }
+
+    #[test]
+    fn validate_sample_params_enforces_f32_bounds() {
+        assert!(validate_sample_params(0.0, 0.95, 0.0, 1.0, 0.0, 0.0, 64).is_ok());
+        assert!(validate_sample_params(-0.1, 0.95, 0.0, 1.0, 0.0, 0.0, 64).is_err());
+        assert!(validate_sample_params(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 64).is_err());
+        assert!(validate_sample_params(0.0, 1e-50, 0.0, 1.0, 0.0, 0.0, 64).is_err());
+        assert!(validate_sample_params(0.0, 0.95, 1.1, 1.0, 0.0, 0.0, 64).is_err());
+        assert!(validate_sample_params(0.0, 0.95, 0.0, 0.0, 0.0, 0.0, 64).is_err());
+        assert!(validate_sample_params(0.0, 0.95, 0.0, 1.0, 2.5, 0.0, 64).is_err());
+        assert!(validate_sample_params(0.0, 0.95, 0.0, 1.0, 0.0, -2.5, 64).is_err());
+        assert!(validate_sample_params(0.0, 0.95, 0.0, 1.0, 0.0, 0.0, -2).is_err());
+    }
+
+    #[test]
+    fn normalize_vram_budget_and_kv_handles_edge_cases() {
+        assert_eq!(normalize_vram_budget_mb(&json!("auto")).unwrap(), (true, 0));
+        assert_eq!(
+            normalize_vram_budget_mb(&json!(" AUTO ")).unwrap(),
+            (true, 0)
+        );
+        assert_eq!(normalize_vram_budget_mb(&json!(null)).unwrap(), (false, 0));
+        assert_eq!(
+            normalize_vram_budget_mb(&json!(1024)).unwrap(),
+            (false, 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            normalize_vram_budget_mb(&json!("512")).unwrap(),
+            (false, 512 * 1024 * 1024)
+        );
+        assert!(normalize_vram_budget_mb(&json!(true)).is_err());
+        assert!(normalize_vram_budget_mb(&json!(-1)).is_err());
+        assert!(normalize_vram_budget_mb(&json!("bogus")).is_err());
+
+        assert_eq!(normalize_kv_cache_type("F16").unwrap(), "f16");
+        assert_eq!(normalize_kv_cache_type(" q8_0 ").unwrap(), "q8_0");
+        assert_eq!(normalize_kv_cache_type("q4_0").unwrap(), "q4_0");
+        assert!(normalize_kv_cache_type("q2_k").is_err());
     }
 }
