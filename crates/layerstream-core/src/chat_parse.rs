@@ -8,7 +8,7 @@ use crate::engine::ChatMessage;
 
 /// Canonical OpenAI-compatible incoming chat message normalizer shared across `layerstream-server`,
 /// Python bindings, and Node.js bindings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingChatMessage {
     pub role: String,
     #[serde(default)]

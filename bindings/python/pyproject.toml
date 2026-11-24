@@ -83,7 +83,6 @@ combine-as-imports = true
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106", "S310", "S603"]
 "**/scripts/**" = ["S108", "S603", "S607"]
-"python/layerstream/_worker.py" = ["S603"]
 
 [tool.pyright]
 pythonVersion = "3.14"

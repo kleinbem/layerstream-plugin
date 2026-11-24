@@ -52,11 +52,15 @@ impl fmt::Display for CancelledError {
 
 impl std::error::Error for CancelledError {}
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KvCacheType {
     #[default]
+    #[serde(alias = "F16")]
     F16 = 0,
+    #[serde(alias = "Q8_0")]
     Q8_0 = 1,
+    #[serde(alias = "Q4_0")]
     Q4_0 = 2,
 }
 
@@ -158,7 +162,7 @@ impl Default for GenerateOptions {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GenerateSummary {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,

@@ -10,6 +10,8 @@ pub mod residency;
 #[cfg(feature = "hf")]
 pub mod sdk;
 pub mod speculator;
+#[cfg(feature = "hf")]
+pub mod worker_ipc;
 
 pub use chat_parse::{
     IncomingChatMessage, OpenAiFunctionCall, OpenAiToolCall, ParsedAssistantOutput, StreamDelta,

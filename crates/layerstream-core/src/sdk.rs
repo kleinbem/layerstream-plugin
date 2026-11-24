@@ -53,7 +53,7 @@ pub struct LoadedSession {
     pub last_summary: Option<GenerateSummary>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct EngineStatsSnapshot {
     pub loaded: bool,
     pub isolated_worker: bool,

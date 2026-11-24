@@ -244,7 +244,7 @@ impl DraftModelProposer {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct SpeculationStats {
     pub sweeps: usize,
     pub drafted_tokens: usize,
