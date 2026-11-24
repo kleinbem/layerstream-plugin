@@ -281,7 +281,7 @@ pub fn run_preflight_checks(
                  or pass --allow-slow for offline batch use.",
                 entry.id
             );
-            if allow_slow {
+            if allow_slow || gpu_mem.is_none() {
                 tracing::warn!("{msg}");
             } else {
                 bail!("{msg}");
