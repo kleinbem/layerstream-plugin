@@ -108,7 +108,7 @@ jobs:
           LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
           CFLAGS: "-fsanitize=address,undefined -fno-omit-frame-pointer"
           CXXFLAGS: "-fsanitize=address,undefined -fno-omit-frame-pointer"
-          RUSTFLAGS: "-C linker=g++-14 -C link-arg=-fsanitize=address,undefined"
+          RUSTFLAGS: "-C linker=g++-14 -C link-arg=-fsanitize=address,undefined -C link-arg=-Wl,--no-as-needed -C link-arg=-lasan -C link-arg=-lubsan"
           ASAN_OPTIONS: "detect_leaks=0:halt_on_error=1"
           UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
         run: cargo test --locked -p layerstream-core --test parity_test -- --test-threads 1
