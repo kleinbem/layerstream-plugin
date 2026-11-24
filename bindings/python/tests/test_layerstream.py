@@ -670,8 +670,11 @@ def test_isolated_worker_parity_and_process_reap(synthetic_gguf: Path) -> None:
     # Worker process must be completely terminated and reaped after context exit!
     assert not iso.is_loaded
     assert iso.worker_pid is None
-    with pytest.raises(ProcessLookupError):
+    with pytest.raises(OSError) as exc_info:
         os.kill(pid, 0)
+    assert isinstance(exc_info.value, ProcessLookupError) or (
+        os.name == "nt" and getattr(exc_info.value, "winerror", None) == 87
+    )
 
 
 def test_grammar_and_json_schema_constrained_decoding(synthetic_json_gguf: Path) -> None:
@@ -1011,6 +1014,11 @@ def test_in_process_openai_and_async_openai_clients(synthetic_json_gguf: Path) -
         except ProcessLookupError:
             still_alive = False
             break
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 87:
+                still_alive = False
+                break
+            raise
         time.sleep(0.05)
     assert not still_alive, f"isolated worker {pid} still alive after GC"
 
