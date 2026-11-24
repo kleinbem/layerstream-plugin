@@ -108,6 +108,8 @@ pub struct LsEngineStats {
 
 impl LsEngineStats {
     pub fn backend_name_str(&self) -> String {
+        // SAFETY: `self.backend_name` is a fixed-size `[c_char; 32]` array; reinterpreting
+        // its initialized bytes as `&[u8]` of the same length is valid for any `c_char` bit pattern.
         let raw = unsafe {
             std::slice::from_raw_parts(
                 self.backend_name.as_ptr().cast::<u8>(),

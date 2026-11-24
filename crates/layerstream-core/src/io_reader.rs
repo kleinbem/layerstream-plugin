@@ -58,7 +58,9 @@ pub struct AlignedBuf {
     layout: Layout,
 }
 
+// SAFETY: `AlignedBuf` exclusively owns its heap allocation and has no thread-local affinity.
 unsafe impl Send for AlignedBuf {}
+// SAFETY: Shared references (`&AlignedBuf`) do not expose interior mutability.
 unsafe impl Sync for AlignedBuf {}
 
 impl AlignedBuf {
@@ -71,6 +73,7 @@ impl AlignedBuf {
         let len = usize::try_from(rounded).context("AlignedBuf size exceeds usize")?;
         let layout = Layout::from_size_align(len, DIRECT_IO_ALIGN as usize)
             .context("invalid AlignedBuf layout")?;
+        // SAFETY: `layout` has non-zero size (`len >= DIRECT_IO_ALIGN`) and power-of-two alignment.
         let raw = unsafe { alloc_zeroed(layout) };
         let Some(ptr) = NonNull::new(raw) else {
             bail!("failed to allocate {len}-byte 4K-aligned IO buffer");
@@ -88,12 +91,14 @@ impl AlignedBuf {
 
     pub fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
         assert!(len <= self.len);
+        // SAFETY: `self.ptr` points to `self.len` initialized zeroed bytes owned exclusively by `&mut self`, and `len <= self.len`.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), len) }
     }
 }
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
+        // SAFETY: `self.ptr` was allocated via `alloc_zeroed` with `self.layout` and is deallocated once on drop.
         unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
     }
 }
@@ -861,7 +866,9 @@ impl LayerIoPool {
                     (self.0, self.1)
                 }
             }
+            // SAFETY: Each parallel worker thread writes strictly to disjoint byte ranges within `dst`.
             unsafe impl Send for SendDstPtr {}
+            // SAFETY: Disjoint destination ranges are verified during span planning before spawning workers.
             unsafe impl Sync for SendDstPtr {}
 
             let mut scratches = self
@@ -960,6 +967,7 @@ impl LayerIoPool {
                     );
                 }
                 let file_off = span.aligned_offset + slice.span_offset as u64;
+                // SAFETY: `dst_end <= dst_len` was checked above and each span writes disjoint destination ranges in `dst_base`.
                 let dst_slice = unsafe {
                     std::slice::from_raw_parts_mut(dst_base.add(slice.dst_offset), slice.len)
                 };
@@ -1020,6 +1028,7 @@ impl LayerIoPool {
                     let src_off = ov_start - chunk_rel;
                     let dst_off = slice.dst_offset + (ov_start - slice.span_offset);
                     debug_assert!(dst_off + len <= dst_len);
+                    // SAFETY: `src_off + len <= read_buf.len()`, `dst_off + len <= dst_len` (validated in span planning), and `read_buf` is disjoint from `dst_base`.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             read_buf.as_ptr().add(src_off),
@@ -1193,6 +1202,7 @@ fn open_sparse_buffered(path: &std::path::Path) -> std::io::Result<File> {
     let file = File::open(path)?;
     // Disable kernel sequential read-ahead on this handle so scattered MoE expert
     // reads don't fetch unused adjacent experts or pollute the OS page cache.
+    // SAFETY: `file.as_raw_fd()` is an open file descriptor owned by `file`.
     unsafe {
         let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
     }
@@ -1206,6 +1216,7 @@ fn evict_page_cache_range(file: &File, offset: u64, len: usize) {
         return;
     }
     if let (Ok(off), Ok(n)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len)) {
+        // SAFETY: `file.as_raw_fd()` is an open file descriptor and `off`/`n` fit in `off_t`.
         unsafe {
             let _ = libc::posix_fadvise(file.as_raw_fd(), off, n, libc::POSIX_FADV_DONTNEED);
         }
@@ -1217,8 +1228,10 @@ fn open_direct(path: &std::path::Path) -> Option<File> {
     use std::os::unix::io::AsRawFd;
     let file = OpenOptions::new().read(true).open(path).ok()?;
     let fd = file.as_raw_fd();
+    // SAFETY: `fd` is a valid open descriptor owned by `file`; `F_NOCACHE` takes a single `c_int`.
     let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
     // Disable speculative OS read-ahead so scattered MoE expert slices don't waste SSD bandwidth.
+    // SAFETY: `fd` is a valid open descriptor owned by `file`; `F_RDAHEAD` takes a single `c_int`.
     unsafe {
         let _ = libc::fcntl(fd, libc::F_RDAHEAD, 0);
     }

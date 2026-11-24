@@ -180,6 +180,8 @@ pub struct StreamEngine {
     cached_kv_tokens: Vec<i32>,
 }
 
+// SAFETY: `StreamEngine` owns its C++ `LsEngine` handle and `LayerIoPool` exclusively; all mutable
+// operations require `&mut self` (or external synchronization), so moving it across threads is sound.
 unsafe impl Send for StreamEngine {}
 
 impl StreamEngine {
@@ -238,11 +240,14 @@ impl StreamEngine {
         };
 
         let mut err_buf = [0 as c_char; 512];
+        // SAFETY: `raw_cfg` fields and C strings live for the duration of `ls_engine_create`, and `err_buf` is valid for `err_buf.len()` bytes.
         let ptr = unsafe { ls_engine_create(&raw_cfg, err_buf.as_mut_ptr(), err_buf.len()) };
         let Some(raw) = NonNull::new(ptr) else {
             if let Some(p) = io_pool_raw {
+                // SAFETY: `p` was created via `Box::into_raw` in `StreamEngine::open` and is reclaimed exactly once after C++ no longer references it.
                 drop(unsafe { Box::from_raw(p) });
             }
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -259,27 +264,32 @@ impl StreamEngine {
 
     pub fn stats(&self) -> LsEngineStats {
         let mut out = LsEngineStats::default();
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         unsafe { ls_engine_get_stats(self.raw.as_ptr(), &mut out) };
         out
     }
 
     pub fn io_stats(&self) -> IoStats {
         self.io_pool
+            // SAFETY: `io_pool_ptr` is non-null, initialized from `Box::into_raw`, and remains valid until `StreamEngine::drop`.
             .map(|p| unsafe { &*p }.stats())
             .unwrap_or_default()
     }
 
     pub fn clear_expert_cache(&self) {
         if let Some(p) = self.io_pool {
+            // SAFETY: `io_pool_ptr` is non-null, initialized from `Box::into_raw`, and remains valid until `StreamEngine::drop`.
             unsafe { &*p }.clear_expert_cache();
         }
     }
 
     pub fn vocab_size(&self) -> i32 {
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         unsafe { ls_engine_vocab_size(self.raw.as_ptr()) }
     }
 
     pub fn n_ctx(&self) -> u32 {
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         unsafe { ls_engine_n_ctx(self.raw.as_ptr()) }
     }
 
@@ -287,6 +297,7 @@ impl StreamEngine {
     pub fn probe_gpu_memory(use_gpu: bool) -> Option<(u64, u64)> {
         let mut free_b = 0u64;
         let mut total_b = 0u64;
+        // SAFETY: Output pointers and buffers are valid, properly aligned stack variables for the duration of the FFI probe.
         let ok = unsafe { ls_probe_gpu_memory(use_gpu, &mut free_b, &mut total_b) };
         if ok && total_b > 0 {
             Some((free_b, total_b))
@@ -300,6 +311,7 @@ impl StreamEngine {
         let mut free_b = 0u64;
         let mut total_b = 0u64;
         let mut name_buf = [0 as c_char; 32];
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let ok = unsafe {
             ls_probe_gpu_device(
                 use_gpu,
@@ -310,6 +322,7 @@ impl StreamEngine {
             )
         };
         if ok && total_b > 0 {
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -329,6 +342,7 @@ impl StreamEngine {
 
     /// Configures `llama.cpp` / `ggml` stderr verbosity (`false` silences INFO/DEBUG logs).
     pub fn set_log_verbose(verbose: bool) {
+        // SAFETY: `ls_set_log_verbose` only updates an atomic/global verbosity flag in C++.
         unsafe { ls_set_log_verbose(verbose) };
     }
 
@@ -402,6 +416,7 @@ impl StreamEngine {
             .collect();
 
         let mut buf = vec![0u8; 4096];
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let needed = unsafe {
             ls_engine_apply_chat_template(
                 self.raw.as_ptr(),
@@ -418,6 +433,7 @@ impl StreamEngine {
         let needed_usize = needed as usize;
         if needed_usize >= buf.len() {
             buf.resize(needed_usize + 1, 0);
+            // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
             let n2 = unsafe {
                 ls_engine_apply_chat_template(
                     self.raw.as_ptr(),
@@ -442,6 +458,7 @@ impl StreamEngine {
         let bytes = text.as_bytes();
         let cap = (bytes.len() + 16).min(i32::MAX as usize) as i32;
         let mut out = vec![0i32; cap as usize];
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let n = unsafe {
             ls_engine_tokenize(
                 self.raw.as_ptr(),
@@ -456,6 +473,7 @@ impl StreamEngine {
         if n < 0 {
             let needed = (-n) as usize;
             out.resize(needed, 0);
+            // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
             let n2 = unsafe {
                 ls_engine_tokenize(
                     self.raw.as_ptr(),
@@ -479,6 +497,7 @@ impl StreamEngine {
 
     fn token_to_piece_bytes(&self, token: i32) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; 64];
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let n = unsafe {
             ls_engine_token_to_piece(
                 self.raw.as_ptr(),
@@ -490,6 +509,7 @@ impl StreamEngine {
         if n < 0 {
             let needed = (-n) as usize;
             buf.resize(needed, 0);
+            // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
             let n2 = unsafe {
                 ls_engine_token_to_piece(
                     self.raw.as_ptr(),
@@ -525,15 +545,18 @@ impl StreamEngine {
     }
 
     pub fn token_is_eog(&self, token: i32) -> bool {
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         unsafe { ls_engine_token_is_eog(self.raw.as_ptr(), token) }
     }
 
     pub fn kv_clear(&mut self) {
         self.cached_kv_tokens.clear();
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         unsafe { ls_engine_kv_clear(self.raw.as_ptr()) };
     }
 
     pub fn kv_trim(&mut self, pos_min: i32) -> bool {
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let ok = unsafe { ls_engine_kv_trim(self.raw.as_ptr(), pos_min) };
         if ok {
             if pos_min <= 0 {
@@ -585,10 +608,12 @@ impl StreamEngine {
         // Trim any uncommitted speculative tail above `cached_kv_tokens` before saving.
         if self.stats().can_speculate {
             let _ =
+                // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
                 unsafe { ls_engine_kv_trim(self.raw.as_ptr(), self.cached_kv_tokens.len() as i32) };
         }
 
         let mut err_buf = [0 as c_char; 512];
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let rc = unsafe {
             ls_engine_save_state(
                 self.raw.as_ptr(),
@@ -605,6 +630,7 @@ impl StreamEngine {
         };
         if rc != 0 {
             let _ = std::fs::remove_file(&tmp_path);
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -649,6 +675,7 @@ impl StreamEngine {
         let mut tokens_out = vec![0i32; cap];
         let mut n_loaded: usize = 0;
         let mut err_buf = [0 as c_char; 512];
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let rc = unsafe {
             ls_engine_load_state(
                 self.raw.as_ptr(),
@@ -662,6 +689,7 @@ impl StreamEngine {
         };
         if rc != 0 {
             self.cached_kv_tokens.clear();
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -675,6 +703,7 @@ impl StreamEngine {
     pub fn eval_greedy(&mut self, tokens: &[i32], pos_start: i32) -> Result<i32> {
         let mut next = 0i32;
         let mut err_buf = [0 as c_char; 512];
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let rc = unsafe {
             ls_engine_eval_greedy(
                 self.raw.as_ptr(),
@@ -690,6 +719,7 @@ impl StreamEngine {
             return Err(CancelledError.into());
         }
         if rc != 0 {
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -724,6 +754,7 @@ impl StreamEngine {
                 penalty_history.len().min(i32::MAX as usize) as i32,
             )
         };
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let rc = unsafe {
             ls_engine_eval_sample(
                 self.raw.as_ptr(),
@@ -742,6 +773,7 @@ impl StreamEngine {
             return Err(CancelledError.into());
         }
         if rc != 0 {
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -753,6 +785,7 @@ impl StreamEngine {
     pub fn eval_verify_greedy(&mut self, tokens: &[i32], pos_start: i32) -> Result<Vec<i32>> {
         let mut out = vec![0i32; tokens.len()];
         let mut err_buf = [0 as c_char; 512];
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let rc = unsafe {
             ls_engine_eval_verify_greedy(
                 self.raw.as_ptr(),
@@ -768,6 +801,7 @@ impl StreamEngine {
             return Err(CancelledError.into());
         }
         if rc != 0 {
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -805,6 +839,7 @@ impl StreamEngine {
                 penalty_history.len().min(i32::MAX as usize) as i32,
             )
         };
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let rc = unsafe {
             ls_engine_eval_verify_sample(
                 self.raw.as_ptr(),
@@ -824,6 +859,7 @@ impl StreamEngine {
             return Err(CancelledError.into());
         }
         if rc != 0 {
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -857,6 +893,7 @@ impl StreamEngine {
                 penalty_history.len().min(i32::MAX as usize) as i32,
             )
         };
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let rc = unsafe {
             ls_engine_eval_with_grammar(
                 self.raw.as_ptr(),
@@ -876,6 +913,7 @@ impl StreamEngine {
             return Err(CancelledError.into());
         }
         if rc != 0 {
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -903,6 +941,7 @@ impl StreamEngine {
                 penalty_history.len().min(i32::MAX as usize) as i32,
             )
         };
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let rc = unsafe {
             ls_engine_eval_verify_with_grammar(
                 self.raw.as_ptr(),
@@ -923,6 +962,7 @@ impl StreamEngine {
             return Err(CancelledError.into());
         }
         if rc != 0 {
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -1416,6 +1456,7 @@ impl GrammarHandle {
         let c_grammar =
             CString::new(grammar_str).context("GBNF grammar contains interior NUL byte")?;
         let mut err_buf = [0 as c_char; 512];
+        // SAFETY: `eng` is a live `LsEngine`, `c_grammar` and `c"root"` are NUL-terminated, and `err_buf` is valid for its length.
         let ptr = unsafe {
             ls_grammar_create(
                 eng.as_ptr(),
@@ -1426,6 +1467,7 @@ impl GrammarHandle {
             )
         };
         let Some(raw) = NonNull::new(ptr) else {
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -1436,6 +1478,7 @@ impl GrammarHandle {
 
     fn accept(&mut self, token: i32) -> Result<()> {
         let mut err_buf = [0 as c_char; 512];
+        // SAFETY: `self.raw` is a live `LsEngine` handle and all passed pointers/slices remain valid for the duration of the FFI call.
         let rc = unsafe {
             ls_grammar_accept(
                 self.raw.as_ptr(),
@@ -1445,6 +1488,7 @@ impl GrammarHandle {
             )
         };
         if rc != 0 {
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
@@ -1456,6 +1500,7 @@ impl GrammarHandle {
 
 impl Drop for GrammarHandle {
     fn drop(&mut self) {
+        // SAFETY: `self.raw` is a valid grammar handle owned exclusively by `self` and freed once on drop.
         unsafe { ls_grammar_free(self.raw.as_ptr()) };
     }
 }
@@ -1478,6 +1523,7 @@ impl StreamEngine {
 impl<'a> CancelCbGuard<'a> {
     fn install(raw: NonNull<LsEngine>, cancel: Option<&'a AtomicBool>) -> Self {
         if let Some(flag) = cancel {
+            // SAFETY: `self.raw` is a live `LsEngine`, and `CancelCbGuard` clears the callback before the `AtomicBool` borrow ends.
             unsafe {
                 ls_engine_set_cancel_cb(
                     raw.as_ptr(),
@@ -1503,6 +1549,7 @@ impl<'a> CancelCbGuard<'a> {
 impl Drop for CancelCbGuard<'_> {
     fn drop(&mut self) {
         if self.installed {
+            // SAFETY: `self.raw` is a live `LsEngine`, and `CancelCbGuard` clears the callback before the `AtomicBool` borrow ends.
             unsafe { ls_engine_set_cancel_cb(self.raw.as_ptr(), None, std::ptr::null()) };
         }
     }
@@ -1512,6 +1559,7 @@ unsafe extern "C" fn rust_cancel_check_cb(user_data: *const c_void) -> bool {
     if user_data.is_null() {
         return false;
     }
+    // SAFETY: `user_data` was registered by `CancelCbGuard` pointing to a live `AtomicBool` for the duration of the C++ call.
     let flag = unsafe { &*(user_data as *const AtomicBool) };
     flag.load(Ordering::Relaxed)
 }
@@ -1580,8 +1628,10 @@ impl StopFilter {
 impl Drop for StreamEngine {
     fn drop(&mut self) {
         // Free C++ engine FIRST so `worker_thread` is joined before freeing `LayerIoPool`.
+        // SAFETY: `self.raw` is a valid engine handle owned exclusively by `self` and freed once on drop before reclaiming `io_pool_ptr`.
         unsafe { ls_engine_free(self.raw.as_ptr()) };
         if let Some(p) = self.io_pool.take() {
+            // SAFETY: `p` was created via `Box::into_raw` in `StreamEngine::open` and is reclaimed exactly once after C++ no longer references it.
             drop(unsafe { Box::from_raw(p) });
         }
     }
@@ -1601,7 +1651,9 @@ unsafe extern "C" fn rust_load_tensors_cb(
         if user_data.is_null() || dst_ptr.is_null() {
             return -1;
         }
+        // SAFETY: `user_data` is the boxed `LayerIoPool` owned by `StreamEngine` and outlives all C++ engine callbacks.
         let pool = unsafe { &*(user_data as *const LayerIoPool) };
+        // SAFETY: C++ caller guarantees the destination pointer is valid and exclusively writable for the given capacity.
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, dst_cap) };
 
         // Fast path: reuse cached 4K-aligned CoalescedSpan plan on sweeps 2..N.
@@ -1616,11 +1668,15 @@ unsafe extern "C" fn rust_load_tensors_cb(
 
         let mut requests = Vec::with_capacity(tensor_count);
         for i in 0..tensor_count {
+            // SAFETY: `i < n_tensors`, and C++ caller guarantees the parallel metadata arrays have at least `n_tensors` elements.
             let c_name = unsafe { *tensor_names.add(i) };
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let Ok(name) = unsafe { CStr::from_ptr(c_name) }.to_str() else {
                 return -2;
             };
+            // SAFETY: `i < n_tensors`, and C++ caller guarantees the parallel metadata arrays have at least `n_tensors` elements.
             let off = unsafe { *tensor_offsets.add(i) } as usize;
+            // SAFETY: `i < n_tensors`, and C++ caller guarantees the parallel metadata arrays have at least `n_tensors` elements.
             let sz = unsafe { *tensor_sizes.add(i) } as usize;
             if off.saturating_add(sz) > dst_cap {
                 return -3;
@@ -1656,8 +1712,11 @@ unsafe extern "C" fn rust_load_layer_direct_cb(
         if user_data.is_null() || pin_ptr.is_null() || out_slices_ptr.is_null() {
             return -1;
         }
+        // SAFETY: `user_data` is the boxed `LayerIoPool` owned by `StreamEngine` and outlives all C++ engine callbacks.
         let pool = unsafe { &*(user_data as *const LayerIoPool) };
+        // SAFETY: C++ caller guarantees the destination pointer is valid and exclusively writable for the given capacity.
         let pin_buf = unsafe { std::slice::from_raw_parts_mut(pin_ptr, pin_cap) };
+        // SAFETY: C++ caller guarantees the destination pointer is valid and exclusively writable for the given capacity.
         let out_slices = unsafe { std::slice::from_raw_parts_mut(out_slices_ptr, max_slices) };
 
         // Fast path: cached span plan on sweeps 2..N (zero CStr/Vec allocation!).
@@ -1672,11 +1731,15 @@ unsafe extern "C" fn rust_load_layer_direct_cb(
 
         let mut requests = Vec::with_capacity(tensor_count);
         for i in 0..tensor_count {
+            // SAFETY: `i < n_tensors`, and C++ caller guarantees the parallel metadata arrays have at least `n_tensors` elements.
             let c_name = unsafe { *tensor_names.add(i) };
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let Ok(name) = unsafe { CStr::from_ptr(c_name) }.to_str() else {
                 return -2;
             };
+            // SAFETY: `i < n_tensors`, and C++ caller guarantees the parallel metadata arrays have at least `n_tensors` elements.
             let off = unsafe { *tensor_offsets.add(i) } as usize;
+            // SAFETY: `i < n_tensors`, and C++ caller guarantees the parallel metadata arrays have at least `n_tensors` elements.
             let sz = unsafe { *tensor_sizes.add(i) } as usize;
             requests.push((name, off, sz));
         }
@@ -1703,16 +1766,20 @@ unsafe extern "C" fn rust_load_slices_cb(
         if user_data.is_null() || dst_ptr.is_null() || (reqs_ptr.is_null() && req_count > 0) {
             return -1;
         }
+        // SAFETY: `user_data` is the boxed `LayerIoPool` owned by `StreamEngine` and outlives all C++ engine callbacks.
         let pool = unsafe { &*(user_data as *const LayerIoPool) };
+        // SAFETY: C++ caller guarantees the destination pointer is valid and exclusively writable for the given capacity.
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, dst_cap) };
         let raw_reqs = if req_count == 0 {
             &[]
         } else {
+            // SAFETY: C++ caller guarantees `reqs_ptr` points to `req_count` initialized `LsSliceReadReq` entries.
             unsafe { std::slice::from_raw_parts(reqs_ptr, req_count) }
         };
 
         let mut requests = Vec::with_capacity(req_count);
         for r in raw_reqs {
+            // SAFETY: C++ FFI wrote a NUL-terminated string into `err_buf` / `name_buf` or passed a valid C string pointer.
             let Ok(name) = unsafe { CStr::from_ptr(r.tensor_name) }.to_str() else {
                 return -2;
             };
@@ -1767,6 +1834,7 @@ impl Utf8PieceAssembler {
                     let valid_len = err.valid_up_to();
                     if valid_len > 0 {
                         let valid_str =
+                            // SAFETY: `valid_len` is `err.valid_up_to()` from `std::str::from_utf8`, so `self.pending[..valid_len]` is valid UTF-8.
                             unsafe { std::str::from_utf8_unchecked(&self.pending[..valid_len]) };
                         out.push_str(valid_str);
                     }

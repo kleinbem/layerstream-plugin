@@ -13,7 +13,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+
+/// Acquires a mutex without panicking if a previous holder panicked while holding it.
+fn lock_unpoisoned<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -410,7 +415,7 @@ impl WorkerClient {
             .spawn(move || reader_loop(reader, reader_state))?;
 
         {
-            let mut st = state.lock().expect("worker state lock poisoned");
+            let mut st = lock_unpoisoned(&state);
             st.reader_thread = Some(reader_thread);
         }
 
@@ -430,7 +435,7 @@ impl WorkerClient {
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
                 {
-                    let mut st = client.state.lock().expect("worker state lock poisoned");
+                    let mut st = lock_unpoisoned(&client.state);
                     st.model_path = model_path;
                 }
                 Ok(client)
@@ -443,12 +448,12 @@ impl WorkerClient {
     }
 
     pub fn is_loaded(&self) -> bool {
-        let mut st = self.state.lock().expect("worker state lock poisoned");
+        let mut st = lock_unpoisoned(&self.state);
         st.loaded && st.is_child_alive()
     }
 
     pub fn worker_pid(&self) -> Option<u32> {
-        let mut st = self.state.lock().expect("worker state lock poisoned");
+        let mut st = lock_unpoisoned(&self.state);
         if !st.loaded {
             return None;
         }
@@ -456,7 +461,7 @@ impl WorkerClient {
     }
 
     pub fn model_path(&self) -> Option<String> {
-        let st = self.state.lock().expect("worker state lock poisoned");
+        let st = lock_unpoisoned(&self.state);
         if st.loaded {
             st.model_path.clone()
         } else {
@@ -465,13 +470,13 @@ impl WorkerClient {
     }
 
     pub fn last_summary(&self) -> Option<GenerateSummary> {
-        let st = self.state.lock().expect("worker state lock poisoned");
+        let st = lock_unpoisoned(&self.state);
         st.last_summary.clone()
     }
 
     fn send_cmd(&self, msg: &Value) -> Result<()> {
-        let _send_guard = self.send_lock.lock().expect("worker send lock poisoned");
-        let mut st = self.state.lock().expect("worker state lock poisoned");
+        let _send_guard = lock_unpoisoned(&self.send_lock);
+        let mut st = lock_unpoisoned(&self.state);
         if !st.loaded {
             return Err(anyhow!(WorkerError::new(
                 "RuntimeError",
@@ -497,7 +502,7 @@ impl WorkerClient {
         on_progress: Option<ProgressCallback>,
     ) -> Result<(Value, Option<GenerateSummary>)> {
         let (req_id, rx) = {
-            let mut st = self.state.lock().expect("worker state lock poisoned");
+            let mut st = lock_unpoisoned(&self.state);
             if !st.loaded || st.sock_writer.is_none() {
                 return Err(anyhow!(WorkerError::new(
                     "RuntimeError",
@@ -512,7 +517,7 @@ impl WorkerClient {
 
         let send_res = self.send_cmd(&json!({"id": req_id, "op": op, "params": params}));
         if let Err(err) = send_res {
-            let mut st = self.state.lock().expect("worker state lock poisoned");
+            let mut st = lock_unpoisoned(&self.state);
             st.pending_rpc.remove(&req_id);
             return Err(err);
         }
@@ -532,7 +537,7 @@ impl WorkerClient {
                     break msg;
                 }
                 Err(_) => {
-                    let mut st = self.state.lock().expect("worker state lock poisoned");
+                    let mut st = lock_unpoisoned(&self.state);
                     st.pending_rpc.remove(&req_id);
                     return Err(anyhow!(WorkerError::new(
                         "RuntimeError",
@@ -543,7 +548,7 @@ impl WorkerClient {
         };
 
         {
-            let mut st = self.state.lock().expect("worker state lock poisoned");
+            let mut st = lock_unpoisoned(&self.state);
             st.pending_rpc.remove(&req_id);
         }
 
@@ -564,7 +569,7 @@ impl WorkerClient {
             .filter(|v| !v.is_null())
             .and_then(|v| serde_json::from_value(v.clone()).ok());
         if let Some(ref sum) = summary {
-            let mut st = self.state.lock().expect("worker state lock poisoned");
+            let mut st = lock_unpoisoned(&self.state);
             st.last_summary = Some(sum.clone());
         }
         Ok((resp.get("result").cloned().unwrap_or(Value::Null), summary))
@@ -707,7 +712,7 @@ impl WorkerClient {
 
     fn start_stream(&self, op: &str, params: Value) -> Result<WorkerStream> {
         let (req_id, rx) = {
-            let mut st = self.state.lock().expect("worker state lock poisoned");
+            let mut st = lock_unpoisoned(&self.state);
             if !st.loaded || st.sock_writer.is_none() {
                 return Err(anyhow!(WorkerError::new(
                     "RuntimeError",
@@ -721,7 +726,7 @@ impl WorkerClient {
         };
 
         if let Err(err) = self.send_cmd(&json!({"id": req_id, "op": op, "params": params})) {
-            let mut st = self.state.lock().expect("worker state lock poisoned");
+            let mut st = lock_unpoisoned(&self.state);
             st.active_streams.remove(&req_id);
             return Err(err);
         }
@@ -739,8 +744,8 @@ impl WorkerClient {
     /// Gracefully shut down, kill if necessary, and reap the isolated worker process.
     pub fn unload(&self) {
         let (child_opt, stdin_opt, reader_opt) = {
-            let _send_guard = self.send_lock.lock().expect("worker send lock poisoned");
-            let mut st = self.state.lock().expect("worker state lock poisoned");
+            let _send_guard = lock_unpoisoned(&self.send_lock);
+            let mut st = lock_unpoisoned(&self.state);
             st.loaded = false;
             if let Some(mut sock) = st.sock_writer.take() {
                 let _ =
@@ -811,8 +816,8 @@ pub struct WorkerCancelHandle {
 impl WorkerCancelHandle {
     /// Sends a non-blocking cancel RPC to the isolated worker for this stream's request ID.
     pub fn cancel(&self) -> bool {
-        let _send_guard = self.send_lock.lock().expect("worker send lock poisoned");
-        let mut st = self.state.lock().expect("worker state lock poisoned");
+        let _send_guard = lock_unpoisoned(&self.send_lock);
+        let mut st = lock_unpoisoned(&self.state);
         let cancel_id = st.alloc_id();
         if let Some(sock) = st.sock_writer.as_mut() {
             send_json_line(
@@ -849,7 +854,7 @@ impl WorkerStream {
             Ok(WorkerStreamEvent::Done(summary)) => {
                 self.done = true;
                 self.summary = summary.clone();
-                let mut st = self.state.lock().expect("worker state lock poisoned");
+                let mut st = lock_unpoisoned(&self.state);
                 st.active_streams.remove(&self.req_id);
                 if let Some(sum) = summary {
                     st.last_summary = Some(sum);
@@ -858,13 +863,13 @@ impl WorkerStream {
             }
             Ok(WorkerStreamEvent::Error(err)) => {
                 self.done = true;
-                let mut st = self.state.lock().expect("worker state lock poisoned");
+                let mut st = lock_unpoisoned(&self.state);
                 st.active_streams.remove(&self.req_id);
                 Err(anyhow!(err))
             }
             Err(_) => {
                 self.done = true;
-                let mut st = self.state.lock().expect("worker state lock poisoned");
+                let mut st = lock_unpoisoned(&self.state);
                 st.active_streams.remove(&self.req_id);
                 Ok(None)
             }
@@ -878,8 +883,8 @@ impl WorkerStream {
         self.done = true;
 
         let cancel_sent = {
-            let _send_guard = self.send_lock.lock().expect("worker send lock poisoned");
-            let mut st = self.state.lock().expect("worker state lock poisoned");
+            let _send_guard = lock_unpoisoned(&self.send_lock);
+            let mut st = lock_unpoisoned(&self.state);
             let cancel_id = st.alloc_id();
             if let Some(sock) = st.sock_writer.as_mut() {
                 send_json_line(
@@ -899,7 +904,7 @@ impl WorkerStream {
                     Ok(WorkerStreamEvent::Done(summary)) => {
                         self.summary = summary.clone();
                         if let Some(sum) = summary {
-                            let mut st = self.state.lock().expect("worker state lock poisoned");
+                            let mut st = lock_unpoisoned(&self.state);
                             st.last_summary = Some(sum);
                         }
                         break;
@@ -912,7 +917,7 @@ impl WorkerStream {
             }
         }
 
-        let mut st = self.state.lock().expect("worker state lock poisoned");
+        let mut st = lock_unpoisoned(&self.state);
         st.active_streams.remove(&self.req_id);
     }
 }
@@ -938,7 +943,7 @@ fn reader_loop(mut reader: BufReader<TcpStream>, state: Arc<Mutex<WorkerState>>)
             continue;
         };
 
-        let st = state.lock().expect("worker state lock poisoned");
+        let st = lock_unpoisoned(&state);
         if let Some(tx) = st.pending_rpc.get(&req_id).cloned() {
             drop(st);
             let _ = tx.send(msg);
@@ -975,7 +980,7 @@ fn reader_loop(mut reader: BufReader<TcpStream>, state: Arc<Mutex<WorkerState>>)
     }
 
     // Wake any blocked callers if the worker disconnected unexpectedly.
-    let mut st = state.lock().expect("worker state lock poisoned");
+    let mut st = lock_unpoisoned(&state);
     st.loaded = false;
     for (_, tx) in st.pending_rpc.drain() {
         let _ = tx.send(json!({
@@ -1047,7 +1052,7 @@ pub fn run_worker_server(port: u16) -> Result<()> {
 
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     {
-        let mut w = writer.lock().expect("worker writer lock poisoned");
+        let mut w = lock_unpoisoned(&writer);
         send_json_line(&mut w, &json!({"token": token}))?;
     }
 
@@ -1082,7 +1087,7 @@ pub fn run_worker_server(port: u16) -> Result<()> {
                 .and_then(|p| p.get("target_id"))
                 .and_then(Value::as_u64)
             {
-                let mut cs = cancel_state.lock().expect("cancel state lock poisoned");
+                let mut cs = lock_unpoisoned(&cancel_state);
                 cs.0.insert(target_id);
                 if let Some(flag) = cs.1.get(&target_id) {
                     flag.store(true, Ordering::Relaxed);
@@ -1097,7 +1102,7 @@ pub fn run_worker_server(port: u16) -> Result<()> {
 
     clean_shutdown.store(true, Ordering::Release);
     {
-        let cs = cancel_state.lock().expect("cancel state lock poisoned");
+        let cs = lock_unpoisoned(&cancel_state);
         for flag in cs.1.values() {
             flag.store(true, Ordering::Relaxed);
         }
@@ -1130,7 +1135,7 @@ fn worker_engine_loop(
         let params = cmd.get("params").cloned().unwrap_or_else(|| json!({}));
 
         let already_cancelled = {
-            let mut cs = cancel_state.lock().expect("cancel state lock poisoned");
+            let mut cs = lock_unpoisoned(&cancel_state);
             cs.0.remove(&req_id)
         };
         if already_cancelled {
@@ -1290,8 +1295,7 @@ fn worker_engine_loop(
 
                             let cancel_flag = Arc::new(AtomicBool::new(false));
                             {
-                                let mut cs =
-                                    cancel_state.lock().expect("cancel state lock poisoned");
+                                let mut cs = lock_unpoisoned(&cancel_state);
                                 if cs.0.remove(&req_id) {
                                     cancel_flag.store(true, Ordering::Relaxed);
                                 }
@@ -1321,8 +1325,7 @@ fn worker_engine_loop(
                             );
 
                             {
-                                let mut cs =
-                                    cancel_state.lock().expect("cancel state lock poisoned");
+                                let mut cs = lock_unpoisoned(&cancel_state);
                                 cs.1.remove(&req_id);
                                 cs.0.remove(&req_id);
                             }

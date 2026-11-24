@@ -13,7 +13,7 @@
 | Priority | Item | Status | Impact on `layerstream-plugin` |
 |---|---|---|---|
 | 1 | [`ggml-org/llama.cpp#32893`](https://github.com/ggml-org/llama.cpp/pull/32893) — `llama : allocate context memory when no_alloc model has bound weights` | Open (CI green, awaiting review) | Removes `clear_model_no_alloc()` protected-member workaround in `llama_compat.hpp`. |
-| 2 | [`ggml-org/llama.cpp#32951`](https://github.com/ggml-org/llama.cpp/pull/32951) — `llama : expose model tensor enumeration and per-layer KV geometry` | Draft PR (depends on `#32893`, branch `kleinbem/llama.cpp@model-tensor-kv-api`) | Drops `#include "llama-model.h"` completely so `layerstream-plugin` builds 100% against public `llama.h` + `ggml-backend.h`. |
+| 2 | [`ggml-org/llama.cpp#32951`](https://github.com/ggml-org/llama.cpp/pull/32951) — `llama : expose model tensor enumeration and per-layer KV geometry` | Open (ready for review, depends on `#32893`, branch `kleinbem/llama.cpp@model-tensor-kv-api`) | Drops `#include "llama-model.h"` completely so `layerstream-plugin` builds 100% against public `llama.h` + `ggml-backend.h`. |
 | 3 | Per-context / runtime CUDA Graph toggle (replacing process-wide `static const` `GGML_CUDA_DISABLE_GRAPHS` in `graph.cuh`) | Planned (after `#27330` / `#29768`) | Enables CUDA Graphs for 100%-resident models while keeping them disabled for streamed models in the same process. |
 
 ## Tracked Upstream PRs & Issues
@@ -21,7 +21,7 @@
 | Ref | Type | Area | Why it matters to `layerstream-plugin` | Action |
 |---|---|---|---|---|
 | [`ggml-org/llama.cpp#32893`](https://github.com/ggml-org/llama.cpp/pull/32893) | PR (ours) | Core / `no_alloc` | Allocates KV/compute buffers when `no_alloc=true` models have externally bound weights. | Follow review, drop `clear_model_no_alloc()` once merged. |
-| [`ggml-org/llama.cpp#32951`](https://github.com/ggml-org/llama.cpp/pull/32951) | Draft PR (ours) | Public C API | Exposes `llama_model_n_tensors`, `llama_model_get_tensor`, `llama_model_n_head_kv_layer`, `llama_model_n_embd_head_{k,v}`. | Mark ready once `#32893` merges; then drop `#include "llama-model.h"`. |
+| [`ggml-org/llama.cpp#32951`](https://github.com/ggml-org/llama.cpp/pull/32951) | PR (ours) | Public C API | Exposes `llama_model_n_tensors`, `llama_model_get_tensor`, `llama_model_n_head_kv_layer`, `llama_model_n_embd_head_{k,v}_layer`. | Follow review; once merged with `#32893`, drop `#include "llama-model.h"`. |
 | [`ggml-org/llama.cpp#32076`](https://github.com/ggml-org/llama.cpp/pull/32076) | PR | MoE / Sync | `llama_moe_cache: run everything without syncs` (`GGML_OP_CUSTOM` GPU↔host signalling). Directly overlaps with out-of-core MoE streaming and Vulkan/Windows sync cost. | Benchmark on `orin-nano` (CUDA) and `nixos-nvme` (Intel Vulkan); share numbers. |
 | [`ggml-org/llama.cpp#30685`](https://github.com/ggml-org/llama.cpp/pull/30685) | PR | `ggml` / Async | `ggml: allow input async copies` (`set_tensor_async` + single sync). Foundation for overlapping H2D transfers. | Watch & test async H2D overlap. |
 | [`ggml-org/llama.cpp#32516`](https://github.com/ggml-org/llama.cpp/pull/32516) | PR | Vulkan / Intel | Fixes i915/Mesa cancelling Vulkan submissions after 20s (`CONFIG_DRM_I915_REQUEST_TIMEOUT`). Affects long prefills on Intel iGPUs (`nixos-nvme`). | Test on Intel RPL-U Vulkan and report results if helpful. |
