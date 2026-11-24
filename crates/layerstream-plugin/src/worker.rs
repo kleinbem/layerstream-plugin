@@ -1519,7 +1519,7 @@ mod tests {
             .await;
         });
 
-        let send_get = |path: &str, auth: Option<&str>| async move {
+        async fn send_get(addr: SocketAddr, path: &str, auth: Option<&str>) -> Result<String> {
             let mut stream = TcpStream::connect(addr).await?;
             let auth_hdr = auth
                 .map(|v| format!("Authorization: {v}\r\n"))
@@ -1530,21 +1530,21 @@ mod tests {
             stream.write_all(req.as_bytes()).await?;
             let mut buf = Vec::new();
             stream.read_to_end(&mut buf).await?;
-            Ok::<String, anyhow::Error>(String::from_utf8_lossy(&buf).into_owned())
-        };
+            Ok(String::from_utf8_lossy(&buf).into_owned())
+        }
 
-        let health = send_get("/health", None).await?;
+        let health = send_get(addr, "/health", None).await?;
         assert!(health.starts_with("HTTP/1.1 200"), "{health}");
         let health_json: Value = serde_json::from_str(split_http_body(&health))?;
         assert_eq!(health_json["worker_isolated"], true);
 
-        let unauth = send_get("/v1/models", None).await?;
+        let unauth = send_get(addr, "/v1/models", None).await?;
         assert!(unauth.starts_with("HTTP/1.1 401"), "{unauth}");
 
-        let wrong = send_get("/v1/models", Some("Bearer wrong-token")).await?;
+        let wrong = send_get(addr, "/v1/models", Some("Bearer wrong-token")).await?;
         assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
 
-        let ok = send_get("/v1/models", Some("Bearer secret-token")).await?;
+        let ok = send_get(addr, "/v1/models", Some("Bearer secret-token")).await?;
         assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
 
         coord.shutdown_cleanly().await;
