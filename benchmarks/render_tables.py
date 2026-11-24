@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Generate verified Markdown benchmark tables from normalized benchmarks.json."""
 
-from __future__ import annotations
-
 import argparse
 import json
 from pathlib import Path
@@ -31,9 +29,7 @@ def main() -> None:
         "Decode (tok/s) | Total (tok/s) | Sweeps | Acc/Draft | Peak RSS (MiB) | "
         "Cache Δ (MiB) | Watts | J/tok |"
     )
-    print(
-        "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-    )
+    print("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for r in rows:
         acc_draft = (
             f"{r['accepted_tokens']}/{r['drafted_tokens']}"

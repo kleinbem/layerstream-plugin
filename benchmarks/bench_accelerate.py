@@ -7,9 +7,7 @@ Jetson Orin Nano) offload cleanly to NVMe rather than OOM-crashing.
 """
 
 import argparse
-import glob
 import json
-import os
 import threading
 import time
 from pathlib import Path
@@ -83,23 +81,23 @@ def mem_snapshot() -> dict[str, float]:
 
 
 def read_ina3221_watts() -> float | None:
-    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+    for hw in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
         try:
-            if Path(hw, "name").read_text().strip() != "ina3221":
+            if (hw / "name").read_text().strip() != "ina3221":
                 continue
         except OSError:
             continue
-        p_path = Path(hw, "power1_input")
+        p_path = hw / "power1_input"
         if p_path.exists():
             try:
                 return float(p_path.read_text().strip()) / 1_000_000.0
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 pass
         try:
-            mv = float(Path(hw, "in1_input").read_text().strip())
-            ma = float(Path(hw, "curr1_input").read_text().strip())
+            mv = float((hw / "in1_input").read_text().strip())
+            ma = float((hw / "curr1_input").read_text().strip())
             return (mv * ma) / 1_000_000.0
-        except (OSError, ValueError):
+        except OSError, ValueError:
             continue
     return None
 
@@ -139,7 +137,7 @@ def main() -> None:
     ap.add_argument("--no-4bit", action="store_true")
     args = ap.parse_args()
 
-    os.makedirs(args.offload_dir, exist_ok=True)
+    Path(args.offload_dir).mkdir(parents=True, exist_ok=True)
     start_snap = mem_snapshot()
     t_load = time.monotonic()
 

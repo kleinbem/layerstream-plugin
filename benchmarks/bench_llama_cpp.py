@@ -6,9 +6,7 @@ telemetry of `crates/layerstream-core/examples/bench.rs`.
 """
 
 import argparse
-import glob
 import json
-import os
 import re
 import subprocess
 import threading
@@ -79,23 +77,23 @@ def mem_snapshot() -> dict[str, float]:
 
 
 def read_ina3221_watts() -> float | None:
-    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+    for hw in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
         try:
-            if Path(hw, "name").read_text().strip() != "ina3221":
+            if (hw / "name").read_text().strip() != "ina3221":
                 continue
         except OSError:
             continue
-        p_path = Path(hw, "power1_input")
+        p_path = hw / "power1_input"
         if p_path.exists():
             try:
                 return float(p_path.read_text().strip()) / 1_000_000.0
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 pass
         try:
-            mv = float(Path(hw, "in1_input").read_text().strip())
-            ma = float(Path(hw, "curr1_input").read_text().strip())
+            mv = float((hw / "in1_input").read_text().strip())
+            ma = float((hw / "curr1_input").read_text().strip())
             return (mv * ma) / 1_000_000.0
-        except (OSError, ValueError):
+        except OSError, ValueError:
             continue
     return None
 
@@ -152,9 +150,7 @@ def parse_llama_timings(stderr: str) -> dict[str, float | int | None]:
     m = re.search(r"load time\s*=\s*([\d.]+)\s*ms", stderr)
     if m:
         out["load_time_s"] = float(m.group(1)) / 1000.0
-    m = re.search(
-        r"prompt eval time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+)\s*tokens", stderr
-    )
+    m = re.search(r"prompt eval time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+)\s*tokens", stderr)
     if m:
         out["prompt_eval_s"] = float(m.group(1)) / 1000.0
         out["prompt_tokens"] = int(m.group(2))
@@ -217,7 +213,7 @@ def main() -> None:
         cmd += args.extra_arg
 
         t0 = time.monotonic()
-        proc = subprocess.Popen(
+        proc = subprocess.Popen(  # noqa: S603 — explicit argv list for user-specified benchmark binary
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -243,11 +239,10 @@ def main() -> None:
         toks = timings["completion_tokens"] or 0
         eval_s = timings["eval_s"] or wall_s
         prompt_s = timings["prompt_eval_s"] or 0.0
+        infer_s = prompt_s + eval_s
         # Compute gross energy over `wall_s` — the exact interval during which `mon.watts` was sampled.
         j_per_tok = (
-            round((avg_w * wall_s) / max(toks, 1), 2)
-            if (avg_w is not None and toks > 0)
-            else None
+            round((avg_w * wall_s) / max(toks, 1), 2) if (avg_w is not None and toks > 0) else None
         )
 
         results.append(

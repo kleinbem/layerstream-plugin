@@ -2,9 +2,7 @@
 """Reproducible AirLLM benchmark matching crates/layerstream-core/examples/bench.rs."""
 
 import argparse
-import glob
 import json
-import os
 import threading
 import time
 from pathlib import Path
@@ -73,23 +71,23 @@ def current_rss_mib() -> float:
 
 
 def read_ina3221_watts() -> float | None:
-    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+    for hw in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
         try:
-            if Path(hw, "name").read_text().strip() != "ina3221":
+            if (hw / "name").read_text().strip() != "ina3221":
                 continue
         except OSError:
             continue
-        p_path = Path(hw, "power1_input")
+        p_path = hw / "power1_input"
         if p_path.exists():
             try:
                 return float(p_path.read_text().strip()) / 1_000_000.0
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 pass
         try:
-            mv = float(Path(hw, "in1_input").read_text().strip())
-            ma = float(Path(hw, "curr1_input").read_text().strip())
+            mv = float((hw / "in1_input").read_text().strip())
+            ma = float((hw / "curr1_input").read_text().strip())
             return (mv * ma) / 1_000_000.0
-        except (OSError, ValueError):
+        except OSError, ValueError:
             continue
     return None
 
@@ -125,10 +123,13 @@ def main() -> None:
     parser.add_argument("--compression", default="4bit", choices=["none", "4bit", "8bit"])
     parser.add_argument("--layer-shards-dir", default=None)
     parser.add_argument("--workload", default=None)
-    parser.add_argument("--max-tokens", type=int, default=None, help="Optional override for max_new_tokens")
+    parser.add_argument(
+        "--max-tokens", type=int, default=None, help="Optional override for max_new_tokens"
+    )
     args = parser.parse_args()
 
     import sys
+
     import airllm
     import torch
     from airllm import AutoModel
@@ -210,9 +211,7 @@ def main() -> None:
         out_ids = gen_out.sequences[0][prompt_tokens:]
         completion_tokens = int(out_ids.shape[0])
         joules_per_tok = (
-            (avg_watts * total_s) / max(completion_tokens, 1)
-            if avg_watts is not None
-            else None
+            (avg_watts * total_s) / max(completion_tokens, 1) if avg_watts is not None else None
         )
         decode_tok_per_s = (
             max(completion_tokens - 1, 0) / decode_s
@@ -241,7 +240,9 @@ def main() -> None:
                 "current_rss_mib": round(current_rss_mib(), 1),
                 "avg_watts": round(avg_watts, 2) if avg_watts is not None else None,
                 "joules_per_tok": round(joules_per_tok, 2) if joules_per_tok is not None else None,
-                "cuda_max_allocated_mib": round(torch.cuda.max_memory_allocated() / (1024 * 1024), 1),
+                "cuda_max_allocated_mib": round(
+                    torch.cuda.max_memory_allocated() / (1024 * 1024), 1
+                ),
                 "page_cache_delta_mib": round(cache_after - cache_before, 1),
                 "page_cache_delta_since_start_mib": round(cache_after - cache_before_load, 1),
                 "output_preview": text[:160],

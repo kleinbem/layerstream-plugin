@@ -36,7 +36,7 @@ preflight: check-versions check-loc
     cargo fmt --all -- --check
     (cd bindings/python && cargo fmt -- --check)
     (cd bindings/node && cargo fmt -- --check)
-    nix develop .#python -c bash -c 'cd bindings/python && ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py && ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py && pyright python/layerstream tests'
+    nix develop .#python -c bash -c 'cd bindings/python && ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py ../../benchmarks && ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py ../../benchmarks && pyright python/layerstream tests'
     nix develop .#node -c bash -c 'cd bindings/node && biome check .'
     nix fmt -- --ci
     if command -v nix-check-workarounds >/dev/null; then nix-check-workarounds .; fi
@@ -46,7 +46,7 @@ fmt:
     cargo fmt --all
     (cd bindings/python && cargo fmt)
     (cd bindings/node && cargo fmt)
-    nix develop .#python -c bash -c 'cd bindings/python && ruff format python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py'
+    nix develop .#python -c bash -c 'cd bindings/python && ruff format python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py ../../benchmarks'
     nix develop .#node -c bash -c 'cd bindings/node && biome check --write .'
     nix fmt
 

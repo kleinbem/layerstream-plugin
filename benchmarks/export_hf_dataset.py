@@ -8,8 +8,6 @@ Usage:
         --out-dir benchmarks/hf-dataset
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 from pathlib import Path
@@ -46,7 +44,7 @@ def load_dir_hardware(round_dir: Path) -> tuple[str, str]:
                 hw = meta.get("hardware") or DEFAULT_HARDWARE
                 hw_id = meta.get("hardware_id") or DEFAULT_HARDWARE_ID
                 return str(hw), str(hw_id)
-        except (OSError, json.JSONDecodeError):
+        except OSError, json.JSONDecodeError:
             pass
     return DEFAULT_HARDWARE, DEFAULT_HARDWARE_ID
 
@@ -158,8 +156,9 @@ def main() -> None:
             continue
         round_name = path.parent.name
         dir_hw, dir_hw_id = load_dir_hardware(path.parent)
-        for item in items:
-            records.append(normalize_record(item, path.name, round_name, dir_hw, dir_hw_id))
+        records.extend(
+            normalize_record(item, path.name, round_name, dir_hw, dir_hw_id) for item in items
+        )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     data_dir = args.out_dir / "data"
