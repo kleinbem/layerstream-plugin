@@ -344,3 +344,295 @@ fn handles_json_pointer_escaping_and_rejects_invalid_refs_and_unsupported_keywor
     assert!(json_schema_to_gbnf(&json!({"type": "string", "pattern": "^[a-z]+$"})).is_err());
     assert!(json_schema_to_gbnf(&json!(false)).is_err());
 }
+
+#[test]
+fn compiles_const_and_enum_with_sibling_constraints_and_escaped_literals() {
+    // Rich literal escaping: control chars, quotes, backslashes, non-ASCII UTF-8, floats, negatives.
+    let g = json_schema_to_gbnf(&json!({
+        "enum": [
+            "line1\nline2\t\"quoted\"\\slash\u{0007}café🚀",
+            -42,
+            3.25,
+            true,
+            false,
+            null,
+            {"k": [1, "v"]}
+        ]
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&g);
+
+    // `enum` filtered by sibling `type`, `minLength`, `maxLength`.
+    let filtered = json_schema_to_gbnf(&json!({
+        "type": "string",
+        "minLength": 2,
+        "maxLength": 4,
+        "enum": ["a", "ok", "good", "toolong", 123, null]
+    }))
+    .unwrap();
+    assert!(filtered.contains("\\\"ok\\\""));
+    assert!(filtered.contains("\\\"good\\\""));
+    assert!(!filtered.contains("\\\"toolong\\\""));
+    assert_all_gbnf_rules_defined(&filtered);
+
+    // `const` satisfied vs contradicted by sibling `type` / `minItems` / `required`.
+    let const_arr = json_schema_to_gbnf(&json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 2,
+        "items": {"type": "integer"},
+        "const": [1, 2]
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&const_arr);
+
+    assert!(
+        json_schema_to_gbnf(&json!({
+            "type": "array",
+            "minItems": 3,
+            "const": [1, 2]
+        }))
+        .is_err()
+    );
+
+    let const_obj = json_schema_to_gbnf(&json!({
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "integer"}},
+        "additionalProperties": false,
+        "const": {"a": 1}
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&const_obj);
+
+    // Contradicted by missing `required` key.
+    assert!(
+        json_schema_to_gbnf(&json!({
+            "type": "object",
+            "required": ["missing_key"],
+            "const": {"a": 1}
+        }))
+        .is_err()
+    );
+
+    // Schema numeric equality: `1` == `1.0`.
+    let num_eq = json_schema_to_gbnf(&json!({
+        "allOf": [{"const": 1}, {"const": 1.0}]
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&num_eq);
+}
+
+#[test]
+fn compiles_allof_intersections_across_objects_arrays_strings_and_enums() {
+    // Intersect two objects with overlapping properties, required sets, and typed additionalProperties.
+    let obj_allof = json_schema_to_gbnf(&json!({
+        "allOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "tag": {"type": "string", "minLength": 1}
+                },
+                "required": ["id"],
+                "additionalProperties": {"type": ["string", "boolean"]}
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "tag": {"type": "string", "maxLength": 8},
+                    "flag": {"type": "boolean"}
+                },
+                "required": ["flag"],
+                "additionalProperties": {"type": ["string", "integer"]}
+            }
+        ]
+    }))
+    .unwrap();
+    assert!(obj_allof.contains("json-char{1,8}"));
+    assert!(obj_allof.contains("\\\"id\\\""));
+    assert!(obj_allof.contains("\\\"flag\\\""));
+    assert_all_gbnf_rules_defined(&obj_allof);
+
+    // Intersect two arrays with prefixItems, items, minItems, maxItems.
+    let arr_allof = json_schema_to_gbnf(&json!({
+        "allOf": [
+            {
+                "type": "array",
+                "prefixItems": [{"type": ["string", "integer"]}],
+                "items": {"type": ["boolean", "null"]},
+                "minItems": 1
+            },
+            {
+                "type": "array",
+                "prefixItems": [{"type": "string"}],
+                "items": {"type": "boolean"},
+                "maxItems": 3
+            }
+        ]
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&arr_allof);
+
+    // Intersect enums & consts.
+    let enum_allof = json_schema_to_gbnf(&json!({
+        "allOf": [
+            {"enum": ["a", "b", "c"]},
+            {"enum": ["b", "c", "d"]}
+        ]
+    }))
+    .unwrap();
+    assert!(enum_allof.contains("\\\"b\\\""));
+    assert!(enum_allof.contains("\\\"c\\\""));
+    assert!(!enum_allof.contains("\\\"a\\\""));
+    assert_all_gbnf_rules_defined(&enum_allof);
+
+    // Disjoint enum intersection is unsatisfiable.
+    assert!(
+        json_schema_to_gbnf(&json!({
+            "allOf": [{"enum": ["a"]}, {"enum": ["b"]}]
+        }))
+        .is_err()
+    );
+
+    // `allOf` with `true` and `false` schemas.
+    let with_true = json_schema_to_gbnf(&json!({
+        "allOf": [true, {"type": "boolean"}]
+    }))
+    .unwrap();
+    assert!(with_true.contains("json-bool"));
+    assert!(json_schema_to_gbnf(&json!({"allOf": [false, {"type": "boolean"}]})).is_err());
+
+    // `allOf` distributing over `anyOf`.
+    let dist = json_schema_to_gbnf(&json!({
+        "allOf": [
+            {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            {"type": "integer"}
+        ]
+    }))
+    .unwrap();
+    assert!(dist.contains("json-int"));
+    assert_all_gbnf_rules_defined(&dist);
+}
+
+#[test]
+fn compiles_oneof_disjoint_and_rejects_overlapping_branches() {
+    // Disjoint primitive types + const/null.
+    let g = json_schema_to_gbnf(&json!({
+        "oneOf": [
+            {"type": "string"},
+            {"type": "boolean"},
+            {"type": "null"}
+        ]
+    }))
+    .unwrap();
+    assert!(g.contains("json-string"));
+    assert!(g.contains("json-bool"));
+    assert!(g.contains("json-null"));
+    assert_all_gbnf_rules_defined(&g);
+
+    // `oneOf` with `const` and disjoint `enum`.
+    let g2 = json_schema_to_gbnf(&json!({
+        "oneOf": [
+            {"const": "alpha"},
+            {"enum": ["beta", "gamma"]}
+        ]
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&g2);
+
+    // `oneOf` subtracts overlapping `"alpha"` leaving only `"beta"`.
+    let g_sub = json_schema_to_gbnf(&json!({
+        "oneOf": [
+            {"const": "alpha"},
+            {"enum": ["alpha", "beta"]}
+        ]
+    }))
+    .unwrap();
+    assert!(g_sub.contains("\\\"beta\\\""));
+    assert!(!g_sub.contains("\\\"alpha\\\""));
+    assert_all_gbnf_rules_defined(&g_sub);
+
+    // `oneOf` with single valid branch and a `false` branch.
+    let g3 = json_schema_to_gbnf(&json!({
+        "oneOf": [false, {"type": "integer"}]
+    }))
+    .unwrap();
+    assert!(g3.contains("json-int"));
+    assert_all_gbnf_rules_defined(&g3);
+}
+
+#[test]
+fn compiles_object_with_excluded_keys_containing_escapes_and_unicode() {
+    // Exercises `compile_string_excluding_keys` and `gbnf.rs` UTF-8 / escape / surrogate logic,
+    // plus `build_ordered_object_fields` with optional + required fields.
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "": {"type": "null"},
+            "a\"b\\c": {"type": "string"},
+            "café": {"type": "integer"},
+            "🚀": {"type": "boolean"},
+            "opt1": {"type": "number"},
+            "opt2": {"type": "string"}
+        },
+        "required": ["café"],
+        "additionalProperties": {"type": "integer"}
+    });
+    let gbnf = json_schema_to_gbnf(&schema).unwrap();
+    assert_all_gbnf_rules_defined(&gbnf);
+
+    // All-optional object with `additionalProperties: false`.
+    let all_opt = json_schema_to_gbnf(&json!({
+        "type": "object",
+        "properties": {
+            "x": {"type": "integer"},
+            "y": {"type": "string"},
+            "z": {"type": "boolean"}
+        },
+        "additionalProperties": false
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&all_opt);
+
+    // Empty object (`additionalProperties: false` and no properties).
+    let empty_obj = json_schema_to_gbnf(&json!({
+        "type": "object",
+        "additionalProperties": false
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&empty_obj);
+}
+
+#[test]
+fn validates_error_paths_annotations_and_boolean_schemas() {
+    // `true` and annotation-only schemas compile to `json-value`.
+    let g_true = json_schema_to_gbnf(&json!(true)).unwrap();
+    assert!(g_true.contains("root ::= ws json-value"));
+    assert_all_gbnf_rules_defined(&g_true);
+
+    let g_annot = json_schema_to_gbnf(&json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Anything",
+        "description": "Annotations only",
+        "x-custom": 42
+    }))
+    .unwrap();
+    assert!(g_annot.contains("root ::= ws json-value"));
+
+    // Invalid root schema type.
+    assert!(json_schema_to_gbnf(&json!(123)).is_err());
+
+    // Invalid non-negative bounds (negative, float, string).
+    assert!(json_schema_to_gbnf(&json!({"type": "string", "minLength": -1})).is_err());
+    assert!(json_schema_to_gbnf(&json!({"type": "string", "maxLength": 1.5})).is_err());
+    assert!(json_schema_to_gbnf(&json!({"type": "array", "minItems": "two"})).is_err());
+
+    // Direct self-referential cycle at root fails closed.
+    assert!(json_schema_to_gbnf(&json!({"$ref": "#"})).is_err());
+
+    // `GrammarError::from(serde_json::Error)` conversion works.
+    let serde_err = serde_json::from_str::<Value>("{bad").unwrap_err();
+    let g_err: GrammarError = serde_err.into();
+    assert!(!g_err.to_string().is_empty());
+}

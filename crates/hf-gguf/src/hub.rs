@@ -73,7 +73,7 @@ pub struct QuantRecommendation {
     pub score: i32,
 }
 
-fn extract_quant_label(path: &str) -> String {
+pub(crate) fn extract_quant_label(path: &str) -> String {
     let fname = path.rsplit('/').next().unwrap_or(path);
     let stem = fname.strip_suffix(".gguf").unwrap_or(fname);
     // Strip trailing shard suffix `-00001-of-0000N` before scanning tokens.
@@ -165,7 +165,7 @@ fn strip_shard_suffix(stem: &str) -> Option<(&str, u32, u32)> {
     Some((prefix, idx, total))
 }
 
-fn quant_quality_rank(quant: &str) -> i32 {
+pub(crate) fn quant_quality_rank(quant: &str) -> i32 {
     let (ud_bonus, base) = match quant.strip_prefix("UD-") {
         Some(rest) => (3, rest),
         None => (0, quant),
@@ -476,7 +476,7 @@ fn expand_tilde(path_str: &str) -> PathBuf {
     PathBuf::from(path_str)
 }
 
-fn looks_like_local_path(spec: &str) -> bool {
+pub(crate) fn looks_like_local_path(spec: &str) -> bool {
     let trimmed = spec.trim();
     if trimmed.starts_with(HF_PREFIX)
         || trimmed.starts_with("https://")
@@ -500,7 +500,7 @@ fn looks_like_local_path(spec: &str) -> bool {
     trimmed.to_ascii_lowercase().ends_with(".gguf")
 }
 
-fn select_candidate_for_repo<'a>(
+pub(crate) fn select_candidate_for_repo<'a>(
     recs: &'a [QuantRecommendation],
     quant_filter: Option<&str>,
     repo_id: &str,

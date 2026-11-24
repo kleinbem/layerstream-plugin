@@ -775,3 +775,363 @@ fn typed_hf_errors_and_alias_resolution_and_cache_check() {
     assert_eq!(best_large.candidate.quant, "Q4_K_M");
     assert_eq!(best_large.verdict, "RESIDENT");
 }
+
+#[test]
+fn covers_quant_labels_verdicts_local_paths_redirects_headers_and_progress_bar() {
+    use crate::hub::{
+        extract_quant_label, looks_like_local_path, quant_quality_rank, select_candidate_for_repo,
+    };
+    // Quant extraction & ranking across all tiers (including UD- bonus and unknown fallback).
+    for (fname, expected) in [
+        ("Model-UD-Q4_K_XL.gguf", "UD-Q4_K_XL"),
+        ("Model-Q5_K_M.gguf", "Q5_K_M"),
+        ("Model-IQ4_XS.gguf", "IQ4_XS"),
+        ("Model-Q6_K.gguf", "Q6_K"),
+        ("Model-Q8_0.gguf", "Q8_0"),
+        ("Model-Q5_0.gguf", "Q5_0"),
+        ("Model-Q3_K_M.gguf", "Q3_K_M"),
+        ("Model-IQ3_M.gguf", "IQ3_M"),
+        ("Model-IQ3_XS.gguf", "IQ3_XS"),
+        ("Model-Q2_K_XL.gguf", "Q2_K_XL"),
+        ("Model-Q2_K.gguf", "Q2_K"),
+        ("Model-BF16.gguf", "BF16"),
+        ("Model-F16.gguf", "F16"),
+        ("weird-custom.gguf", "CUSTOM"),
+    ] {
+        let q = extract_quant_label(fname);
+        assert_eq!(q, expected, "fname={fname}");
+        assert!(quant_quality_rank(&q) >= 50);
+    }
+
+    // `recommend_candidates` verdicts: TOO_SLOW_DISK, GOOD, SLOW, VERY_SLOW, zero-size, has_draft.
+    let big = HfGgufCandidate {
+        quant: "Q4_K_M".to_string(),
+        primary_file: "dir/Big-Q4_K_M.gguf".to_string(),
+        shard_count: 1,
+        total_bytes: 40 * 1024 * 1024 * 1024,
+    };
+    let slow_disk = recommend_candidates(
+        "o/r",
+        "main",
+        std::slice::from_ref(&big),
+        8 << 30,
+        50.0,
+        false,
+    );
+    assert_eq!(slow_disk[0].verdict, "TOO_SLOW_DISK");
+
+    let good_stream = recommend_candidates(
+        "o/r",
+        "dev",
+        std::slice::from_ref(&big),
+        8 << 30,
+        50_000.0,
+        true,
+    );
+    assert_eq!(good_stream[0].verdict, "GOOD");
+    assert!(good_stream[0].hf_uri.ends_with("@dev"));
+
+    let slow_stream = recommend_candidates(
+        "o/r",
+        "main",
+        std::slice::from_ref(&big),
+        8 << 30,
+        12_000.0,
+        true,
+    );
+    assert!(matches!(
+        slow_stream[0].verdict.as_str(),
+        "GOOD" | "SLOW" | "VERY_SLOW"
+    ));
+
+    let very_slow = recommend_candidates(
+        "o/r",
+        "main",
+        std::slice::from_ref(&big),
+        4 << 30,
+        200.0,
+        false,
+    );
+    assert_eq!(very_slow[0].verdict, "VERY_SLOW");
+
+    let zero_cand = HfGgufCandidate {
+        quant: "Q4_K_M".to_string(),
+        primary_file: "Zero.gguf".to_string(),
+        shard_count: 1,
+        total_bytes: 0,
+    };
+    let zero_recs = recommend_candidates("o/r", "main", &[zero_cand], 8 << 30, 2000.0, false);
+    assert_eq!(zero_recs[0].pinned_pct, 0);
+
+    // `select_candidate_for_repo`: exact path, basename, quant, and missing quant error.
+    assert!(select_candidate_for_repo(&slow_disk, Some("dir/Big-Q4_K_M.gguf"), "o/r").is_ok());
+    assert!(select_candidate_for_repo(&slow_disk, Some("Big-Q4_K_M.gguf"), "o/r").is_ok());
+    assert!(select_candidate_for_repo(&slow_disk, Some("q4_k_m"), "o/r").is_ok());
+    assert!(matches!(
+        select_candidate_for_repo(&slow_disk, Some("Q8_0"), "o/r").unwrap_err(),
+        HfError::NotFound(_)
+    ));
+    assert!(matches!(
+        select_candidate_for_repo(&[], None, "o/r").unwrap_err(),
+        HfError::NotFound(_)
+    ));
+
+    // `looks_like_local_path` across Unix, Windows, relative, and URL forms.
+    assert!(looks_like_local_path("/abs/model.gguf"));
+    assert!(looks_like_local_path("./rel.gguf"));
+    assert!(looks_like_local_path("../up.gguf"));
+    assert!(looks_like_local_path("~/m.gguf"));
+    assert!(looks_like_local_path("C:\\models\\m.gguf"));
+    assert!(looks_like_local_path("foo.gguf"));
+    assert!(!looks_like_local_path("hf://org/repo:m.gguf"));
+    assert!(!looks_like_local_path("https://huggingface.co/org/repo"));
+    assert!(!looks_like_local_path("org/repo"));
+
+    // `resolve_redirect_url`, `extract_header_sha256`, `content_range_matches_start`.
+    assert_eq!(
+        resolve_redirect_url("https://hf.co/a/b", "https://cdn.example/x").unwrap(),
+        "https://cdn.example/x"
+    );
+    assert_eq!(
+        resolve_redirect_url("https://hf.co/a/b", "/rel/path").unwrap(),
+        "https://hf.co/rel/path"
+    );
+    assert_eq!(
+        resolve_redirect_url("https://hf.co/a/b", "leaf").unwrap(),
+        "https://hf.co/leaf"
+    );
+    assert!(resolve_redirect_url("not-a-uri", "/x").is_err());
+
+    let mut hdrs = ureq::http::HeaderMap::new();
+    let sha = "a".repeat(64);
+    hdrs.insert("etag", format!("W/\"{sha}\"").parse().unwrap());
+    assert_eq!(
+        extract_header_sha256(&hdrs, "etag").as_deref(),
+        Some(sha.as_str())
+    );
+    hdrs.insert("x-bad", "short".parse().unwrap());
+    assert_eq!(extract_header_sha256(&hdrs, "x-bad"), None);
+
+    hdrs.insert("content-range", "bytes 100-199/200".parse().unwrap());
+    assert!(content_range_matches_start(&hdrs, 100));
+    assert!(!content_range_matches_start(&hdrs, 50));
+
+    // `render_tty_progress_bar` with total_bytes, without total_bytes, and multi-shard.
+    let _ = render_tty_progress_bar(&DownloadProgress {
+        repo_id: "o/r".into(),
+        filename: "sub/m.gguf".into(),
+        shard_index: 1,
+        shard_count: 2,
+        downloaded_bytes: 512,
+        total_bytes: Some(1024),
+        mib_per_s: 12.5,
+        cached: false,
+        done: false,
+    });
+    let _ = render_tty_progress_bar(&DownloadProgress {
+        repo_id: "o/r".into(),
+        filename: "m.gguf".into(),
+        shard_index: 1,
+        shard_count: 1,
+        downloaded_bytes: 512,
+        total_bytes: None,
+        mib_per_s: 12.5,
+        cached: false,
+        done: false,
+    });
+
+    // `Debug` for `PretrainedResolveOptions`, `HfError::from(io::Error)`, `default_cache_dir`,
+    // `is_path_or_hf_cached`, and `resolve_path_or_hf`.
+    let dbg = format!("{:?}", PretrainedResolveOptions::default());
+    assert!(dbg.contains("PretrainedResolveOptions"));
+    let io_err: HfError = std::io::Error::other("disk").into();
+    assert!(matches!(io_err, HfError::Io { .. }));
+    assert!(!default_cache_dir().as_os_str().is_empty());
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("x.gguf");
+    fs::write(&local, b"GGUF").unwrap();
+    assert!(is_path_or_hf_cached(local.to_str().unwrap(), tmp.path()));
+    assert_eq!(
+        resolve_path_or_hf(local.to_str().unwrap(), tmp.path()).unwrap(),
+        local
+    );
+}
+
+#[test]
+fn download_handles_416_range_mismatch_etag_change_truncation_sha_mismatch_and_redirects() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = b"GGUF_PAYLOAD_0123456789ABCDEF".to_vec();
+    let body_sha = to_hex_lower(&Sha256::digest(&body));
+    let req_count = Arc::new(AtomicUsize::new(0));
+    let body_srv = body.clone();
+    let sha_srv = body_sha.clone();
+    let cnt_srv = req_count.clone();
+
+    let server = std::thread::spawn(move || {
+        for stream_res in listener.incoming() {
+            let Ok(mut stream) = stream_res else { break };
+            let mut req_buf = [0u8; 4096];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let req = String::from_utf8_lossy(&req_buf[..n]);
+            let first = req.lines().next().unwrap_or("");
+            let path = first.split_whitespace().nth(1).unwrap_or("");
+            let has_range = req.to_ascii_lowercase().contains("\nrange:");
+            cnt_srv.fetch_add(1, Ordering::SeqCst);
+
+            if path.ends_with("/__stop") {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                break;
+            } else if path.ends_with("/err404.gguf") {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            } else if path.ends_with("/loop.gguf") {
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/o/r/resolve/main/loop.gguf\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else if path.ends_with("/trunc.gguf") {
+                let resp =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\nConnection: close\r\n\r\nshort";
+                let _ = stream.write_all(resp);
+            } else if path.ends_with("/badsha.gguf") {
+                let wrong = "0".repeat(64);
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"{wrong}\"\r\nConnection: close\r\n\r\n",
+                    body_srv.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(&body_srv);
+            } else if path.ends_with("/r416.gguf") {
+                if has_range {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                } else {
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"{sha_srv}\"\r\nConnection: close\r\n\r\n",
+                        body_srv.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&body_srv);
+                }
+            } else if path.ends_with("/etag_flip.gguf") {
+                if has_range {
+                    let hdr = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-{}/{}\r\nContent-Length: {}\r\nETag: \"new-etag\"\r\nConnection: close\r\n\r\n",
+                        body_srv.len() - 1,
+                        body_srv.len(),
+                        body_srv.len() - 5
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&body_srv[5..]);
+                } else {
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"new-etag\"\r\nConnection: close\r\n\r\n",
+                        body_srv.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&body_srv);
+                }
+            } else if path.contains("/api/models/Org/Paged/tree/main") && !path.contains("cursor=2")
+            {
+                let page1 = r#"[{"type":"file","path":"Model-Q4_K_M.gguf","size":1000}]"#;
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nLink: <http://{addr}/api/models/Org/Paged/tree/main?cursor=2>; rel=\"next\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    page1.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(page1.as_bytes());
+            } else if path.contains("cursor=2") {
+                let page2 = r#"[{"type":"file","path":"Model-Q8_0.gguf","size":2000}]"#;
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    page2.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(page2.as_bytes());
+            } else if path.contains("/api/models/Org/ApiErr/tree/main") {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+            }
+        }
+    });
+
+    // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
+    unsafe { std::env::set_var("HF_ENDPOINT", format!("http://{addr}")) };
+    let tmp = tempfile::tempdir().unwrap();
+
+    // 1. HTTP 404 -> HfError::Http
+    assert!(matches!(
+        ensure_hf_downloaded("hf://o/r:err404.gguf", tmp.path()).unwrap_err(),
+        HfError::Http(_)
+    ));
+
+    // 2. Redirect loop -> HfError::Http
+    assert!(matches!(
+        ensure_hf_downloaded("hf://o/r:loop.gguf", tmp.path()).unwrap_err(),
+        HfError::Http(_)
+    ));
+
+    // 3. Truncated body -> HfError::Io (UnexpectedEof from HTTP reader) or DownloadFailed
+    assert!(matches!(
+        ensure_hf_downloaded("hf://o/r:trunc.gguf", tmp.path()).unwrap_err(),
+        HfError::Io { .. } | HfError::DownloadFailed(_)
+    ));
+
+    // 4. SHA-256 mismatch -> HfError::DownloadFailed & partial cleaned up
+    assert!(matches!(
+        ensure_hf_downloaded("hf://o/r:badsha.gguf", tmp.path()).unwrap_err(),
+        HfError::DownloadFailed(_)
+    ));
+
+    // 5. HTTP 416 on stale .part restarts cleanly from byte 0
+    let spec416 = HfSpec::parse("hf://o/r:r416.gguf").unwrap();
+    let dest416 = spec416.cache_path(tmp.path());
+    fs::create_dir_all(dest416.parent().unwrap()).unwrap();
+    fs::write(part_path_for(&dest416), b"stale-bytes").unwrap();
+    write_part_meta(
+        &meta_path_for(&dest416),
+        &PartMeta {
+            etag: Some("\"old\"".into()),
+            sha256: None,
+        },
+    );
+    let p416 = ensure_hf_downloaded("hf://o/r:r416.gguf", tmp.path()).unwrap();
+    assert_eq!(fs::read(&p416).unwrap(), body);
+
+    // 6. ETag change during 206 resume restarts cleanly from byte 0
+    let spec_flip = HfSpec::parse("hf://o/r:etag_flip.gguf").unwrap();
+    let dest_flip = spec_flip.cache_path(tmp.path());
+    fs::write(part_path_for(&dest_flip), b"12345").unwrap();
+    write_part_meta(
+        &meta_path_for(&dest_flip),
+        &PartMeta {
+            etag: Some("\"old-etag\"".into()),
+            sha256: None,
+        },
+    );
+    let p_flip = ensure_hf_downloaded("hf://o/r:etag_flip.gguf", tmp.path()).unwrap();
+    assert_eq!(fs::read(&p_flip).unwrap(), body);
+
+    // 7. Paginated Hugging Face tree listing via `Link: <...>; rel="next"` + API 500 error
+    let cands = list_hf_gguf_candidates("Org/Paged", "main").unwrap();
+    assert_eq!(cands.len(), 2);
+    assert!(matches!(
+        list_hf_gguf_candidates("Org/ApiErr", "main").unwrap_err(),
+        HfError::Http(_)
+    ));
+
+    // Signal server shutdown.
+    let _ = ureq::get(&format!("http://{addr}/__stop")).call();
+    // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
+    unsafe { std::env::remove_var("HF_ENDPOINT") };
+    server.join().unwrap();
+}
