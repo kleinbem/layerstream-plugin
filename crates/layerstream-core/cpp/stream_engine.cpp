@@ -2744,7 +2744,10 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     // before `llama_init_from_model` (tracking: kleinbem/layerstream-plugin#8,
     // upstream: ggml-org/llama.cpp#32893).
     struct LsModelNoAllocReset : llama_model {
-        static void clear(llama_model * m) { static_cast<LsModelNoAllocReset *>(m)->params.no_alloc = false; }
+        static void clear(llama_model * m) {
+            constexpr auto member = &LsModelNoAllocReset::params;
+            (m->*member).no_alloc = false;
+        }
     };
     LsModelNoAllocReset::clear(eng->model);
 
