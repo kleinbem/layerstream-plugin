@@ -1756,6 +1756,8 @@ fn wire_to_worker_gen_params(wire_json: &str) -> Result<WorkerGenParams> {
 pub struct NativeWorkerStream {
     inner: Arc<Mutex<Option<WorkerStream>>>,
     last_summary: Arc<Mutex<Option<GenerateSummary>>>,
+    cancel_handle: layerstream_core::worker_ipc::WorkerCancelHandle,
+    closed: Arc<AtomicBool>,
 }
 
 #[napi]
@@ -1768,6 +1770,8 @@ impl NativeWorkerStream {
 
     #[napi]
     pub fn cancel(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let _ = self.cancel_handle.cancel();
         if let Ok(mut guard) = self.inner.lock()
             && let Some(stream) = guard.as_mut()
         {
@@ -1782,8 +1786,12 @@ impl NativeWorkerStream {
 
     #[napi]
     pub async fn next_chunk(&self) -> Result<Option<String>> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         let inner = Arc::clone(&self.inner);
         let last_summary = Arc::clone(&self.last_summary);
+        let closed = Arc::clone(&self.closed);
         run_blocking(move || {
             let mut stream = {
                 let mut guard = inner
@@ -1795,6 +1803,9 @@ impl NativeWorkerStream {
                 s
             };
             let res = stream.next_chunk();
+            if closed.load(Ordering::SeqCst) {
+                stream.close();
+            }
             if let Some(s) = stream.summary()
                 && let Ok(mut sg) = last_summary.lock()
             {
@@ -1803,6 +1814,9 @@ impl NativeWorkerStream {
             if let Ok(mut guard) = inner.lock() {
                 *guard = Some(stream);
             }
+            if closed.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             res.map_err(map_worker_err)
         })
         .await
@@ -1810,6 +1824,8 @@ impl NativeWorkerStream {
 
     #[napi]
     pub async fn close(&self) -> Result<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        let _ = self.cancel_handle.cancel();
         let inner = Arc::clone(&self.inner);
         let last_summary = Arc::clone(&self.last_summary);
         run_blocking(move || {
@@ -2096,9 +2112,12 @@ impl NativeWorkerClient {
             .inner
             .generate_stream(&prompt, &params)
             .map_err(map_worker_err)?;
+        let cancel_handle = stream.cancel_handle();
         Ok(NativeWorkerStream {
             inner: Arc::new(Mutex::new(Some(stream))),
             last_summary: Arc::new(Mutex::new(None)),
+            cancel_handle,
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -2115,9 +2134,12 @@ impl NativeWorkerClient {
             .inner
             .chat_stream(&msgs, &params)
             .map_err(map_worker_err)?;
+        let cancel_handle = stream.cancel_handle();
         Ok(NativeWorkerStream {
             inner: Arc::new(Mutex::new(Some(stream))),
             last_summary: Arc::new(Mutex::new(None)),
+            cancel_handle,
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 

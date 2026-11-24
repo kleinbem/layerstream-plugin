@@ -607,6 +607,18 @@ impl Drop for CancelOnDrop {
     }
 }
 
+fn residency_key(entry: &ModelEntry) -> String {
+    match entry.draft_path.as_deref() {
+        Some(draft) => format!(
+            "{}\0{}\0{}",
+            entry.id,
+            entry.path.display(),
+            draft.display()
+        ),
+        None => format!("{}\0{}\0", entry.id, entry.path.display()),
+    }
+}
+
 fn emit_stream_deltas(
     deltas: Vec<StreamDelta>,
     req_id: &str,
@@ -770,7 +782,8 @@ async fn chat_completions(
                 if cancel_worker.load(Ordering::Relaxed) {
                     return;
                 }
-                let pair = match lease.get_or_load(&entry_bg.id, || state_load.load_pair(&entry_bg))
+                let pair = match lease
+                    .get_or_load(&residency_key(&entry_bg), || state_load.load_pair(&entry_bg))
                 {
                     Ok(p) => p,
                     Err(err) => {
@@ -928,7 +941,7 @@ async fn chat_completions(
             if cancel_worker.load(Ordering::Relaxed) {
                 return Err(CancelledError.into());
             }
-            let pair = lease.get_or_load(&entry.id, || state_bg.load_pair(&entry))?;
+            let pair = lease.get_or_load(&residency_key(&entry), || state_bg.load_pair(&entry))?;
             let prompt = pair.target.apply_chat_template(&messages, true)?;
             let mut raw_output = String::new();
             let summary = pair.target.generate_stream_with_cancel(
@@ -1095,7 +1108,8 @@ async fn text_completions(
                 if cancel_worker.load(Ordering::Relaxed) {
                     return;
                 }
-                let pair = match lease.get_or_load(&entry_bg.id, || state_load.load_pair(&entry_bg))
+                let pair = match lease
+                    .get_or_load(&residency_key(&entry_bg), || state_load.load_pair(&entry_bg))
                 {
                     Ok(p) => p,
                     Err(err) => {
@@ -1193,7 +1207,7 @@ async fn text_completions(
             if cancel_worker.load(Ordering::Relaxed) {
                 return Err(CancelledError.into());
             }
-            let pair = lease.get_or_load(&entry.id, || state_bg.load_pair(&entry))?;
+            let pair = lease.get_or_load(&residency_key(&entry), || state_bg.load_pair(&entry))?;
             let mut text = String::new();
             let summary = pair.target.generate_stream_with_cancel(
                 &prompt,
