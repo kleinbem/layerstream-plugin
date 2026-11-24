@@ -51,7 +51,7 @@ jobs:
 
       - uses: DeterminateSystems/determinate-nix-action@4b040423529d49b1a19ba918742e0aa9aa95031a # v3.24.3
 
-      - name: Check latest ggml-org/llama.cpp release and open bump PR if newer
+      - name: Check latest ggml-org/llama.cpp master and open bump PR if ahead
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -61,13 +61,19 @@ jobs:
             exit 1
           fi
 
-          latest_tag=$(gh api repos/ggml-org/llama.cpp/releases/latest --jq '.tag_name')
-          latest_sha=$(gh api "repos/ggml-org/llama.cpp/commits/${latest_tag}" --jq '.sha')
+          latest_sha=$(gh api repos/ggml-org/llama.cpp/commits/master --jq '.sha')
           echo "Current llama.cpp: ${current_sha}"
-          echo "Latest  llama.cpp: ${latest_sha} (${latest_tag})"
+          echo "Latest  llama.cpp: ${latest_sha} (master)"
 
           if [ "$current_sha" = "$latest_sha" ]; then
-            echo "llama.cpp already at latest release ${latest_tag}."
+            echo "llama.cpp already at latest master ${latest_sha:0:9}."
+            exit 0
+          fi
+
+          cmp_status=$(gh api "repos/ggml-org/llama.cpp/compare/${current_sha}...${latest_sha}" --jq '.status')
+          ahead_by=$(gh api "repos/ggml-org/llama.cpp/compare/${current_sha}...${latest_sha}" --jq '.ahead_by')
+          if [ "$cmp_status" != "ahead" ]; then
+            echo "Skipping bump: master (${latest_sha:0:9}) is '${cmp_status}' relative to ${current_sha:0:9} (fast-forward only)."
             exit 0
           fi
 
@@ -94,13 +100,13 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$branch"
           git add flake.nix flake.lock
-          git commit -m "chore(deps): bump llama.cpp to ${latest_tag} (${latest_sha:0:9})"
+          git commit -m "chore(deps): bump llama.cpp to ${latest_sha:0:9}"
           git push --force-with-lease origin "$branch"
 
           if ! gh pr list --head "$branch" --base main --state open --json number --jq '.[0].number' | grep -q .; then
             gh pr create \
               --base main \
               --head "$branch" \
-              --title "chore(deps): bump llama.cpp to ${latest_tag}" \
-              --body "Automated weekly bump of pinned \`ggml-org/llama.cpp\` in \`flake.nix\`/\`flake.lock\` from \`${current_sha:0:9}\` to \`${latest_sha:0:9}\` (\`${latest_tag}\`). Note: sync the pinned SHA in \`.github/workflows/*.yml\` before merging."
+              --title "chore(deps): bump llama.cpp to ${latest_sha:0:9}" \
+              --body "Automated weekly bump of pinned \`ggml-org/llama.cpp\` in \`flake.nix\`/\`flake.lock\` from \`${current_sha:0:9}\` to \`${latest_sha:0:9}\` (+${ahead_by} commits on \`master\`). Note: sync the pinned SHA in \`.github/workflows/*.yml\` before merging."
           fi
