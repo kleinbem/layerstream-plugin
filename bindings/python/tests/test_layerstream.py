@@ -572,7 +572,7 @@ def test_repeated_load_unload_releases_file_descriptors(synthetic_gguf: Path) ->
         pytest.skip("/proc/self/fd not available on this platform")
 
     def open_fd_count() -> int:
-        return len(os.listdir(fd_dir))
+        return sum(1 for _ in fd_dir.iterdir())
 
     # Warm up once (e.g., backend init / dynamic library handles), then measure delta.
     with AutoModel.from_pretrained(
@@ -610,7 +610,6 @@ def test_repeated_load_unload_releases_file_descriptors(synthetic_gguf: Path) ->
 def test_isolated_worker_parity_and_process_reap(synthetic_gguf: Path) -> None:
     """Verify isolated_worker=True runs in a separate OS process, matches in-process output
     bit-for-bit, supports tokenize/detokenize/kv_trim, and reaps the worker on unload."""
-    import os
 
     with AutoModel.from_pretrained(
         str(synthetic_gguf),
@@ -958,11 +957,10 @@ def test_in_process_openai_and_async_openai_clients(synthetic_json_gguf: Path) -
                 max_tokens=6,
                 stream=True,
             )
-            collected: list[str] = []
             async with astream as s:
-                async for ch in s:
-                    if ch.choices[0].delta.content:
-                        collected.append(ch.choices[0].delta.content)
+                collected = [
+                    ch.choices[0].delta.content async for ch in s if ch.choices[0].delta.content
+                ]
             assert len(collected) > 0
 
             cstream = await aclient.completions.create(
@@ -970,17 +968,14 @@ def test_in_process_openai_and_async_openai_clients(synthetic_json_gguf: Path) -
                 max_tokens=4,
                 stream=True,
             )
-            comp_parts: list[str] = []
             async with cstream as cs:
-                async for item in cs:
-                    comp_parts.append(item.choices[0].text)
+                comp_parts = [item.choices[0].text async for item in cs]
             assert len(comp_parts) > 0
 
     asyncio.run(_run_async())
 
     # Verify isolated worker is reaped when AutoModel is garbage-collected without `.unload()`
     import gc
-    import os
     import time
 
     from layerstream import AutoModel

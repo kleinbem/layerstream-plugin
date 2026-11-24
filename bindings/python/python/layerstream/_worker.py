@@ -182,6 +182,165 @@ class IsolatedWorkerClient:
     def unload(self) -> None:
         self._native.unload()
 
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 256,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        min_p: float = 0.0,
+        top_k: int = 40,
+        repeat_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_last_n: int = 64,
+        seed: int = 42,
+        stop: str | Sequence[str] | None = None,
+        stream: bool = False,
+        ngram_speculation: bool = True,
+        max_draft_tokens: int | None = None,
+        grammar: str | None = None,
+        json_schema: Any = None,
+        return_summary: bool = False,
+    ) -> Any:
+        params = prepare_generate_params(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            repeat_penalty=repeat_penalty,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            penalty_last_n=penalty_last_n,
+            seed=seed,
+            stop=stop,
+            ngram_speculation=ngram_speculation,
+            max_draft_tokens=max_draft_tokens,
+            grammar=grammar,
+            json_schema=json_schema,
+        )
+        if stream:
+            return self.start_stream("generate_stream", params)
+        if return_summary:
+            out, summary = self.rpc_with_summary("generate", params)
+            return str(out["text"]), summary
+        out = self.rpc("generate", params)
+        return str(out["text"])
+
+    def chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        max_tokens: int = 256,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        min_p: float = 0.0,
+        top_k: int = 40,
+        repeat_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_last_n: int = 64,
+        seed: int = 42,
+        stop: str | Sequence[str] | None = None,
+        stream: bool = False,
+        add_generation_prompt: bool = True,
+        ngram_speculation: bool = True,
+        max_draft_tokens: int | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        grammar: str | None = None,
+        json_schema: Any = None,
+        parse_output: bool = False,
+        return_summary: bool = False,
+    ) -> Any:
+        if stream and parse_output:
+            raise ValueError(
+                "parse_output=True cannot be combined with stream=True "
+                "(use StreamTagParser or layerstream.OpenAI)"
+            )
+        params = prepare_chat_params(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            repeat_penalty=repeat_penalty,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            penalty_last_n=penalty_last_n,
+            seed=seed,
+            stop=stop,
+            add_generation_prompt=add_generation_prompt,
+            ngram_speculation=ngram_speculation,
+            max_draft_tokens=max_draft_tokens,
+            tools=tools,
+            grammar=grammar,
+            json_schema=json_schema,
+        )
+        if stream:
+            return self.start_stream("chat_stream", params)
+        params["parse_output"] = parse_output
+        if return_summary:
+            out, summary = self.rpc_with_summary("chat", params)
+            payload = out["parsed"] if parse_output else str(out["text"])
+            return payload, summary
+        out = self.rpc("chat", params)
+        return out["parsed"] if parse_output else str(out["text"])
+
+    def tokenize(
+        self,
+        text: str,
+        *,
+        add_special: bool = False,
+        parse_special: bool = False,
+    ) -> list[int]:
+        res = self.rpc(
+            "tokenize",
+            {"text": text, "add_special": add_special, "parse_special": parse_special},
+        )
+        return list(res["tokens"])
+
+    def detokenize(self, tokens: Sequence[int]) -> str:
+        res = self.rpc("detokenize", {"tokens": [int(t) for t in tokens]})
+        return str(res["text"])
+
+    def apply_chat_template(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        add_generation_prompt: bool = True,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+    ) -> str:
+        clean_msgs = serialize_messages_arg(messages)
+        clean_tools = validate_tools_arg(tools)
+        res = self.rpc(
+            "apply_chat_template",
+            {
+                "messages": clean_msgs,
+                "add_generation_prompt": add_generation_prompt,
+                "tools": clean_tools,
+            },
+        )
+        return str(res["prompt"])
+
+    def kv_clear(self) -> None:
+        self.rpc("kv_clear", {})
+
+    def kv_trim(self, pos_min: int) -> bool:
+        res = self.rpc("kv_trim", {"pos_min": int(pos_min)})
+        return bool(res["trimmed"])
+
+    def save_state(self, path: str) -> int:
+        res = self.rpc("save_state", {"path": path})
+        return int(res["tokens"])
+
+    def load_state(self, path: str) -> int:
+        res = self.rpc("load_state", {"path": path})
+        return int(res["tokens"])
+
 
 def normalize_open_kwargs(
     model: str,

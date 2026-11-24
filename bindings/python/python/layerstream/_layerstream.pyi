@@ -189,8 +189,8 @@ class NativeAutoModel:
         max_draft_tokens: int | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
-        return_summary: Literal[False] = False,
-    ) -> str | TokenStream: ...
+        return_summary: bool = False,
+    ) -> str | TokenStream | tuple[str, dict[str, Any]]: ...
     @overload
     def chat(
         self,
@@ -267,8 +267,8 @@ class NativeAutoModel:
         grammar: str | None = None,
         json_schema: Any = None,
         parse_output: bool = False,
-        return_summary: Literal[False] = False,
-    ) -> str | dict[str, Any] | TokenStream: ...
+        return_summary: bool = False,
+    ) -> str | dict[str, Any] | TokenStream | tuple[str | dict[str, Any], dict[str, Any]]: ...
     def tokenize(
         self,
         text: str,
