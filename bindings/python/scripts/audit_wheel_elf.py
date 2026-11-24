@@ -13,6 +13,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+WARN_WHEEL_BYTES = 90 * 1024 * 1024  # Warn when <10 MiB headroom remains below PyPI 100 MiB cap
 MAX_WHEEL_BYTES = 98 * 1024 * 1024  # PyPI hard cap is 100 MiB
 MAX_GLIBC = (2, 34)
 MAX_GLIBCXX = (3, 4, 29)
@@ -39,10 +40,18 @@ def audit_wheel(wheel_path: Path) -> None:
 
     size = wheel_path.stat().st_size
     size_mib = size / (1024 * 1024)
-    print(f"[audit] {wheel_path.name}: {size_mib:.2f} MiB")
+    headroom_mib = 100.0 - size_mib
+    print(
+        f"[audit] {wheel_path.name}: {size_mib:.2f} MiB ({headroom_mib:.2f} MiB under PyPI 100 MiB cap)"
+    )
     if size > MAX_WHEEL_BYTES:
         raise SystemExit(
             f"ERROR: {wheel_path.name} is {size_mib:.2f} MiB, exceeding PyPI 100 MiB safety limit"
+        )
+    if size > WARN_WHEEL_BYTES:
+        print(
+            f"::warning::{wheel_path.name} is {size_mib:.2f} MiB "
+            f"({headroom_mib:.2f} MiB headroom below PyPI's 100 MiB cap)"
         )
 
     if "-linux_" in wheel_path.name:
