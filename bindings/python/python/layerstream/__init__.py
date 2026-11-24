@@ -69,10 +69,11 @@ def _configure_native_backends() -> list[str]:
     _add(os.environ.get("MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR", "").strip() or None)
 
     with contextlib.suppress(ImportError, OSError):
-        import layerstream_cuda13  # type: ignore[import-not-found]
+        import importlib
 
-        layerstream_cuda13.preload_nvidia_libraries()
-        _add(layerstream_cuda13.backend_dir())
+        cuda_plugin: Any = importlib.import_module("layerstream_cuda13")
+        cuda_plugin.preload_nvidia_libraries()
+        _add(str(cuda_plugin.backend_dir()))
 
     _add(local_backends)
     if dirs:
@@ -110,15 +111,15 @@ from ._layerstream import (  # noqa: E402
     start_server,
 )
 from ._worker import (  # noqa: E402
+    IsolatedWorkerClient as _IsolatedWorkerClient,
     WorkerTokenStream as _WorkerTokenStream,
-    _IsolatedWorkerClient,
     normalize_open_kwargs as _normalize_open_kwargs,
     prepare_chat_params as _prepare_chat_params,
     prepare_generate_params as _prepare_generate_params,
     serialize_messages_arg as _serialize_messages_arg,
     validate_tools_arg as _validate_tools_arg,
 )
-from .openai import AsyncOpenAI, OpenAI, _AsyncStreamMixin  # noqa: E402
+from .openai import AsyncOpenAI, AsyncStreamMixin as _AsyncStreamMixin, OpenAI  # noqa: E402
 
 
 def serve(
@@ -367,7 +368,7 @@ class AutoModel:
         )
         if stream:
             return TokenStream(self._backend.start_stream("generate_stream", params))
-        out = self._backend._rpc("generate", params)
+        out = self._backend.rpc("generate", params)
         return str(out["text"])
 
     def _generate_with_summary(
@@ -382,7 +383,7 @@ class AutoModel:
             return str(text), summary
 
         params = _prepare_generate_params(prompt, **kwargs)
-        out, summary = self._backend._rpc_with_summary("generate", params)
+        out, summary = self._backend.rpc_with_summary("generate", params)
         return str(out["text"]), summary
 
     def chat(
@@ -462,7 +463,7 @@ class AutoModel:
         if stream:
             return TokenStream(self._backend.start_stream("chat_stream", params))
         params["parse_output"] = parse_output
-        out = self._backend._rpc("chat", params)
+        out = self._backend.rpc("chat", params)
         return out["parsed"] if parse_output else str(out["text"])
 
     def _chat_with_summary(
@@ -484,7 +485,7 @@ class AutoModel:
 
         params = _prepare_chat_params(messages, **kwargs)
         params["parse_output"] = parse_output
-        out, summary = self._backend._rpc_with_summary("chat", params)
+        out, summary = self._backend.rpc_with_summary("chat", params)
         payload = out["parsed"] if parse_output else str(out["text"])
         return payload, summary
 
@@ -499,7 +500,7 @@ class AutoModel:
             return self._backend.tokenize(
                 text, add_special=add_special, parse_special=parse_special
             )
-        res = self._backend._rpc(
+        res = self._backend.rpc(
             "tokenize",
             {"text": text, "add_special": add_special, "parse_special": parse_special},
         )
@@ -508,7 +509,7 @@ class AutoModel:
     def detokenize(self, tokens: Sequence[int]) -> str:
         if isinstance(self._backend, _NativeAutoModel):
             return self._backend.detokenize(list(tokens))
-        res = self._backend._rpc("detokenize", {"tokens": [int(t) for t in tokens]})
+        res = self._backend.rpc("detokenize", {"tokens": [int(t) for t in tokens]})
         return str(res["text"])
 
     def apply_chat_template(
@@ -524,7 +525,7 @@ class AutoModel:
             )
         clean_msgs = _serialize_messages_arg(messages)
         clean_tools = _validate_tools_arg(tools)
-        res = self._backend._rpc(
+        res = self._backend.rpc(
             "apply_chat_template",
             {
                 "messages": clean_msgs,
@@ -538,32 +539,32 @@ class AutoModel:
         if isinstance(self._backend, _NativeAutoModel):
             self._backend.kv_clear()
             return
-        self._backend._rpc("kv_clear", {})
+        self._backend.rpc("kv_clear", {})
 
     def kv_trim(self, pos_min: int) -> bool:
         if pos_min < 0:
             raise ValueError("pos_min must be non-negative")
         if isinstance(self._backend, _NativeAutoModel):
             return self._backend.kv_trim(pos_min)
-        res = self._backend._rpc("kv_trim", {"pos_min": int(pos_min)})
+        res = self._backend.rpc("kv_trim", {"pos_min": int(pos_min)})
         return bool(res["trimmed"])
 
     def save_state(self, path: str | PathLike[str]) -> int:
         """Persist KV cache memory and committed token sequence to `path` on disk."""
-        raw_path = os.path.abspath(os.fspath(path))
+        raw_path = os.path.abspath(str(os.fspath(path)))
         if isinstance(self._backend, _NativeAutoModel):
             return int(self._backend.save_state(raw_path))
-        res = self._backend._rpc("save_state", {"path": raw_path})
+        res = self._backend.rpc("save_state", {"path": raw_path})
         return int(res["tokens"])
 
     def load_state(self, path: str | PathLike[str]) -> int:
         """Restore a KV cache snapshot and committed token sequence from `path`."""
-        raw_path = os.path.abspath(os.fspath(path))
+        raw_path = os.path.abspath(str(os.fspath(path)))
         if not os.path.isfile(raw_path):
             raise FileNotFoundError(f"KV state file not found: '{raw_path}'")
         if isinstance(self._backend, _NativeAutoModel):
             return int(self._backend.load_state(raw_path))
-        res = self._backend._rpc("load_state", {"path": raw_path})
+        res = self._backend.rpc("load_state", {"path": raw_path})
         return int(res["tokens"])
 
     def stats(self) -> dict[str, Any]:

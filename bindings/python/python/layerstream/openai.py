@@ -149,16 +149,20 @@ class ModelObject(_OpenAIModel):
     owned_by: str = "layerstream"
 
 
+def _empty_model_list() -> list[ModelObject]:
+    return []
+
+
 @dataclass(slots=True)
 class SyncPage(_OpenAIModel):
-    data: list[ModelObject] = field(default_factory=list)
+    data: list[ModelObject] = field(default_factory=_empty_model_list)
     object: str = "list"
 
     def __iter__(self) -> Iterator[ModelObject]:
         return iter(self.data)
 
 
-class _AsyncStreamMixin[T](Iterator[T], AsyncIterator[T]):
+class AsyncStreamMixin[T](Iterator[T], AsyncIterator[T]):
     """Generic PEP 695 sync + async context-managed stream base."""
 
     def close(self) -> None:
@@ -237,14 +241,17 @@ def _annotation_to_json_schema(tp: Any, field_label: str) -> JsonDict:
         return {"type": "object"}
 
     if isinstance(tp, type):
-        if issubclass(tp, enum.Enum):
-            return {"enum": [member.value for member in tp]}
-        if dataclasses.is_dataclass(tp):
-            return _dataclass_to_json_schema(tp)
-        if hasattr(tp, "model_json_schema"):
-            return dict(tp.model_json_schema())
-        if hasattr(tp, "schema"):
-            return dict(tp.schema())
+        cls = typing.cast(type[Any], tp)
+        if issubclass(cls, enum.Enum):
+            return {"enum": [member.value for member in cls]}
+        if dataclasses.is_dataclass(cls):
+            return _dataclass_to_json_schema(cls)
+        if hasattr(cls, "model_json_schema"):
+            schema_fn: Any = cls.model_json_schema
+            return dict(typing.cast(Mapping[str, Any], schema_fn()))
+        if hasattr(cls, "schema"):
+            schema_fn_v1: Any = cls.schema
+            return dict(typing.cast(Mapping[str, Any], schema_fn_v1()))
 
     origin = get_origin(tp)
     args = get_args(tp)
@@ -304,9 +311,10 @@ def _dataclass_to_json_schema(dc_cls: type[Any]) -> JsonDict:
         if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:
             required.append(f.name)
     try:
-        from pydantic import TypeAdapter  # type: ignore[import-not-found]
+        import importlib
 
-        return dict(TypeAdapter(dc_cls).json_schema())
+        pydantic: Any = importlib.import_module("pydantic")
+        return dict(typing.cast(Mapping[str, Any], pydantic.TypeAdapter(dc_cls).json_schema()))
     except ImportError:
         pass
     return {
@@ -321,10 +329,11 @@ def _coerce_value_for_type(val: Any, tp: Any) -> Any:
     if val is None or isinstance(tp, str):
         return val
     if isinstance(tp, type):
-        if issubclass(tp, enum.Enum):
-            return tp(val)
-        if dataclasses.is_dataclass(tp) and isinstance(val, Mapping):
-            return _instantiate_dataclass(tp, val)
+        cls = typing.cast(type[Any], tp)
+        if issubclass(cls, enum.Enum):
+            return cls(val)
+        if dataclasses.is_dataclass(cls) and isinstance(val, Mapping):
+            return _instantiate_dataclass(cls, typing.cast(Mapping[str, Any], val))
         return val
     origin = get_origin(tp)
     args = get_args(tp)
@@ -338,23 +347,27 @@ def _coerce_value_for_type(val: Any, tp: Any) -> Any:
                 continue
         return val
     if origin in (list, Sequence) and args and isinstance(val, list):
-        return [_coerce_value_for_type(v, args[0]) for v in val]
+        items = typing.cast(list[Any], val)
+        return [_coerce_value_for_type(v, args[0]) for v in items]
     if origin is tuple and isinstance(val, list):
+        items = typing.cast(list[Any], val)
         if len(args) == 2 and args[1] is Ellipsis:
-            return tuple(_coerce_value_for_type(v, args[0]) for v in val)
-        if args and len(args) == len(val):
-            return tuple(_coerce_value_for_type(v, a) for v, a in zip(val, args, strict=True))
-        return tuple(val)
+            return tuple(_coerce_value_for_type(v, args[0]) for v in items)
+        if args and len(args) == len(items):
+            return tuple(_coerce_value_for_type(v, a) for v, a in zip(items, args, strict=True))
+        return tuple(items)
     if origin in (dict, Mapping) and len(args) == 2 and isinstance(val, Mapping):
-        return {k: _coerce_value_for_type(v, args[1]) for k, v in val.items()}
+        mapping = typing.cast(Mapping[Any, Any], val)
+        return {k: _coerce_value_for_type(v, args[1]) for k, v in mapping.items()}
     return val
 
 
 def _instantiate_dataclass(dc_cls: type[Any], data: Mapping[str, Any]) -> Any:
     try:
-        from pydantic import TypeAdapter  # type: ignore[import-not-found]
+        import importlib
 
-        return TypeAdapter(dc_cls).validate_python(data)
+        pydantic: Any = importlib.import_module("pydantic")
+        return pydantic.TypeAdapter(dc_cls).validate_python(data)
     except ImportError:
         pass
 
@@ -371,27 +384,33 @@ def _compile_response_format(response_format: Any) -> tuple[str | None, Any]:
         return None, None
 
     if isinstance(response_format, type):
-        if hasattr(response_format, "model_json_schema") or hasattr(response_format, "schema"):
-            return json_schema_to_gbnf(response_format), response_format
-        if dataclasses.is_dataclass(response_format):
-            schema = _dataclass_to_json_schema(response_format)
-            return json_schema_to_gbnf(schema), response_format
-        raise TypeError(f"unsupported response_format class '{response_format.__name__}'")
+        cls = typing.cast(type[Any], response_format)
+        if hasattr(cls, "model_json_schema") or hasattr(cls, "schema"):
+            return json_schema_to_gbnf(cls), cls
+        if dataclasses.is_dataclass(cls):
+            schema = _dataclass_to_json_schema(cls)
+            return json_schema_to_gbnf(schema), cls
+        raise TypeError(f"unsupported response_format class '{cls.__name__}'")
 
     if isinstance(response_format, Mapping):
-        match response_format.get("type", "text"):
+        rf = typing.cast(Mapping[str, Any], response_format)
+        match rf.get("type", "text"):
             case "text":
                 return None, None
             case "json_object":
                 return json_object_gbnf(), dict
             case "json_schema":
-                inner = response_format.get("json_schema", response_format)
-                schema = inner.get("schema", inner) if isinstance(inner, Mapping) else inner
+                inner: Any = rf.get("json_schema", rf)
+                schema: Any = (
+                    typing.cast(Mapping[str, Any], inner).get("schema", inner)
+                    if isinstance(inner, Mapping)
+                    else inner
+                )
                 if schema is None:
                     raise ValueError("response_format 'json_schema' requires a 'schema' mapping")
                 return json_schema_to_gbnf(schema), dict
             case "gbnf":
-                grammar = response_format.get("grammar")
+                grammar: Any = rf.get("grammar")
                 if not isinstance(grammar, str) or not grammar.strip():
                     raise ValueError("response_format 'gbnf' requires a non-empty 'grammar' string")
                 return grammar, None
@@ -417,7 +436,9 @@ def _parse_structured_text(raw_text: str, parser_target: Any) -> Any:
     if isinstance(parser_target, type) and dataclasses.is_dataclass(parser_target):
         if not isinstance(data, Mapping):
             raise ValueError("expected JSON object for dataclass response_format")
-        return _instantiate_dataclass(parser_target, data)
+        return _instantiate_dataclass(
+            typing.cast(type[Any], parser_target), typing.cast(Mapping[str, Any], data)
+        )
     return data
 
 
@@ -456,7 +477,7 @@ def _merge_extra_body(
     return min_p, top_k, repeat_penalty, penalty_last_n, ngram_speculation, max_draft_tokens
 
 
-class ChatCompletionStream(_AsyncStreamMixin[ChatCompletionChunk]):
+class ChatCompletionStream(AsyncStreamMixin[ChatCompletionChunk]):
     """Synchronous & asynchronous iterator yielding OpenAI `ChatCompletionChunk` events."""
 
     def __init__(
@@ -569,7 +590,7 @@ class ChatCompletionStream(_AsyncStreamMixin[ChatCompletionChunk]):
         return self._pending.pop(0)
 
 
-class CompletionStream(_AsyncStreamMixin[Completion]):
+class CompletionStream(AsyncStreamMixin[Completion]):
     """Synchronous & asynchronous iterator yielding OpenAI `Completion` text chunks."""
 
     def __init__(
@@ -908,8 +929,6 @@ class _ChatCompletionsResource:
             stream=False,
             **kwargs,
         )
-        if not isinstance(resp, ChatCompletion):
-            raise TypeError("expected non-streaming ChatCompletion")
         content = resp.choices[0].message.content or ""
         resp.choices[0].message.parsed = _parse_structured_text(content, parser_target)
         return resp

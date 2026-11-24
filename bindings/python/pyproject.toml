@@ -74,7 +74,7 @@ line-length = 100
 src = ["python", "tests", "scripts"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "S"]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "S", "ASYNC", "BLE", "DTZ"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
@@ -89,6 +89,7 @@ combine-as-imports = true
 pythonVersion = "3.14"
 extraPaths = ["python"]
 include = ["python/layerstream", "tests"]
+strict = ["python/layerstream"]
 typeCheckingMode = "standard"
 reportMissingModuleSource = "none"
 reportUnusedImport = "error"

@@ -118,6 +118,7 @@
                 ruff
                 pyright
                 uv
+                pip-audit
               ]);
 
             LLAMA_CPP_DIR = "${llama-cpp-src}";

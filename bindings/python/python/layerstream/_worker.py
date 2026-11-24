@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import threading
+import typing
 import weakref
 from collections.abc import Iterator, Mapping, Sequence
 from os import PathLike
@@ -69,7 +70,7 @@ def _reap_proc(proc: subprocess.Popen[bytes]) -> None:
 
 
 class _WorkerState:
-    """Low-level IPC & subprocess state owned via `weakref.finalize` on `_IsolatedWorkerClient`."""
+    """Low-level IPC & subprocess state owned via `weakref.finalize` on `IsolatedWorkerClient`."""
 
     def __init__(
         self,
@@ -144,16 +145,22 @@ def _reader_loop(state: _WorkerState, reader_file: Any) -> None:
             state.active_streams.clear()
 
 
+def _copy_mapping(raw: object) -> dict[str, Any] | None:
+    if isinstance(raw, Mapping):
+        return {str(k): v for k, v in typing.cast(Mapping[object, Any], raw).items()}
+    return None
+
+
 class WorkerTokenStream(Iterator[str]):
     """Streaming token iterator backed by an isolated worker subprocess."""
 
     def __init__(
         self,
-        client: _IsolatedWorkerClient,
+        client: IsolatedWorkerClient,
         req_id: int,
         ev_queue: queue.Queue[dict[str, Any]],
     ) -> None:
-        self._client: _IsolatedWorkerClient | None = client
+        self._client: IsolatedWorkerClient | None = client
         self._req_id = req_id
         self._queue = ev_queue
         self._done = False
@@ -191,7 +198,7 @@ class WorkerTokenStream(Iterator[str]):
             client = self._client
             self._client = None
         if client is not None:
-            sum_out = client._cancel_stream(self._req_id, self._queue)
+            sum_out = client.cancel_stream(self._req_id, self._queue)
             if sum_out is not None:
                 with self._lock:
                     self._summary = sum_out
@@ -226,25 +233,25 @@ class WorkerTokenStream(Iterator[str]):
             if kind == "chunk":
                 return str(msg["text"])
             if kind == "done":
-                summary = msg.get("summary")
+                summary = _copy_mapping(msg.get("summary"))
                 with self._lock:
                     self._done = True
-                    self._summary = dict(summary) if isinstance(summary, Mapping) else None
+                    self._summary = summary
                     self._client = None
-                client._finish_stream(self._req_id, summary)
+                client.finish_stream(self._req_id, summary)
                 raise StopIteration
             if kind == "error":
                 with self._lock:
                     self._done = True
                     self._client = None
-                client._finish_stream(self._req_id, None)
+                client.finish_stream(self._req_id, None)
                 raise _file_not_found_or_runtime(
                     str(msg.get("err_type", "RuntimeError")),
                     str(msg.get("message", "worker generation failed")),
                 )
 
 
-class _IsolatedWorkerClient:
+class IsolatedWorkerClient:
     """Parent-side IPC client managing one isolated child `python -m layerstream._worker`."""
 
     def __init__(
@@ -327,7 +334,7 @@ class _IsolatedWorkerClient:
             payload_open = dict(open_kwargs)
             if on_progress is not None:
                 payload_open["_stream_progress"] = True
-            resp, _ = self._rpc_with_summary("open", payload_open, on_progress=on_progress)
+            resp, _ = self.rpc_with_summary("open", payload_open, on_progress=on_progress)
             with state.state_lock:
                 state.loaded = True
                 state.model_path = resp.get("model_path")
@@ -341,11 +348,11 @@ class _IsolatedWorkerClient:
             self._state.next_id += 1
             return rid
 
-    def _rpc(self, op: str, params: dict[str, Any]) -> dict[str, Any]:
-        res, _ = self._rpc_with_summary(op, params)
+    def rpc(self, op: str, params: dict[str, Any]) -> dict[str, Any]:
+        res, _ = self.rpc_with_summary(op, params)
         return res
 
-    def _rpc_with_summary(
+    def rpc_with_summary(
         self,
         op: str,
         params: dict[str, Any],
@@ -406,8 +413,7 @@ class _IsolatedWorkerClient:
                 str(resp.get("err_type", "RuntimeError")),
                 str(resp.get("message", "worker request failed")),
             )
-        raw_sum = resp.get("summary")
-        sum_copy = dict(raw_sum) if isinstance(raw_sum, Mapping) else None
+        sum_copy = _copy_mapping(resp.get("summary"))
         if sum_copy is not None:
             with state.state_lock:
                 state.last_summary = dict(sum_copy)
@@ -432,7 +438,7 @@ class _IsolatedWorkerClient:
             raise
         return WorkerTokenStream(self, req_id, ev_q)
 
-    def _cancel_stream(
+    def cancel_stream(
         self, req_id: int, ev_q: queue.Queue[dict[str, Any]]
     ) -> dict[str, Any] | None:
         state = self._state
@@ -455,16 +461,15 @@ class _IsolatedWorkerClient:
                     except queue.Empty:
                         break
                     if msg.get("event") in ("done", "error"):
-                        raw_sum = msg.get("summary")
-                        captured_summary = dict(raw_sum) if isinstance(raw_sum, Mapping) else None
-                        self._finish_stream(req_id, captured_summary)
+                        captured_summary = _copy_mapping(msg.get("summary"))
+                        self.finish_stream(req_id, captured_summary)
                         break
         finally:
             with state.state_lock:
                 state.active_streams.pop(req_id, None)
         return captured_summary
 
-    def _finish_stream(self, req_id: int, summary: Mapping[str, Any] | None) -> None:
+    def finish_stream(self, req_id: int, summary: Mapping[str, Any] | None) -> None:
         with self._state.state_lock:
             self._state.active_streams.pop(req_id, None)
             if summary is not None:
@@ -499,7 +504,7 @@ class _IsolatedWorkerClient:
     def stats(self) -> dict[str, Any]:
         if not self.is_loaded:
             return {"loaded": False}
-        st = self._rpc("stats", {})
+        st = self.rpc("stats", {})
         st["isolated_worker"] = True
         st["worker_pid"] = self.worker_pid
         return st
@@ -624,9 +629,15 @@ def _normalize_stop_and_grammar(
     if grammar is not None and json_schema is not None:
         raise ValueError("pass at most one of 'grammar' or 'json_schema', not both")
     if stop is not None and not isinstance(stop, str):
-        if not isinstance(stop, Sequence) or not all(isinstance(s, str) for s in stop):
+        raw_stop = typing.cast(object, stop)
+        if not isinstance(raw_stop, Sequence):
             raise TypeError("stop must be None, a string, or a sequence of strings")
-        stop_val: str | list[str] | None = list(stop)
+        stop_items: list[str] = []
+        for s in typing.cast(Sequence[object], raw_stop):
+            if not isinstance(s, str):
+                raise TypeError("stop must be None, a string, or a sequence of strings")
+            stop_items.append(s)
+        stop_val: str | list[str] | None = stop_items
     else:
         stop_val = stop
 
@@ -741,23 +752,26 @@ def prepare_chat_params(
 def validate_tools_arg(tools: Sequence[Mapping[str, Any]] | None) -> list[dict[str, Any]] | None:
     if tools is None:
         return None
-    if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes)):
+    raw_tools = typing.cast(object, tools)
+    if not isinstance(raw_tools, Sequence) or isinstance(raw_tools, (str, bytes)):
         raise TypeError("tools must be a sequence of tool dicts")
     out: list[dict[str, Any]] = []
-    for item in tools:
+    for item in typing.cast(Sequence[object], raw_tools):
         if not isinstance(item, Mapping):
             raise TypeError("each entry in 'tools' must be a dict/mapping")
-        out.append(dict(item))
+        out.append({str(k): v for k, v in typing.cast(Mapping[object, Any], item).items()})
     return out
 
 
 def serialize_messages_arg(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
+    raw_messages = typing.cast(object, messages)
+    if not isinstance(raw_messages, Sequence) or isinstance(raw_messages, (str, bytes)):
         raise TypeError("messages must be an iterable of {'role': str, 'content': str} dicts")
     out: list[dict[str, Any]] = []
-    for item in messages:
-        if not isinstance(item, Mapping):
+    for raw_item in typing.cast(Sequence[object], raw_messages):
+        if not isinstance(raw_item, Mapping):
             raise TypeError("each message must be a mapping")
+        item = typing.cast(Mapping[str, Any], raw_item)
         if "role" not in item:
             raise ValueError("each message must contain a 'role' string")
         role = item["role"]
@@ -997,7 +1011,7 @@ def _run_worker_main(port: int) -> int:
                     )
                 else:
                     raise ValueError(f"unknown worker op '{op}'")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — top-level worker RPC dispatch boundary
                 err_name = type(exc).__name__
                 if op in ("generate_stream", "chat_stream"):
                     _send_json_line(
