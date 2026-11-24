@@ -683,6 +683,8 @@ class _ModelManager:
             owned_models = [self._models[k] for k in self._owned if k in self._models]
             for k in list(self._owned):
                 self._models.pop(k, None)
+            if self._default_id in self._owned:
+                self._default_id = None
             self._owned.clear()
         for inst in owned_models:
             inst.unload()

@@ -21,7 +21,7 @@ use layerstream_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::parse::{
     IncomingChatMessage, StreamDelta, StreamTagParser, inject_tools_into_messages,
@@ -612,7 +612,7 @@ fn emit_stream_deltas(
     req_id: &str,
     created: u64,
     model: &str,
-    tx: &mpsc::UnboundedSender<Result<Event, Infallible>>,
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) -> bool {
     for d in deltas {
         let delta_json = match d {
@@ -648,7 +648,7 @@ fn emit_stream_deltas(
             }]
         });
         if tx
-            .send(Ok(Event::default().data(chunk.to_string())))
+            .blocking_send(Ok(Event::default().data(chunk.to_string())))
             .is_err()
         {
             return false;
@@ -741,7 +741,7 @@ async fn chat_completions(
     let model_id = entry.id.clone();
 
     if req.stream {
-        let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+        let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
         let cancelled = Arc::new(AtomicBool::new(state.shutdown.load(Ordering::SeqCst)));
         let cancel_worker = cancelled.clone();
         let state_bg = state.clone();
@@ -777,7 +777,8 @@ async fn chat_completions(
                         tracing::error!("model load error: {err:#}");
                         let err_chunk =
                             json!({"error": {"message": format!("{err:#}"), "type": "server_error"}});
-                        let _ = tx_stream.send(Ok(Event::default().data(err_chunk.to_string())));
+                        let _ = tx_stream
+                            .blocking_send(Ok(Event::default().data(err_chunk.to_string())));
                         return;
                     }
                 };
@@ -788,7 +789,8 @@ async fn chat_completions(
                         tracing::error!("chat template error: {err:#}");
                         let err_chunk =
                             json!({"error": {"message": format!("{err:#}"), "type": "server_error"}});
-                        let _ = tx_stream.send(Ok(Event::default().data(err_chunk.to_string())));
+                        let _ = tx_stream
+                            .blocking_send(Ok(Event::default().data(err_chunk.to_string())));
                         return;
                     }
                 };
@@ -806,7 +808,7 @@ async fn chat_completions(
                     }]
                 });
                 if tx_stream
-                    .send(Ok(Event::default().data(role_chunk.to_string())))
+                    .blocking_send(Ok(Event::default().data(role_chunk.to_string())))
                     .is_err()
                 {
                     return;
@@ -874,8 +876,8 @@ async fn chat_completions(
                                     "total_tokens": summary.prompt_tokens + summary.completion_tokens,
                                 }
                             });
-                            let _ =
-                                tx_stream.send(Ok(Event::default().data(final_chunk.to_string())));
+                            let _ = tx_stream
+                                .blocking_send(Ok(Event::default().data(final_chunk.to_string())));
                             true
                         }
                     }
@@ -888,19 +890,20 @@ async fn chat_completions(
                             "server_error"
                         };
                         let err_chunk = json!({"error": {"message": format!("{err:#}"), "type": kind}});
-                        let _ = tx_stream.send(Ok(Event::default().data(err_chunk.to_string())));
+                        let _ = tx_stream
+                            .blocking_send(Ok(Event::default().data(err_chunk.to_string())));
                         false
                     }
                 };
                 if finish {
-                    let _ = tx_stream.send(Ok(Event::default().data("[DONE]")));
+                    let _ = tx_stream.blocking_send(Ok(Event::default().data("[DONE]")));
                 }
             })
             .await;
         });
 
         let guard = Arc::new(CancelOnDrop(cancelled));
-        let stream = tokio_stream::StreamExt::map(UnboundedReceiverStream::new(rx), move |ev| {
+        let stream = tokio_stream::StreamExt::map(ReceiverStream::new(rx), move |ev| {
             let _keep_guard = &guard;
             ev
         });
@@ -1062,7 +1065,7 @@ async fn text_completions(
     let model_id = entry.id.clone();
 
     if req.stream {
-        let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+        let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
         let cancelled = Arc::new(AtomicBool::new(state.shutdown.load(Ordering::SeqCst)));
         let cancel_worker = cancelled.clone();
         let state_bg = state.clone();
@@ -1099,7 +1102,8 @@ async fn text_completions(
                         tracing::error!("model load error: {err:#}");
                         let err_chunk =
                             json!({"error": {"message": format!("{err:#}"), "type": "server_error"}});
-                        let _ = tx_stream.send(Ok(Event::default().data(err_chunk.to_string())));
+                        let _ = tx_stream
+                            .blocking_send(Ok(Event::default().data(err_chunk.to_string())));
                         return;
                     }
                 };
@@ -1124,7 +1128,7 @@ async fn text_completions(
                             }]
                         });
                         tx_stream
-                            .send(Ok(Event::default().data(chunk.to_string())))
+                            .blocking_send(Ok(Event::default().data(chunk.to_string())))
                             .is_ok()
                     },
                 ) {
@@ -1140,8 +1144,9 @@ async fn text_completions(
                                 "finish_reason": summary.finish_reason,
                             }]
                         });
-                        let _ = tx_stream.send(Ok(Event::default().data(final_chunk.to_string())));
-                        let _ = tx_stream.send(Ok(Event::default().data("[DONE]")));
+                        let _ = tx_stream
+                            .blocking_send(Ok(Event::default().data(final_chunk.to_string())));
+                        let _ = tx_stream.blocking_send(Ok(Event::default().data("[DONE]")));
                     }
                     Ok(_) => {}
                     Err(err) if err.downcast_ref::<CancelledError>().is_some() => {}
@@ -1153,7 +1158,8 @@ async fn text_completions(
                             "server_error"
                         };
                         let err_chunk = json!({"error": {"message": format!("{err:#}"), "type": kind}});
-                        let _ = tx_stream.send(Ok(Event::default().data(err_chunk.to_string())));
+                        let _ = tx_stream
+                            .blocking_send(Ok(Event::default().data(err_chunk.to_string())));
                     }
                 }
             })
@@ -1161,7 +1167,7 @@ async fn text_completions(
         });
 
         let guard = Arc::new(CancelOnDrop(cancelled));
-        let stream = tokio_stream::StreamExt::map(UnboundedReceiverStream::new(rx), move |ev| {
+        let stream = tokio_stream::StreamExt::map(ReceiverStream::new(rx), move |ev| {
             let _keep_guard = &guard;
             ev
         });

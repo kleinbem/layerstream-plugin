@@ -449,19 +449,28 @@ class ModelManager {
     }
 
     let firstError = null;
-    for (const key of [...this._owned]) {
-      try {
+    while (this._owned.size > 0) {
+      const keys = [...this._owned];
+      for (const key of keys) {
         const inst = this._models.get(key);
-        if (inst) {
-          await inst.unload();
-        }
-        this._models.delete(key);
         this._owned.delete(key);
+        if (this._models.get(key) === inst) {
+          this._models.delete(key);
+        }
         if (this._defaultId === key) {
           this._defaultId = null;
         }
-      } catch (err) {
-        firstError ??= err;
+        try {
+          if (inst) {
+            await inst.unload();
+          }
+        } catch (err) {
+          firstError ??= err;
+        }
+      }
+      while (this._initPromise || this._loadingModels.size > 0) {
+        const pending = [this._initPromise, ...this._loadingModels.values()].filter(Boolean);
+        await Promise.allSettled(pending);
       }
     }
     if (firstError) {
