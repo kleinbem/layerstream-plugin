@@ -761,3 +761,103 @@ fn compiles_oneof_discriminated_unions_number_xor_int_and_allof_distribution() {
     .unwrap();
     assert_all_gbnf_rules_defined(&one_sided_obj);
 }
+
+#[test]
+fn covers_array_string_object_ref_and_validation_edge_cases() {
+    // Array edge cases: exact count, unbounded min, empty-only, prefixItems + extra required tail,
+    // prefixItems with `false` element, prefixItems longer than maxItems, items: false + minItems: 1.
+    for schema in [
+        json!({"type": "array", "items": {"type": "integer"}, "minItems": 0, "maxItems": 0}),
+        json!({"type": "array", "items": {"type": "integer"}, "minItems": 2}),
+        json!({"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}),
+        json!({"type": "array", "items": {"type": "integer"}, "maxItems": 3}),
+        json!({
+            "type": "array",
+            "prefixItems": [{"type": "string"}],
+            "items": {"type": "integer"},
+            "minItems": 3,
+            "maxItems": 4
+        }),
+        json!({
+            "type": "array",
+            "prefixItems": [{"type": "string"}, false],
+            "items": {"type": "integer"}
+        }),
+        json!({
+            "type": "array",
+            "prefixItems": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}],
+            "maxItems": 2
+        }),
+        json!({
+            "type": "array",
+            "prefixItems": [{"type": "string"}],
+            "items": false,
+            "minItems": 0,
+            "maxItems": 1
+        }),
+    ] {
+        let g = json_schema_to_gbnf(&schema).unwrap();
+        assert_all_gbnf_rules_defined(&g);
+    }
+    assert!(json_schema_to_gbnf(&json!({"type": "array", "items": false, "minItems": 1})).is_err());
+
+    // String length edge cases: min-only, max-only, exact 0.
+    for schema in [
+        json!({"type": "string", "minLength": 2}),
+        json!({"type": "string", "maxLength": 4}),
+        json!({"type": "string", "minLength": 0, "maxLength": 0}),
+    ] {
+        let g = json_schema_to_gbnf(&schema).unwrap();
+        assert_all_gbnf_rules_defined(&g);
+    }
+
+    // Object edge cases: optional-only with additionalProperties: true, optional false property,
+    // unsatisfiable additionalProperties without properties, required false property, invalid types.
+    for schema in [
+        json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": false},
+            "additionalProperties": true
+        }),
+        json!({
+            "type": "object",
+            "additionalProperties": {"allOf": [false]}
+        }),
+    ] {
+        let g = json_schema_to_gbnf(&schema).unwrap();
+        assert_all_gbnf_rules_defined(&g);
+    }
+
+    // `$ref` with sibling constraints + chained refs.
+    let ref_sibling = json_schema_to_gbnf(&json!({
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"type": "string", "minLength": 2}
+        },
+        "$ref": "#/$defs/A",
+        "maxLength": 5
+    }))
+    .unwrap();
+    assert!(ref_sibling.contains("json-char{2,5}"));
+    assert_all_gbnf_rules_defined(&ref_sibling);
+
+    // Error paths: invalid properties/additionalProperties/required/type/enum/anyOf/allOf/ref-index.
+    for bad in [
+        json!({"type": "object", "properties": 42}),
+        json!({"type": "object", "additionalProperties": 42}),
+        json!({"type": "object", "properties": {"a": {"type": "integer"}}, "additionalProperties": 42}),
+        json!({"type": "object", "properties": {"a": false}, "required": ["a"]}),
+        json!({"type": "object", "required": [123]}),
+        json!({"type": 42}),
+        json!({"type": "bogus"}),
+        json!({"enum": []}),
+        json!({"anyOf": []}),
+        json!({"allOf": []}),
+        json!({"anyOf": [{"type": "string"}], "$ref": "#/anyOf/99"}),
+    ] {
+        assert!(
+            json_schema_to_gbnf(&bad).is_err(),
+            "expected error for {bad}"
+        );
+    }
+}

@@ -1136,6 +1136,278 @@ fn download_handles_416_range_mismatch_etag_change_truncation_sha_mismatch_and_r
     server.join().unwrap();
 }
 
+#[test]
+fn covers_env_cache_dirs_hub_cache_hit_tokens_reentry_and_resume_edge_cases() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // 1. `default_cache_dir` env priority: LAYERSTREAM_CACHE_DIR -> XDG_CACHE_HOME -> HOME.
+    let saved_lc = std::env::var_os("LAYERSTREAM_CACHE_DIR");
+    let saved_xdg = std::env::var_os("XDG_CACHE_HOME");
+    let saved_hf_hub = std::env::var_os("HF_HUB_CACHE");
+    let saved_hf_home = std::env::var_os("HF_HOME");
+    let saved_hf_tok = std::env::var_os("HF_TOKEN");
+    let saved_hub_tok = std::env::var_os("HUGGING_FACE_HUB_TOKEN");
+
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe {
+        std::env::set_var("LAYERSTREAM_CACHE_DIR", tmp.path().join("custom-lc"));
+    }
+    assert_eq!(default_cache_dir(), tmp.path().join("custom-lc"));
+
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe {
+        std::env::remove_var("LAYERSTREAM_CACHE_DIR");
+        std::env::set_var("XDG_CACHE_HOME", tmp.path().join("xdg"));
+    }
+    assert_eq!(
+        default_cache_dir(),
+        tmp.path().join("xdg").join("layerstream").join("models")
+    );
+
+    // 2. `load_hf_token` via HF_TOKEN, HUGGING_FACE_HUB_TOKEN, and $HF_HOME/token file.
+    let hf_home = tmp.path().join("hf-home");
+    fs::create_dir_all(&hf_home).unwrap();
+    fs::write(hf_home.join("token"), "file-tok-123\n").unwrap();
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe {
+        std::env::set_var("HF_HOME", &hf_home);
+        std::env::set_var("HF_TOKEN", "env-tok-1");
+    }
+    assert_eq!(load_hf_token().as_deref(), Some("env-tok-1"));
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe {
+        std::env::remove_var("HF_TOKEN");
+        std::env::set_var("HUGGING_FACE_HUB_TOKEN", "env-tok-2");
+    }
+    assert_eq!(load_hf_token().as_deref(), Some("env-tok-2"));
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe {
+        std::env::remove_var("HUGGING_FACE_HUB_TOKEN");
+    }
+    assert_eq!(load_hf_token().as_deref(), Some("file-tok-123"));
+
+    // 3. `hf_hub_cache_roots` + `ensure_hf_downloaded_with_progress` hitting HF Hub cache directly,
+    //    plus `resolve_model_spec` (`alias=hf://...` and `hf://...`) and `is_model_spec_cached`.
+    let hub_cache = tmp.path().join("hub-cache");
+    let sha = "1234567890abcdef1234567890abcdef12345678";
+    let snap = hub_cache
+        .join("models--Org--CachedRepo")
+        .join("snapshots")
+        .join(sha);
+    let refs = hub_cache.join("models--Org--CachedRepo").join("refs");
+    fs::create_dir_all(&snap).unwrap();
+    fs::create_dir_all(&refs).unwrap();
+    fs::write(refs.join("main"), format!("{sha}\n")).unwrap();
+    fs::write(refs.join("badref"), "../escape\n").unwrap();
+    let hub_gguf = snap.join("m.gguf");
+    fs::write(&hub_gguf, b"GGUF_HUB_CACHED").unwrap();
+
+    // Invalid ref path and invalid ref contents return None cleanly.
+    let bad_rev_spec = HfSpec {
+        repo_id: "Org/CachedRepo".into(),
+        filename: "m.gguf".into(),
+        revision: "../bad".into(),
+    };
+    assert!(
+        find_shards_in_hf_hub_root(
+            &bad_rev_spec,
+            std::slice::from_ref(&bad_rev_spec),
+            &hub_cache
+        )
+        .is_none()
+    );
+    let bad_ref_content = HfSpec {
+        repo_id: "Org/CachedRepo".into(),
+        filename: "m.gguf".into(),
+        revision: "badref".into(),
+    };
+    assert!(
+        find_shards_in_hf_hub_root(
+            &bad_ref_content,
+            std::slice::from_ref(&bad_ref_content),
+            &hub_cache
+        )
+        .is_none()
+    );
+
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe {
+        std::env::set_var("HF_HUB_CACHE", &hub_cache);
+    }
+    let empty_cache = tmp.path().join("ls-cache");
+    let uri = "hf://Org/CachedRepo:m.gguf";
+    assert!(is_model_spec_cached(
+        &format!("myalias={uri}"),
+        &empty_cache
+    ));
+    let hit_cb_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hit_flag = hit_cb_called.clone();
+    let cb: ProgressCallback = Arc::new(move |ev| {
+        assert!(ev.cached && ev.done);
+        hit_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    });
+    let resolved = ensure_hf_downloaded_with_progress(uri, &empty_cache, Some(&cb)).unwrap();
+    assert_eq!(resolved, hub_gguf);
+    assert!(hit_cb_called.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        resolve_model_spec(&format!("myalias={uri}"), &empty_cache).unwrap(),
+        format!("myalias={}", hub_gguf.display())
+    );
+    assert_eq!(
+        resolve_model_spec(uri, &empty_cache).unwrap(),
+        hub_gguf.to_string_lossy()
+    );
+    assert_eq!(resolve_path_or_hf(uri, &empty_cache).unwrap(), hub_gguf);
+    assert!(!is_path_or_hf_cached("hf://bad", &empty_cache));
+
+    // 4. Mock server for mismatched Content-Range restart, weak ETag discard, relative redirect,
+    //    Authorization header forwarding, and re-entrant progress-callback deadlock guard.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = b"GGUF_CONTENT_RANGE_AND_REENTRY_TEST".to_vec();
+    let body_srv = body.clone();
+    let saw_auth = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let auth_srv = saw_auth.clone();
+
+    let server = std::thread::spawn(move || {
+        for stream_res in listener.incoming() {
+            let Ok(mut stream) = stream_res else { break };
+            let mut req_buf = [0u8; 4096];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let req = String::from_utf8_lossy(&req_buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("");
+            let lower = req.to_ascii_lowercase();
+            let has_range = lower.contains("\nrange:");
+            if lower.contains("authorization: bearer file-tok-123") {
+                auth_srv.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            if path.ends_with("/__stop") {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                break;
+            } else if path.ends_with("/badcr.gguf") {
+                if has_range {
+                    // Return mismatched Content-Range start (99 != 5) -> client restarts from byte 0.
+                    let hdr = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 99-110/200\r\nContent-Length: 12\r\nConnection: close\r\n\r\n123456789012";
+                    let _ = stream.write_all(hdr.as_bytes());
+                } else {
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body_srv.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&body_srv);
+                }
+            } else if path.ends_with("/rel_redir.gguf") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /o/r/resolve/main/final_rel.gguf\r\nContent-Length: 0\r\n\r\n",
+                );
+            } else if path.ends_with("/final_rel.gguf") || path.ends_with("/reentry.gguf") {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body_srv.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(&body_srv);
+            }
+        }
+    });
+
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe {
+        std::env::set_var("HF_ENDPOINT", format!("http://{addr}"));
+    }
+
+    // Mismatched Content-Range on resume restarts cleanly from byte 0.
+    let spec_cr = HfSpec::parse("hf://o/r:badcr.gguf").unwrap();
+    let dest_cr = spec_cr.cache_path(&empty_cache);
+    fs::create_dir_all(dest_cr.parent().unwrap()).unwrap();
+    fs::write(part_path_for(&dest_cr), b"12345").unwrap();
+    write_part_meta(
+        &meta_path_for(&dest_cr),
+        &PartMeta {
+            etag: Some("\"strong-etag\"".into()),
+            sha256: None,
+        },
+    );
+    let p_cr = ensure_hf_downloaded("hf://o/r:badcr.gguf", &empty_cache).unwrap();
+    assert_eq!(fs::read(&p_cr).unwrap(), body);
+    assert!(saw_auth.load(std::sync::atomic::Ordering::SeqCst));
+
+    // Weak ETag partial without SHA-256 is discarded and restarted via relative redirect.
+    let spec_rel = HfSpec::parse("hf://o/r:rel_redir.gguf").unwrap();
+    let dest_rel = spec_rel.cache_path(&empty_cache);
+    fs::write(part_path_for(&dest_rel), b"weak-stale").unwrap();
+    write_part_meta(
+        &meta_path_for(&dest_rel),
+        &PartMeta {
+            etag: Some("W/\"weak\"".into()),
+            sha256: None,
+        },
+    );
+    let p_rel = ensure_hf_downloaded("hf://o/r:rel_redir.gguf", &empty_cache).unwrap();
+    assert_eq!(fs::read(&p_rel).unwrap(), body);
+
+    // Re-entrant download from inside progress callback fails closed instead of deadlocking.
+    let reentry_cache = empty_cache.clone();
+    let reentry_cb: ProgressCallback = Arc::new(move |_ev| {
+        ensure_hf_downloaded("hf://o/r:reentry.gguf", &reentry_cache).map(|_| ())
+    });
+    let reentry_err = ensure_hf_downloaded_with_progress(
+        "hf://o/r:reentry.gguf",
+        &empty_cache,
+        Some(&reentry_cb),
+    )
+    .unwrap_err();
+    assert!(matches!(reentry_err, HfError::DownloadFailed(_)));
+    assert!(reentry_err.to_string().contains("re-entrant"));
+
+    let _ = ureq::get(&format!("http://{addr}/__stop")).call();
+    server.join().unwrap();
+
+    // Restore all modified environment variables.
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe {
+        std::env::remove_var("HF_ENDPOINT");
+        match saved_lc {
+            Some(v) => std::env::set_var("LAYERSTREAM_CACHE_DIR", v),
+            None => std::env::remove_var("LAYERSTREAM_CACHE_DIR"),
+        }
+        match saved_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match saved_hf_hub {
+            Some(v) => std::env::set_var("HF_HUB_CACHE", v),
+            None => std::env::remove_var("HF_HUB_CACHE"),
+        }
+        match saved_hf_home {
+            Some(v) => std::env::set_var("HF_HOME", v),
+            None => std::env::remove_var("HF_HOME"),
+        }
+        match saved_hf_tok {
+            Some(v) => std::env::set_var("HF_TOKEN", v),
+            None => std::env::remove_var("HF_TOKEN"),
+        }
+        match saved_hub_tok {
+            Some(v) => std::env::set_var("HUGGING_FACE_HUB_TOKEN", v),
+            None => std::env::remove_var("HUGGING_FACE_HUB_TOKEN"),
+        }
+    }
+}
+
 fn make_sparse_gguf(path: &Path, arch: &str, tokens: &[&str], sparse_size: u64) {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"GGUF");

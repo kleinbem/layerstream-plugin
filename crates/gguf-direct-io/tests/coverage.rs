@@ -167,3 +167,50 @@ fn storage_probes_handle_tiny_missing_and_empty_directories() {
     let (mib_s, _) = probe_storage_mib_per_s(&big, true).unwrap();
     assert!(mib_s >= 0.0);
 }
+
+#[test]
+fn large_layer_read_exercises_parallel_span_and_negative_cached_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard_path = dir.path().join("big_layer.gguf");
+    let tensor_bytes = 5 * 1024 * 1024; // > 4 MiB PARALLEL_READ_MIN_BYTES
+    let mut payload = vec![0u8; tensor_bytes + 8192];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = ((i * 7) ^ (i >> 11)) as u8;
+    }
+    std::fs::write(&shard_path, &payload).unwrap();
+
+    let mut tensors = HashMap::new();
+    tensors.insert(
+        "blk.0.big".to_string(),
+        TensorLocation {
+            name: "blk.0.big".to_string(),
+            shard_idx: 0,
+            abs_offset: 4096,
+            ggml_type: 0,
+            dims: vec![(tensor_bytes / 4) as u64],
+        },
+    );
+    let index = GgufIndex {
+        meta: ModelMeta {
+            architecture: "llama".to_string(),
+            name: None,
+            n_layers: 1,
+            context_length: None,
+            total_file_bytes: payload.len() as u64,
+        },
+        shards: vec![shard_path],
+        shard_sizes: vec![payload.len() as u64],
+        tensors,
+    };
+    let pool = LayerIoPool::new(index, true).unwrap();
+    assert!(!pool.load_cached_layer_into(-1, &mut []).unwrap());
+
+    let mut dst = vec![0u8; tensor_bytes];
+    pool.load_layer_tensors_into(0, &[("blk.0.big", 0, tensor_bytes)], &mut dst)
+        .unwrap();
+    assert_eq!(&dst[..4096], &payload[4096..8192]);
+    assert_eq!(
+        &dst[tensor_bytes - 4096..],
+        &payload[4096 + tensor_bytes - 4096..4096 + tensor_bytes]
+    );
+}
