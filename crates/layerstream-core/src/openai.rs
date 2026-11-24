@@ -88,15 +88,16 @@ pub fn compile_response_format(
         }),
         Some("json_schema") => {
             let schema = if let Some(inner) = obj.get("json_schema") {
-                if let Some(inner_obj) = inner.as_object() {
-                    inner_obj.get("schema").unwrap_or(inner)
-                } else {
+                let Some(inner_obj) = inner.as_object() else {
                     bail!("response_format.json_schema must be an object");
-                }
+                };
+                inner_obj.get("schema").ok_or_else(|| {
+                    anyhow::anyhow!("response_format 'json_schema' requires an explicit 'schema'")
+                })?
             } else if let Some(s) = obj.get("schema") {
                 s
             } else {
-                bail!("response_format 'json_schema' requires a 'schema' object");
+                bail!("response_format 'json_schema' requires an explicit 'schema'");
             };
             if schema.is_null() {
                 bail!("response_format 'json_schema' requires a non-null 'schema'");
@@ -181,6 +182,13 @@ mod tests {
         assert!(compile_response_format(&json!({"type": "bogus"}), false).is_err());
         assert!(compile_response_format(&json!({"type": "gbnf", "grammar": "  "}), false).is_err());
         assert!(compile_response_format(&json!({"type": "json_schema"}), false).is_err());
+        assert!(
+            compile_response_format(
+                &json!({"type": "json_schema", "json_schema": {"name": "missing"}}),
+                true,
+            )
+            .is_err()
+        );
     }
 
     #[test]

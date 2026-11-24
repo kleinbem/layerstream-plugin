@@ -73,7 +73,12 @@ function compileResponseFormat(responseFormat) {
         validator = (raw) => fn(JSON.parse(raw));
       }
     }
-    const compiled = native.compileResponseFormat(JSON.stringify(responseFormat), true);
+    let compiled;
+    try {
+      compiled = native.compileResponseFormat(JSON.stringify(responseFormat), true);
+    } catch (err) {
+      throw new RangeError(err?.message || String(err));
+    }
     return {
       grammar: compiled.grammar ?? undefined,
       parser: compiled.expectsJson ? validator : null,
