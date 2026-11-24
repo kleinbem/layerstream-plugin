@@ -1461,19 +1461,23 @@ impl Drop for GrammarHandle {
     }
 }
 
-pub(crate) struct CancelCbGuard {
+pub(crate) struct CancelCbGuard<'a> {
     raw: NonNull<LsEngine>,
     installed: bool,
+    _flag: std::marker::PhantomData<Option<&'a AtomicBool>>,
 }
 
 impl StreamEngine {
-    pub(crate) fn install_cancel_cb(&self, cancel: Option<&AtomicBool>) -> CancelCbGuard {
+    pub(crate) fn install_cancel_cb<'a>(
+        &self,
+        cancel: Option<&'a AtomicBool>,
+    ) -> CancelCbGuard<'a> {
         CancelCbGuard::install(self.raw, cancel)
     }
 }
 
-impl CancelCbGuard {
-    fn install(raw: NonNull<LsEngine>, cancel: Option<&AtomicBool>) -> Self {
+impl<'a> CancelCbGuard<'a> {
+    fn install(raw: NonNull<LsEngine>, cancel: Option<&'a AtomicBool>) -> Self {
         if let Some(flag) = cancel {
             unsafe {
                 ls_engine_set_cancel_cb(
@@ -1485,17 +1489,19 @@ impl CancelCbGuard {
             Self {
                 raw,
                 installed: true,
+                _flag: std::marker::PhantomData,
             }
         } else {
             Self {
                 raw,
                 installed: false,
+                _flag: std::marker::PhantomData,
             }
         }
     }
 }
 
-impl Drop for CancelCbGuard {
+impl Drop for CancelCbGuard<'_> {
     fn drop(&mut self) {
         if self.installed {
             unsafe { ls_engine_set_cancel_cb(self.raw.as_ptr(), None, std::ptr::null()) };

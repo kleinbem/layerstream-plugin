@@ -371,52 +371,20 @@ fn lock_path_for(dest: &Path) -> PathBuf {
 
 struct PartLock {
     _file: File,
-    #[cfg(not(unix))]
-    path: PathBuf,
 }
 
 impl PartLock {
     fn acquire(lock_path: &Path) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(lock_path)
-                .with_context(|| format!("open download lock {}", lock_path.display()))?;
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc != 0 {
-                bail!(
-                    "failed to acquire flock on {}: {}",
-                    lock_path.display(),
-                    std::io::Error::last_os_error()
-                );
-            }
-            Ok(Self { _file: file })
-        }
-        #[cfg(not(unix))]
-        {
-            let file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(lock_path)
-                .with_context(|| format!("open download lock {}", lock_path.display()))?;
-            Ok(Self {
-                _file: file,
-                path: lock_path.to_path_buf(),
-            })
-        }
-    }
-}
-
-#[cfg(not(unix))]
-impl Drop for PartLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)
+            .with_context(|| format!("open download lock {}", lock_path.display()))?;
+        file.lock()
+            .with_context(|| format!("acquire exclusive lock on {}", lock_path.display()))?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -1327,18 +1295,57 @@ pub fn group_gguf_tree_entries(entries: &[HfTreeEntry]) -> Vec<HfGgufCandidate> 
     out
 }
 
-/// Fetches the recursive file tree of a Hugging Face repo and returns logical GGUF checkpoints.
+/// Parses RFC 8288 `Link` header(s) and returns the `rel="next"` target URL, if present.
+fn parse_next_link_url(headers: &ureq::http::HeaderMap, base_url: &str) -> Option<String> {
+    for val in headers.get_all("link") {
+        let Ok(raw) = val.to_str() else {
+            continue;
+        };
+        for part in raw.split(',') {
+            let mut segs = part.split(';').map(str::trim);
+            let Some(url_part) = segs.next() else {
+                continue;
+            };
+            let is_next = segs.any(|p| {
+                p.eq_ignore_ascii_case("rel=\"next\"") || p.eq_ignore_ascii_case("rel=next")
+            });
+            if !is_next {
+                continue;
+            }
+            let target = url_part
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .trim();
+            if target.is_empty() {
+                continue;
+            }
+            if target.starts_with("http://") || target.starts_with("https://") {
+                return Some(target.to_string());
+            }
+            if target.starts_with('/')
+                && let Some(origin) = url_origin(base_url)
+            {
+                return Some(format!("{origin}{target}"));
+            }
+        }
+    }
+    None
+}
+
+/// Fetches the recursive file tree of a Hugging Face repo (following `Link: rel="next"`
+/// pagination on the configured Hub origin) and returns logical GGUF checkpoints.
 pub fn list_hf_gguf_candidates(repo_id: &str, revision: &str) -> Result<Vec<HfGgufCandidate>> {
     let endpoint = std::env::var("HF_ENDPOINT")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_HF_ENDPOINT.to_string());
-    let url = format!(
+    let initial_url = format!(
         "{}/api/models/{}/tree/{}?recursive=true",
         endpoint.trim_end_matches('/'),
         repo_id,
         revision
     );
+    let initial_origin = url_origin(&initial_url);
 
     let agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
@@ -1347,25 +1354,45 @@ pub fn list_hf_gguf_candidates(repo_id: &str, revision: &str) -> Result<Vec<HfGg
         .build()
         .new_agent();
 
-    let mut req = agent.get(&url).header("User-Agent", "layerstream-plugin");
-    if let Some(tok) = load_hf_token() {
-        req = req.header("Authorization", &format!("Bearer {tok}"));
-    }
+    let token = load_hf_token();
+    let mut next_url = Some(initial_url);
+    let mut all_entries: Vec<HfTreeEntry> = Vec::new();
+    const MAX_TREE_PAGES: usize = 32;
 
-    let resp = req
-        .call()
-        .with_context(|| format!("query Hugging Face API {url}"))?;
-    let status = resp.status().as_u16();
-    if status != 200 {
-        bail!("Hugging Face API returned HTTP {status} for {repo_id}@{revision} ({url})");
+    for _ in 0..MAX_TREE_PAGES {
+        let Some(url) = next_url.take() else {
+            break;
+        };
+        let mut req = agent.get(&url).header("User-Agent", "layerstream-plugin");
+        if let Some(ref tok) = token
+            && url_origin(&url) == initial_origin
+        {
+            req = req.header("Authorization", &format!("Bearer {tok}"));
+        }
+
+        let resp = req
+            .call()
+            .with_context(|| format!("query Hugging Face API {url}"))?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            bail!("Hugging Face API returned HTTP {status} for {repo_id}@{revision} ({url})");
+        }
+        let candidate_next = parse_next_link_url(resp.headers(), &url);
+        let body = resp
+            .into_body()
+            .read_to_string()
+            .context("read Hugging Face tree JSON")?;
+        let page_entries: Vec<HfTreeEntry> =
+            serde_json::from_str(&body).context("parse Hugging Face tree JSON")?;
+        all_entries.extend(page_entries);
+
+        if let Some(nu) = candidate_next
+            && url_origin(&nu) == initial_origin
+        {
+            next_url = Some(nu);
+        }
     }
-    let body = resp
-        .into_body()
-        .read_to_string()
-        .context("read Hugging Face tree JSON")?;
-    let entries: Vec<HfTreeEntry> =
-        serde_json::from_str(&body).context("parse Hugging Face tree JSON")?;
-    Ok(group_gguf_tree_entries(&entries))
+    Ok(group_gguf_tree_entries(&all_entries))
 }
 
 /// Evaluates and ranks GGUF candidates against probed (or user-specified) GPU/UMA memory

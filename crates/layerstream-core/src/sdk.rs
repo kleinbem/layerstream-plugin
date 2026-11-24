@@ -184,7 +184,16 @@ impl LoadedSession {
         cfg.n_batch = batch_size;
         cfg.n_threads = n_threads.max(1);
         cfg.resident_layers = opts.resident_layers;
-        cfg.vram_budget_bytes = opts.vram_budget_bytes;
+        cfg.vram_budget_bytes = if opts.vram_budget_bytes > 0
+            && let Some(ref dp) = draft_path
+            && let Ok(meta) = std::fs::metadata(dp)
+        {
+            // Reserve the loaded draft checkpoint size out of an explicit target VRAM budget
+            // so target + draft residency stays within the caller's requested ceiling.
+            opts.vram_budget_bytes.saturating_sub(meta.len())
+        } else {
+            opts.vram_budget_bytes
+        };
         cfg.vram_budget_auto = opts.vram_budget_auto && opts.resident_layers.is_none();
         cfg.kv_cache_type = opts.kv_cache_type;
         cfg.use_gpu = opts.use_gpu;

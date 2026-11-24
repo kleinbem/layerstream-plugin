@@ -306,31 +306,48 @@ impl<'a> SchemaCompiler<'a> {
     }
 
     fn deref_shallow(&self, val: &Value) -> Result<Value> {
-        let mut cur = val.clone();
         let mut seen = BTreeSet::new();
-        while let Value::Object(obj) = &cur {
-            let Some(ref_val) = obj.get("$ref") else {
-                break;
-            };
-            let Some(ref_str) = ref_val.as_str() else {
-                bail!("JSON Schema '$ref' must be a string");
-            };
-            if !seen.insert(ref_str.to_string()) {
-                bail!("unguarded recursive JSON Schema $ref cycle at '{ref_str}'");
-            }
-            let target = self.resolve_ref(ref_str)?;
-            let mut sib = obj.clone();
-            sib.remove("$ref");
-            if has_validation_keys(&sib) {
-                cur = match self.intersect_schemas(&target, &Value::Object(sib), "ref")? {
-                    Some(m) => m,
-                    None => return Ok(Value::Bool(false)),
+        self.deref_shallow_with_seen(val, &mut seen)
+    }
+
+    fn deref_shallow_with_seen(&self, val: &Value, seen: &mut BTreeSet<String>) -> Result<Value> {
+        let mut cur = val.clone();
+        let mut pushed = Vec::new();
+        let out = (|| -> Result<Value> {
+            while let Value::Object(obj) = &cur {
+                let Some(ref_val) = obj.get("$ref") else {
+                    break;
                 };
-            } else {
-                cur = target;
+                let Some(ref_str) = ref_val.as_str() else {
+                    bail!("JSON Schema '$ref' must be a string");
+                };
+                if !seen.insert(ref_str.to_string()) {
+                    bail!("unguarded recursive JSON Schema $ref cycle at '{ref_str}'");
+                }
+                pushed.push(ref_str.to_string());
+                let target = self.resolve_ref(ref_str)?;
+                let mut sib = obj.clone();
+                sib.remove("$ref");
+                cur = if has_validation_keys(&sib) {
+                    match self.intersect_schemas_with_seen(
+                        &target,
+                        &Value::Object(sib),
+                        "ref",
+                        seen,
+                    )? {
+                        Some(m) => m,
+                        None => return Ok(Value::Bool(false)),
+                    }
+                } else {
+                    target
+                };
             }
+            Ok(cur)
+        })();
+        for r in pushed {
+            seen.remove(&r);
         }
-        Ok(cur)
+        out
     }
 
     /// Compiles `node`, returning `Ok(None)` when the schema branch is unsatisfiable (`false`).
@@ -649,8 +666,19 @@ impl<'a> SchemaCompiler<'a> {
     }
 
     fn intersect_schemas(&self, a: &Value, b: &Value, hint: &str) -> Result<Option<Value>> {
-        let da = self.deref_shallow(a)?;
-        let db = self.deref_shallow(b)?;
+        let mut seen = BTreeSet::new();
+        self.intersect_schemas_with_seen(a, b, hint, &mut seen)
+    }
+
+    fn intersect_schemas_with_seen(
+        &self,
+        a: &Value,
+        b: &Value,
+        hint: &str,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<Option<Value>> {
+        let da = self.deref_shallow_with_seen(a, seen)?;
+        let db = self.deref_shallow_with_seen(b, seen)?;
         match (&da, &db) {
             (Value::Bool(false), _) | (_, Value::Bool(false)) => return Ok(None),
             (Value::Bool(true), other) => return Ok(Some(other.clone())),
