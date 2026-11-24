@@ -2319,8 +2319,11 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                                 : (cfg->kv_cache_type == 2) ? 0.5625
                                                             : 2.0;
     for (uint32_t il = 0; il < eng->n_layers; ++il) {
-        const uint64_t k_dim = eng->model->hparams.n_embd_k_gqa(il);
-        const uint64_t v_dim = eng->model->hparams.n_embd_v_gqa(il);
+        const uint64_t n_head_kv = (il < eng->model->hparams.n_head_kv_arr.size())
+            ? eng->model->hparams.n_head_kv_arr[il]
+            : eng->model->hparams.n_head_kv_arr[0];
+        const uint64_t k_dim = static_cast<uint64_t>(eng->model->hparams.n_embd_head_k_full) * n_head_kv;
+        const uint64_t v_dim = static_cast<uint64_t>(eng->model->hparams.n_embd_head_v_full) * n_head_kv;
         kv_bytes += static_cast<uint64_t>(
             static_cast<double>((k_dim + v_dim) * static_cast<uint64_t>(n_ctx)) * bytes_per_elem
         );
