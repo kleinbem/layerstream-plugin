@@ -21,6 +21,7 @@ python-stage-backends = []
 [dependencies]
 anyhow.workspace = true
 getrandom.workspace = true
+json-schema-gbnf = { path = "../json-schema-gbnf" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

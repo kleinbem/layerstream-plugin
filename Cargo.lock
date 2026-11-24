@@ -840,6 +840,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "json-schema-gbnf"
+version = "0.4.1"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "layerstream-core"
 version = "0.4.1"
 dependencies = [
@@ -847,6 +855,7 @@ dependencies = [
  "cc",
  "cmake",
  "getrandom 0.4.3",
+ "json-schema-gbnf",
  "libc",
  "serde",
  "serde_json",

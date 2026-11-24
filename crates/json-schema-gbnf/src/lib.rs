@@ -9,7 +9,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use anyhow::{Result, bail};
+/// Error returned when a JSON Schema cannot be compiled into a valid GBNF grammar.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct GrammarError(String);
+
+impl From<serde_json::Error> for GrammarError {
+    fn from(err: serde_json::Error) -> Self {
+        Self(err.to_string())
+    }
+}
+
+/// Convenience `Result` alias for `json-schema-gbnf`.
+pub type Result<T> = std::result::Result<T, GrammarError>;
+
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err(GrammarError(format!($($arg)*)))
+    };
+}
 use serde_json::{Map, Value};
 
 const MAX_STRING_BOUND: u64 = 4096;
@@ -77,6 +95,7 @@ const UNSUPPORTED_VALIDATION_KEYWORDS: &[&str] = &[
 ];
 
 /// Returns a self-contained GBNF grammar constraining output to a valid JSON object (`{...}`).
+#[must_use]
 pub fn json_object_gbnf() -> String {
     format!("root ::= ws json-object\n{BASE_PRIMITIVE_RULES}")
 }
@@ -300,7 +319,7 @@ impl<'a> SchemaCompiler<'a> {
                 Value::Array(arr) => seg.parse::<usize>().ok().and_then(|idx| arr.get(idx)),
                 _ => None,
             }
-            .ok_or_else(|| anyhow::anyhow!("unresolved JSON Schema $ref '{reference}'"))?;
+            .ok_or_else(|| GrammarError(format!("unresolved JSON Schema $ref '{reference}'")))?;
         }
         Ok(cur.clone())
     }
@@ -1276,7 +1295,9 @@ impl<'a> SchemaCompiler<'a> {
         let props_opt = match obj.get("properties") {
             None => None,
             Some(v) => Some(v.as_object().ok_or_else(|| {
-                anyhow::anyhow!("JSON Schema 'properties' at '{hint}' must be an object")
+                GrammarError(format!(
+                    "JSON Schema 'properties' at '{hint}' must be an object"
+                ))
             })?),
         };
         let required_list = extract_required_list(obj, hint)?;

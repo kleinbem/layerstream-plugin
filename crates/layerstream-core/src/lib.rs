@@ -2,7 +2,7 @@ pub mod chat_parse;
 pub mod engine;
 pub mod ffi;
 pub mod gguf_index;
-pub mod grammar;
+pub use json_schema_gbnf as grammar;
 #[cfg(feature = "hf")]
 pub mod hf;
 pub mod io_reader;
