@@ -60,13 +60,14 @@ jobs:
           cargo fmt -- --check
           cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Python static lint & type check (ruff + pyright)
+      - name: Python static lint, strict type check, and audit (ruff + pyright + pip-audit)
         working-directory: bindings/python
         run: |
-          uv pip install --system ruff pyright pytest pytest-asyncio pytest-timeout hypothesis
+          uv pip install --system ruff pyright pip-audit pytest pytest-asyncio pytest-timeout hypothesis
           ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts
           ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts
           pyright python/layerstream tests
+          pip-audit --strict
 
       - name: Smoke-test layerstream-cuda13 companion wheel packaging & metadata
         run: |

@@ -732,4 +732,75 @@ mod tests {
         assert_eq!(spans[1].aligned_offset % DIRECT_IO_ALIGN, 0);
         assert_eq!(spans[1].slices.len(), 1);
     }
+
+    #[test]
+    fn fuzz_parse_single_header_never_panics_on_corrupt_or_random_inputs() {
+        // Deterministic xorshift64* PRNG so fuzzing stays fast, zero-dep, and reproducible.
+        struct Rng(u64);
+        impl Rng {
+            fn next_u64(&mut self) -> u64 {
+                self.0 ^= self.0 >> 12;
+                self.0 ^= self.0 << 25;
+                self.0 ^= self.0 >> 27;
+                self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn fill_bytes(&mut self, dst: &mut [u8]) {
+                for chunk in dst.chunks_mut(8) {
+                    let bytes = self.next_u64().to_le_bytes();
+                    chunk.copy_from_slice(&bytes[..chunk.len()]);
+                }
+            }
+        }
+
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_BABEu64);
+
+        // 1) Completely random byte slices of varying lengths (0..512 bytes).
+        for i in 0..1000usize {
+            let len = (rng.next_u64() as usize) % 512;
+            let mut buf = vec![0u8; len];
+            rng.fill_bytes(&mut buf);
+            let mut cur = Cursor::new(buf);
+            let _ = parse_single_header(&mut cur, 0, len as u64, (i & 1) == 0);
+        }
+
+        // 2) Valid GGUF v2/v3 headers with fuzzed counts, KV payloads, and tensor tables.
+        for i in 0..1500usize {
+            let version = if (i & 1) == 0 { 3u32 } else { 2u32 };
+            let n_tensors = match i % 5 {
+                0 => 0,
+                1 => rng.next_u64() % 16,
+                2 => u64::MAX,
+                3 => (MAX_GGUF_TENSORS as u64).saturating_add(1),
+                _ => rng.next_u64() % 256,
+            };
+            let n_kv = match i % 4 {
+                0 => 0,
+                1 => rng.next_u64() % 16,
+                2 => (MAX_GGUF_KV_COUNT as u64).saturating_add(1),
+                _ => rng.next_u64() % 64,
+            };
+            let mut buf = gguf_header(version, n_tensors, n_kv);
+            let tail_len = (rng.next_u64() as usize) % 384;
+            let mut tail = vec![0u8; tail_len];
+            rng.fill_bytes(&mut tail);
+            buf.extend_from_slice(&tail);
+
+            let total_len = buf.len() as u64;
+            let mut cur = Cursor::new(buf);
+            let _ = parse_single_header(&mut cur, 0, total_len, (i & 2) == 0);
+        }
+
+        // 3) Deeply nested GGUF array KV values (must hit MAX_GGUF_KV_DEPTH without stack overflow).
+        let mut nested = gguf_header(3, 0, 1);
+        nested.extend_from_slice(&1u64.to_le_bytes()); // key len = 1
+        nested.push(b'k');
+        nested.extend_from_slice(&9u32.to_le_bytes()); // GGUF_TYPE_ARRAY
+        for _ in 0..64 {
+            nested.extend_from_slice(&9u32.to_le_bytes()); // elem_type = ARRAY
+            nested.extend_from_slice(&1u64.to_le_bytes()); // len = 1
+        }
+        let nested_len = nested.len() as u64;
+        let mut cur = Cursor::new(nested);
+        assert!(parse_single_header(&mut cur, 0, nested_len, false).is_err());
+    }
 }

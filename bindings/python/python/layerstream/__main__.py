@@ -100,7 +100,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
             use_gpu=not args.cpu,
             allow_slow=args.allow_slow,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — top-level CLI preflight boundary
         if args.json:
             print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
         else:
@@ -141,13 +141,14 @@ def _format_turn_telemetry(
 ) -> str:
     comp = int((summary or {}).get("completion_tokens", 0))
     tps = comp / max(elapsed_s, 1e-4)
-    spec = (summary or {}).get("speculation") or {}
+    spec: Mapping[str, Any] = (summary or {}).get("speculation") or {}
     drafted = int(spec.get("drafted_tokens", 0))
     accepted = int(spec.get("accepted_tokens", 0))
     backend = st.get("backend_name") or ("GPU" if st.get("using_gpu") else "CPU")
     res_l = st.get("resident_layers", 0)
     tot_l = st.get("n_layers", 0)
-    io_gib = float((st.get("io") or {}).get("bytes_read", 0)) / (1024.0**3)
+    io_stats: Mapping[str, Any] = st.get("io") or {}
+    io_gib = float(io_stats.get("bytes_read", 0)) / (1024.0**3)
     parts = [
         f"{comp} tok in {elapsed_s:.2f}s ({tps:.2f} tok/s)",
         f"backend={backend}",
