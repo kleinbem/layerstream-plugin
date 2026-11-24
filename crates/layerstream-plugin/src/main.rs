@@ -224,19 +224,41 @@ fn main() -> Result<()> {
                 let listener = TcpListener::bind(&addr)
                     .await
                     .with_context(|| format!("bind standalone HTTP listener on {addr}"))?;
+                let local_is_loopback = listener
+                    .local_addr()
+                    .map(|a| a.ip().is_loopback())
+                    .unwrap_or(false);
+                if !local_is_loopback && api_key.is_none() {
+                    tracing::warn!(
+                        addr = %addr,
+                        "listening on non-loopback address without --api-key; /v1/* endpoints including /v1/unload are exposed unauthenticated"
+                    );
+                }
                 tracing::info!(
                     addr = %addr,
                     models = server_cfg.registry.len(),
-                    worker_isolated = !in_process && api_key.is_none(),
+                    worker_isolated = !in_process,
+                    authenticated = api_key.is_some(),
                     "starting standalone layerstream OpenAI server (0 MB GPU memory idle)"
                 );
-                if in_process || api_key.is_some() {
-                    layerstream_server::serve_with_api_key(listener, server_cfg, api_key).await
+                if in_process {
+                    let state = layerstream_server::AppState::new(server_cfg);
+                    let shutdown_state = state.clone();
+                    layerstream_server::serve_with_state_until(
+                        listener,
+                        state,
+                        api_key,
+                        async move {
+                            mesh_adapter::shutdown_signal().await;
+                            shutdown_state.request_shutdown();
+                        },
+                    )
+                    .await
                 } else {
                     let coordinator = worker::WorkerCoordinator::new(server_cfg)?;
                     let coord_shutdown = coordinator.clone();
                     let serve_res = tokio::select! {
-                        res = worker::serve_with_coordinator(listener, coordinator) => res,
+                        res = worker::serve_with_coordinator_and_api_key(listener, coordinator, api_key) => res,
                         _ = mesh_adapter::shutdown_signal() => Ok(()),
                     };
                     coord_shutdown.shutdown_cleanly().await;

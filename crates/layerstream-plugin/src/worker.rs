@@ -28,8 +28,8 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use layerstream_core::KvCacheType;
 use layerstream_server::{
-    AppState, ModelRegistry, ServerConfig, WORKER_TOKEN_HEADER, api_error, build_router_with_token,
-    models_list_json,
+    AppState, MAX_REQUEST_BODY_BYTES, ModelRegistry, ServerConfig, WORKER_TOKEN_HEADER, api_error,
+    build_router_with_token, models_list_json, with_api_key_auth,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -44,7 +44,6 @@ use tokio_stream::wrappers::ReceiverStream;
 const WORKER_READY_PREFIX: &str = "LAYERSTREAM_WORKER_READY ";
 const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_STOP_GRACE: Duration = Duration::from_secs(2);
-const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkerModelSpec {
@@ -680,12 +679,27 @@ pub fn build_coordinator_router(state: WorkerCoordinator) -> Router {
         .with_state(state)
 }
 
+pub fn build_coordinator_router_with_api_key(
+    state: WorkerCoordinator,
+    api_key: Option<String>,
+) -> Router {
+    with_api_key_auth(build_coordinator_router(state), api_key)
+}
+
 pub async fn serve_with_coordinator(
     listener: TcpListener,
     coordinator: WorkerCoordinator,
 ) -> Result<()> {
+    serve_with_coordinator_and_api_key(listener, coordinator, None).await
+}
+
+pub async fn serve_with_coordinator_and_api_key(
+    listener: TcpListener,
+    coordinator: WorkerCoordinator,
+    api_key: Option<String>,
+) -> Result<()> {
     let _reaper = DropAbort(coordinator.spawn_reaper());
-    let app = build_coordinator_router(coordinator);
+    let app = build_coordinator_router_with_api_key(coordinator, api_key);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -1484,6 +1498,55 @@ mod tests {
 
         let _ = t1.await;
         let _ = t2.await;
+        coord.shutdown_cleanly().await;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coordinator_api_key_enforces_bearer_auth_while_keeping_worker_isolated() -> Result<()>
+    {
+        let coord = mock_coordinator(Duration::from_secs(60), 2);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server_coord = coord.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_with_coordinator_and_api_key(
+                listener,
+                server_coord,
+                Some("secret-token".to_string()),
+            )
+            .await;
+        });
+
+        let send_get = |path: &str, auth: Option<&str>| async move {
+            let mut stream = TcpStream::connect(addr).await?;
+            let auth_hdr = auth
+                .map(|v| format!("Authorization: {v}\r\n"))
+                .unwrap_or_default();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth_hdr}Connection: close\r\n\r\n"
+            );
+            stream.write_all(req.as_bytes()).await?;
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await?;
+            Ok::<String, anyhow::Error>(String::from_utf8_lossy(&buf).into_owned())
+        };
+
+        let health = send_get("/health", None).await?;
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+        let health_json: Value = serde_json::from_str(split_http_body(&health))?;
+        assert_eq!(health_json["worker_isolated"], true);
+
+        let unauth = send_get("/v1/models", None).await?;
+        assert!(unauth.starts_with("HTTP/1.1 401"), "{unauth}");
+
+        let wrong = send_get("/v1/models", Some("Bearer wrong-token")).await?;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+
+        let ok = send_get("/v1/models", Some("Bearer secret-token")).await?;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+
         coord.shutdown_cleanly().await;
         server.abort();
         Ok(())

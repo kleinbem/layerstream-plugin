@@ -299,6 +299,7 @@ impl Drop for ActiveCancelGuard {
 }
 
 pub const WORKER_TOKEN_HEADER: &str = "x-layerstream-worker-token";
+pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -318,20 +319,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/unload", post(unload_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(text_completions))
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
-/// Builds the standalone HTTP router enforcing an optional `Authorization: Bearer <api_key>`
-/// on `/v1/*` routes while keeping `/health` unauthenticated for liveness probes.
-/// An explicitly provided empty/whitespace `Some("")` fails closed (`401`) rather than disabling auth.
-pub fn build_router_with_api_key(state: AppState, api_key: Option<String>) -> Router {
+/// Wraps an Axum router with optional `Authorization: Bearer <api_key>` enforcement on all routes
+/// except `/health`. An explicitly provided empty/whitespace `Some("")` fails closed (`401`).
+pub fn with_api_key_auth(router: Router, api_key: Option<String>) -> Router {
     let Some(raw_key) = api_key else {
-        return build_router(state);
+        return router;
     };
     let trimmed = raw_key.trim();
     if trimmed.is_empty() {
-        return build_router(state).layer(axum::middleware::from_fn(
+        return router.layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| async move {
                 if req.uri().path() == "/health" {
                     return next.run(req).await;
@@ -344,7 +344,7 @@ pub fn build_router_with_api_key(state: AppState, api_key: Option<String>) -> Ro
         ));
     }
     let expected = Arc::new(format!("Bearer {trimmed}").into_bytes());
-    build_router(state).layer(axum::middleware::from_fn(
+    router.layer(axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
             let expected = expected.clone();
             async move {
@@ -363,6 +363,13 @@ pub fn build_router_with_api_key(state: AppState, api_key: Option<String>) -> Ro
             }
         },
     ))
+}
+
+/// Builds the standalone HTTP router enforcing an optional `Authorization: Bearer <api_key>`
+/// on `/v1/*` routes while keeping `/health` unauthenticated for liveness probes.
+/// An explicitly provided empty/whitespace `Some("")` fails closed (`401`) rather than disabling auth.
+pub fn build_router_with_api_key(state: AppState, api_key: Option<String>) -> Router {
+    with_api_key_auth(build_router(state), api_key)
 }
 
 /// Builds the worker router requiring a matching `x-layerstream-worker-token` header on every request.

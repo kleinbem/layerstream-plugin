@@ -1,6 +1,6 @@
 # layerstream (Node.js / TypeScript SDK)
 
-Native Node-API (`napi-rs`) & TypeScript SDK for [`layerstream-core`](../../crates/layerstream-core): an out-of-core GGUF layer-streaming inference engine backed by unpatched `llama.cpp`, `O_DIRECT` / `F_NOCACHE` async ping-pong GPU streaming, auto-sized hybrid residency, sparse MoE TinyLFU expert caching, and speculative decoding.
+Native Node-API (`napi-rs`) & TypeScript SDK for [`layerstream-core`](https://github.com/kleinbem/layerstream-plugin/tree/main/crates/layerstream-core): an out-of-core GGUF layer-streaming inference engine backed by unpatched `llama.cpp`, `O_DIRECT` / `F_NOCACHE` async ping-pong GPU streaming, auto-sized hybrid residency, sparse MoE TinyLFU expert caching, and speculative decoding.
 
 Zero runtime npm dependencies, dual ESM + CommonJS exports, full `AbortSignal` mid-prefill/mid-decode cancellation, `Symbol.asyncDispose` (`await using`), and `isolatedWorker: true` for true 0 MB GPU / CUDA / Vulkan / Metal driver context handoff.
 
@@ -84,4 +84,4 @@ npm run typecheck
 npm test
 ```
 
-See the root [README.md](../../README.md) for bare-metal benchmarks and Mesh-LLM plugin usage.
+See the root [README.md](https://github.com/kleinbem/layerstream-plugin/blob/main/README.md) for bare-metal benchmarks and Mesh-LLM plugin usage.
