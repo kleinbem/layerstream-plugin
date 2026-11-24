@@ -32,6 +32,7 @@ pub use grammar::{json_object_gbnf, json_schema_to_gbnf};
 pub use io_reader::{IoStats, LayerIoPool, probe_dir_storage_mib_per_s, probe_storage_mib_per_s};
 pub use openai::{
     CompiledResponseFormat, OpenAiUsage, compile_response_format, normalize_finish_reason,
+    normalize_kv_cache_type, normalize_vram_budget_mb, validate_sample_params,
 };
 pub use residency::{AdmissionPermit, EngineLease, Residency};
 pub use speculator::{DraftModelProposer, NgramProposer, SpeculationStats};
