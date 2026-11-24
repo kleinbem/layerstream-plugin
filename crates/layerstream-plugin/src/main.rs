@@ -101,6 +101,20 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    if cli.command.is_some()
+        && (!cli.plugin_args.models.is_empty()
+            || cli.plugin_args.in_process
+            || cli.plugin_args.no_gpu
+            || cli.plugin_args.allow_slow
+            || cli.plugin_args.low_vram
+            || cli.plugin_args.idle_timeout_secs.is_some()
+            || cli.plugin_args.threads.is_some())
+    {
+        anyhow::bail!(
+            "engine flags (such as --model, --in-process, --idle-timeout-secs) must be placed after the subcommand (for example: 'layerstream-plugin serve --model ...')"
+        );
+    }
+
     if let Some(Command::Pull { spec, cache_dir }) = cli.command {
         let root = cache_dir.unwrap_or_else(hf::default_cache_dir);
         let local = hf::ensure_hf_downloaded(&spec, &root)?;
