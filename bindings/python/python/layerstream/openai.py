@@ -3,6 +3,8 @@
 import asyncio
 import dataclasses
 import enum
+import functools
+import importlib
 import json
 import sys
 import threading
@@ -10,6 +12,7 @@ import time
 import types
 import typing
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from types import TracebackType
@@ -222,7 +225,17 @@ class AsyncStreamMixin[T](Iterator[T], AsyncIterator[T]):
         await asyncio.to_thread(self.close)
 
 
-def _annotation_to_json_schema(tp: Any, field_label: str) -> JsonDict:
+@functools.cache
+def _get_pydantic() -> Any:
+    try:
+        return importlib.import_module("pydantic")
+    except ImportError:
+        return None
+
+
+def _annotation_to_json_schema(
+    tp: Any, field_label: str, *, _seen: frozenset[type[Any]] = frozenset()
+) -> JsonDict:
     if tp is Any:
         return {}
     if tp is None or tp is types.NoneType:
@@ -245,7 +258,7 @@ def _annotation_to_json_schema(tp: Any, field_label: str) -> JsonDict:
         if issubclass(cls, enum.Enum):
             return {"enum": [member.value for member in cls]}
         if dataclasses.is_dataclass(cls):
-            return _dataclass_to_json_schema(cls)
+            return _dataclass_to_json_schema(cls, _seen=_seen)
         if hasattr(cls, "model_json_schema"):
             schema_fn: Any = cls.model_json_schema
             return dict(typing.cast(Mapping[str, Any], schema_fn()))
@@ -256,7 +269,7 @@ def _annotation_to_json_schema(tp: Any, field_label: str) -> JsonDict:
     origin = get_origin(tp)
     args = get_args(tp)
     if origin in (Union, types.UnionType):
-        return {"anyOf": [_annotation_to_json_schema(a, field_label) for a in args]}
+        return {"anyOf": [_annotation_to_json_schema(a, field_label, _seen=_seen) for a in args]}
     if origin is Literal:
         for a in args:
             if not isinstance(a, (str, int, float, bool, type(None))):
@@ -264,7 +277,10 @@ def _annotation_to_json_schema(tp: Any, field_label: str) -> JsonDict:
         return {"enum": list(args)}
     if origin in (list, Sequence):
         return (
-            {"type": "array", "items": _annotation_to_json_schema(args[0], field_label)}
+            {
+                "type": "array",
+                "items": _annotation_to_json_schema(args[0], field_label, _seen=_seen),
+            }
             if args
             else {"type": "array"}
         )
@@ -274,8 +290,11 @@ def _annotation_to_json_schema(tp: Any, field_label: str) -> JsonDict:
         if len(args) == 1 and args[0] == ():
             return {"type": "array", "maxItems": 0}
         if len(args) == 2 and args[1] is Ellipsis:
-            return {"type": "array", "items": _annotation_to_json_schema(args[0], field_label)}
-        pfx = [_annotation_to_json_schema(a, field_label) for a in args]
+            return {
+                "type": "array",
+                "items": _annotation_to_json_schema(args[0], field_label, _seen=_seen),
+            }
+        pfx = [_annotation_to_json_schema(a, field_label, _seen=_seen) for a in args]
         return {
             "type": "array",
             "prefixItems": pfx,
@@ -289,7 +308,7 @@ def _annotation_to_json_schema(tp: Any, field_label: str) -> JsonDict:
             raise TypeError(f"JSON object keys in '{field_label}' must be 'str', got {args[0]!r}")
         return {
             "type": "object",
-            "additionalProperties": _annotation_to_json_schema(args[1], field_label),
+            "additionalProperties": _annotation_to_json_schema(args[1], field_label, _seen=_seen),
         }
 
     raise TypeError(f"unsupported dataclass field annotation {tp!r} on '{field_label}'")
@@ -301,22 +320,27 @@ def _resolve_dataclass_field_types(dc_cls: type[Any]) -> dict[str, Any]:
     return typing.get_type_hints(dc_cls, globalns=mod_ns)
 
 
-def _dataclass_to_json_schema(dc_cls: type[Any]) -> JsonDict:
+def _dataclass_to_json_schema(
+    dc_cls: type[Any], *, _seen: frozenset[type[Any]] = frozenset()
+) -> JsonDict:
+    if dc_cls in _seen:
+        raise ValueError(
+            f"recursive dataclass '{dc_cls.__name__}' is not supported without pydantic"
+        )
+    if not _seen and (pydantic := _get_pydantic()) is not None:
+        return dict(typing.cast(Mapping[str, Any], pydantic.TypeAdapter(dc_cls).json_schema()))
+
+    next_seen = _seen | {dc_cls}
     resolved_types = _resolve_dataclass_field_types(dc_cls)
     props: JsonDict = {}
     required: list[str] = []
     for f in dataclasses.fields(dc_cls):
         py_t = resolved_types.get(f.name, f.type)
-        props[f.name] = _annotation_to_json_schema(py_t, f"{dc_cls.__name__}.{f.name}")
+        props[f.name] = _annotation_to_json_schema(
+            py_t, f"{dc_cls.__name__}.{f.name}", _seen=next_seen
+        )
         if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:
             required.append(f.name)
-    try:
-        import importlib
-
-        pydantic: Any = importlib.import_module("pydantic")
-        return dict(typing.cast(Mapping[str, Any], pydantic.TypeAdapter(dc_cls).json_schema()))
-    except ImportError:
-        pass
     return {
         "type": "object",
         "properties": props,
@@ -363,13 +387,8 @@ def _coerce_value_for_type(val: Any, tp: Any) -> Any:
 
 
 def _instantiate_dataclass(dc_cls: type[Any], data: Mapping[str, Any]) -> Any:
-    try:
-        import importlib
-
-        pydantic: Any = importlib.import_module("pydantic")
+    if (pydantic := _get_pydantic()) is not None:
         return pydantic.TypeAdapter(dc_cls).validate_python(data)
-    except ImportError:
-        pass
 
     resolved_types = _resolve_dataclass_field_types(dc_cls)
     kwargs = {
@@ -469,14 +488,16 @@ class ChatCompletionStream(AsyncStreamMixin[ChatCompletionChunk]):
         self._created = created
         self._model_id = model_id
         self._tag_parser = None if structured_json else StreamTagParser()
-        self._pending: list[ChatCompletionChunk] = [
-            ChatCompletionChunk(
-                id=req_id,
-                created=created,
-                model=model_id,
-                choices=[ChunkChoice(index=0, delta=ChoiceDelta(role="assistant"))],
-            )
-        ]
+        self._pending: deque[ChatCompletionChunk] = deque(
+            [
+                ChatCompletionChunk(
+                    id=req_id,
+                    created=created,
+                    model=model_id,
+                    choices=[ChunkChoice(index=0, delta=ChoiceDelta(role="assistant"))],
+                )
+            ]
+        )
         self._finished = False
 
     @override
@@ -563,7 +584,7 @@ class ChatCompletionStream(AsyncStreamMixin[ChatCompletionChunk]):
 
         if not self._pending:
             raise StopIteration
-        return self._pending.pop(0)
+        return self._pending.popleft()
 
 
 class CompletionStream(AsyncStreamMixin[Completion]):
@@ -770,6 +791,54 @@ class _ChatCompletionsResource:
         max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
     ) -> ChatCompletion | ChatCompletionStream:
+        return self._create_impl(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            max_completion_tokens=max_completion_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            repeat_penalty=repeat_penalty,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            penalty_last_n=penalty_last_n,
+            seed=seed,
+            stop=stop,
+            stream=stream,
+            tools=tools,
+            response_format=response_format,
+            ngram_speculation=ngram_speculation,
+            max_draft_tokens=max_draft_tokens,
+            extra_body=extra_body,
+        )
+
+    def _create_impl(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        model: str | None = None,
+        max_tokens: int | None = None,
+        max_completion_tokens: int | None = None,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        min_p: float = 0.0,
+        top_k: int = 40,
+        repeat_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_last_n: int = 64,
+        seed: int = 42,
+        stop: str | Sequence[str] | None = None,
+        stream: bool = False,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        response_format: Any = None,
+        compiled_grammar: str | None = None,
+        ngram_speculation: bool = True,
+        max_draft_tokens: int | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> ChatCompletion | ChatCompletionStream:
         (
             min_p,
             top_k,
@@ -789,9 +858,15 @@ class _ChatCompletionsResource:
 
         model_id, eng = self._mgr.resolve(model)
         eff_max = (
-            max_completion_tokens if max_completion_tokens is not None else (max_tokens or 512)
+            max_completion_tokens
+            if max_completion_tokens is not None
+            else (max_tokens if max_tokens is not None else 512)
         )
-        grammar, _parser_target = _compile_response_format(response_format)
+        grammar = (
+            compiled_grammar
+            if compiled_grammar is not None
+            else _compile_response_format(response_format)[0]
+        )
         req_id = f"chatcmpl-ls-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
 
@@ -900,13 +975,16 @@ class _ChatCompletionsResource:
         response_format: Any,
         **kwargs: Any,
     ) -> ChatCompletion:
-        _grammar, parser_target = _compile_response_format(response_format)
-        resp = self.create(
+        grammar, parser_target = _compile_response_format(response_format)
+        resp = self._create_impl(
             messages=messages,
-            response_format=response_format,
+            response_format=None,
+            compiled_grammar=grammar,
             stream=False,
             **kwargs,
         )
+        if not isinstance(resp, ChatCompletion):
+            raise TypeError("expected non-streaming ChatCompletion")
         content = resp.choices[0].message.content or ""
         resp.choices[0].message.parsed = _parse_structured_text(content, parser_target)
         return resp

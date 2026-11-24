@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -1512,3 +1513,18 @@ def test_cli_inspect_check_chat_and_rust_axum_server(
             unloaded = json.loads(resp.read().decode("utf-8"))
             assert unloaded["unloaded"] is True
             assert unloaded["loaded"] is False
+
+
+@dataclass(frozen=True, slots=True)
+class _RecursiveTreeNode:
+    label: str
+    children: list[_RecursiveTreeNode]
+
+
+def test_recursive_dataclass_schema_raises_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Self-referential dataclasses fail cleanly with ValueError instead of RecursionError."""
+    import layerstream.openai as ls_openai
+
+    monkeypatch.setattr(ls_openai, "_get_pydantic", lambda: None)
+    with pytest.raises(ValueError, match="recursive dataclass '_RecursiveTreeNode'"):
+        ls_openai._dataclass_to_json_schema(_RecursiveTreeNode)

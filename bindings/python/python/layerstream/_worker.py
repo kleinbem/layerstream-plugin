@@ -103,63 +103,6 @@ class IsolatedWorkerClient:
             on_progress=on_progress,
         )
 
-    def rpc(self, op: str, params: dict[str, Any]) -> dict[str, Any]:
-        res, _ = self.rpc_with_summary(op, params)
-        return res
-
-    def rpc_with_summary(
-        self, op: str, params: dict[str, Any]
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        match op:
-            case "generate":
-                text, summary = self._native.generate(
-                    str(params["prompt"]), _gen_params_json(params)
-                )
-                return {"text": text}, summary
-            case "chat":
-                text, parsed, summary = self._native.chat(
-                    json.dumps(params["messages"]), _gen_params_json(params)
-                )
-                return {"text": text, "parsed": parsed}, summary
-            case "tokenize":
-                tokens = self._native.tokenize(
-                    str(params["text"]),
-                    bool(params.get("add_special", False)),
-                    bool(params.get("parse_special", False)),
-                )
-                return {"tokens": tokens}, None
-            case "detokenize":
-                text = self._native.detokenize([int(t) for t in params["tokens"]])
-                return {"text": text}, None
-            case "apply_chat_template":
-                tools = params.get("tools")
-                prompt = self._native.apply_chat_template(
-                    json.dumps(params["messages"]),
-                    bool(params.get("add_generation_prompt", True)),
-                    json.dumps(tools) if tools is not None else None,
-                )
-                return {"prompt": prompt}, None
-            case "kv_clear":
-                self._native.kv_clear()
-                return {}, None
-            case "kv_trim":
-                return {"trimmed": self._native.kv_trim(int(params["pos_min"]))}, None
-            case "save_state":
-                return {"tokens": self._native.save_state(str(params["path"]))}, None
-            case "load_state":
-                return {"tokens": self._native.load_state(str(params["path"]))}, None
-            case other:
-                raise ValueError(f"unknown worker op '{other}'")
-
-    def start_stream(self, op: str, params: dict[str, Any]) -> NativeWorkerStream:
-        if op == "generate_stream":
-            return self._native.generate_stream(str(params["prompt"]), _gen_params_json(params))
-        if op == "chat_stream":
-            return self._native.chat_stream(
-                json.dumps(params["messages"]), _gen_params_json(params)
-            )
-        raise ValueError(f"unknown worker stream op '{op}'")
-
     @property
     def is_loaded(self) -> bool:
         return self._native.is_loaded
@@ -222,13 +165,13 @@ class IsolatedWorkerClient:
             grammar=grammar,
             json_schema=json_schema,
         )
+        params_json = _gen_params_json(params)
         if stream:
-            return self.start_stream("generate_stream", params)
+            return self._native.generate_stream(prompt, params_json)
+        text, summary = self._native.generate(prompt, params_json)
         if return_summary:
-            out, summary = self.rpc_with_summary("generate", params)
-            return str(out["text"]), summary
-        out = self.rpc("generate", params)
-        return str(out["text"])
+            return text, summary
+        return text
 
     def chat(
         self,
@@ -280,15 +223,15 @@ class IsolatedWorkerClient:
             grammar=grammar,
             json_schema=json_schema,
         )
+        messages_json = json.dumps(params["messages"])
         if stream:
-            return self.start_stream("chat_stream", params)
+            return self._native.chat_stream(messages_json, _gen_params_json(params))
         params["parse_output"] = parse_output
+        text, parsed, summary = self._native.chat(messages_json, _gen_params_json(params))
+        payload: Any = parsed if parse_output else text
         if return_summary:
-            out, summary = self.rpc_with_summary("chat", params)
-            payload = out["parsed"] if parse_output else str(out["text"])
             return payload, summary
-        out = self.rpc("chat", params)
-        return out["parsed"] if parse_output else str(out["text"])
+        return payload
 
     def tokenize(
         self,
@@ -297,15 +240,10 @@ class IsolatedWorkerClient:
         add_special: bool = False,
         parse_special: bool = False,
     ) -> list[int]:
-        res = self.rpc(
-            "tokenize",
-            {"text": text, "add_special": add_special, "parse_special": parse_special},
-        )
-        return list(res["tokens"])
+        return list(self._native.tokenize(text, add_special, parse_special))
 
     def detokenize(self, tokens: Sequence[int]) -> str:
-        res = self.rpc("detokenize", {"tokens": [int(t) for t in tokens]})
-        return str(res["text"])
+        return self._native.detokenize([int(t) for t in tokens])
 
     def apply_chat_template(
         self,
@@ -316,30 +254,23 @@ class IsolatedWorkerClient:
     ) -> str:
         clean_msgs = serialize_messages_arg(messages)
         clean_tools = validate_tools_arg(tools)
-        res = self.rpc(
-            "apply_chat_template",
-            {
-                "messages": clean_msgs,
-                "add_generation_prompt": add_generation_prompt,
-                "tools": clean_tools,
-            },
+        return self._native.apply_chat_template(
+            json.dumps(clean_msgs),
+            add_generation_prompt,
+            json.dumps(clean_tools) if clean_tools is not None else None,
         )
-        return str(res["prompt"])
 
     def kv_clear(self) -> None:
-        self.rpc("kv_clear", {})
+        self._native.kv_clear()
 
     def kv_trim(self, pos_min: int) -> bool:
-        res = self.rpc("kv_trim", {"pos_min": int(pos_min)})
-        return bool(res["trimmed"])
+        return self._native.kv_trim(int(pos_min))
 
     def save_state(self, path: str) -> int:
-        res = self.rpc("save_state", {"path": path})
-        return int(res["tokens"])
+        return self._native.save_state(path)
 
     def load_state(self, path: str) -> int:
-        res = self.rpc("load_state", {"path": path})
-        return int(res["tokens"])
+        return self._native.load_state(path)
 
 
 def normalize_open_kwargs(
