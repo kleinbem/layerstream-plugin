@@ -7,8 +7,8 @@ use tokio::net::TcpListener;
 
 pub use registry::{ModelEntry, ModelRegistry};
 pub use routes::{
-    AppState, ServerConfig, WORKER_TOKEN_HEADER, api_error, build_router,
-    build_router_with_api_key, build_router_with_token, models_list_json,
+    AppState, MAX_REQUEST_BODY_BYTES, ServerConfig, WORKER_TOKEN_HEADER, api_error, build_router,
+    build_router_with_api_key, build_router_with_token, models_list_json, with_api_key_auth,
 };
 
 pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<()> {
