@@ -1,11 +1,11 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use layerstream_core::hf::{DownloadProgress, ProgressCallback};
+use layerstream_core::hf::{DownloadProgress, HfError, ProgressCallback};
 use layerstream_core::sdk::{
     CheckOptions, LoadedSession, OpenSessionOptions, RecommendOptions, check_model,
     inspect_gguf_file, pull_model, recommend_repo,
@@ -20,6 +20,7 @@ use layerstream_core::{
     normalize_kv_cache_type, normalize_vram_budget_mb, parse_assistant_output,
     validate_sample_params,
 };
+use parking_lot::{Mutex, MutexGuard};
 use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{
@@ -101,12 +102,11 @@ pub struct TokenStream {
 impl Drop for TokenStream {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
-        let handle = if let Ok(mut st) = self.state.lock() {
+        let handle = {
+            let mut st = self.state.lock();
             st.rx = None;
             st.done = true;
             st.worker.take()
-        } else {
-            None
         };
         if let Some(h) = handle {
             let _ = h.join();
@@ -140,10 +140,7 @@ impl TokenStream {
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.cancel.store(true, Ordering::Relaxed);
         let handle = {
-            let mut st = self
-                .state
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("stream lock poisoned"))?;
+            let mut st = self.state.lock();
             st.rx = None;
             st.done = true;
             st.worker.take()
@@ -158,12 +155,7 @@ impl TokenStream {
 
     #[getter]
     fn summary<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let sum = self
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("stream lock poisoned"))?
-            .summary
-            .clone();
+        let sum = self.state.lock().summary.clone();
         match sum {
             Some(s) => Ok(Some(serialize_to_pydict(py, &s)?)),
             None => Ok(None),
@@ -178,7 +170,7 @@ impl TokenStream {
             }
 
             let recv_result = py.detach(|| {
-                let st = self.state.lock().ok()?;
+                let st = self.state.lock();
                 if st.done {
                     return None;
                 }
@@ -196,9 +188,7 @@ impl TokenStream {
                     return Ok(None);
                 }
                 Some(Ok(StreamEvent::Done(summary))) => {
-                    if let Ok(mut st) = self.state.lock() {
-                        st.summary = Some(summary);
-                    }
+                    self.state.lock().summary = Some(summary);
                     self.finish_stream(py);
                     return Ok(None);
                 }
@@ -215,12 +205,11 @@ impl TokenStream {
 
 impl TokenStream {
     fn finish_stream(&self, py: Python<'_>) {
-        let handle = if let Ok(mut st) = self.state.lock() {
+        let handle = {
+            let mut st = self.state.lock();
             st.done = true;
             st.rx = None;
             st.worker.take()
-        } else {
-            None
         };
         if let Some(h) = handle {
             py.detach(move || {
@@ -248,32 +237,16 @@ impl PyStreamTagParser {
 
     #[getter]
     fn has_tool_calls(&self) -> PyResult<bool> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("StreamTagParser lock poisoned"))?;
-        Ok(guard.has_tool_calls())
+        Ok(self.inner.lock().has_tool_calls())
     }
 
     fn push<'py>(&self, py: Python<'py>, piece: &str) -> PyResult<Bound<'py, PyList>> {
-        let deltas = {
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("StreamTagParser lock poisoned"))?;
-            guard.push(piece)
-        };
+        let deltas = self.inner.lock().push(piece);
         deltas_to_pylist(py, &deltas)
     }
 
     fn flush<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let deltas = {
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("StreamTagParser lock poisoned"))?;
-            guard.flush()
-        };
+        let deltas = self.inner.lock().flush();
         deltas_to_pylist(py, &deltas)
     }
 }
@@ -513,17 +486,17 @@ pub(crate) fn build_progress_callback(
     let py_cb: Py<PyAny> = cb_bound.clone().unbind();
     let slot_clone = err_slot.clone();
     let cb: ProgressCallback = Arc::new(move |ev: &DownloadProgress| {
-        Python::attach(|py| -> anyhow::Result<()> {
+        Python::attach(|py| -> layerstream_core::hf::Result<()> {
             let call_res: PyResult<()> = (|| {
                 let d = serialize_to_pydict(py, ev)?;
                 py_cb.bind(py).call1((d,))?;
                 Ok(())
             })();
             if let Err(py_err) = call_res {
-                if let Ok(mut guard) = slot_clone.lock() {
-                    *guard = Some(py_err);
-                }
-                anyhow::bail!("on_progress callback raised Python exception");
+                *slot_clone.lock() = Some(py_err);
+                return Err(HfError::Cancelled(
+                    "on_progress callback raised Python exception".into(),
+                ));
             }
             Ok(())
         })
@@ -716,9 +689,7 @@ impl AutoModel {
         };
 
         let loaded_res = py.detach(move || LoadedSession::open(&model_owned, open_opts));
-        if let Ok(mut guard) = cb_err_slot.lock()
-            && let Some(py_err) = guard.take()
-        {
+        if let Some(py_err) = cb_err_slot.lock().take() {
             return Err(py_err);
         }
         let loaded = loaded_res.map_err(map_open_err)?;
@@ -999,7 +970,7 @@ impl AutoModel {
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let inner = self.inner.clone();
         let snapshot = py.detach(move || {
-            let guard = inner.lock().ok()?;
+            let guard = inner.lock();
             let loaded = guard.as_ref()?;
             Some(loaded.stats_snapshot())
         });
@@ -1016,12 +987,7 @@ impl AutoModel {
     #[getter]
     fn last_summary<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         let inner = self.inner.clone();
-        let summary = py.detach(move || {
-            inner
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().and_then(|l| l.last_summary.clone()))
-        });
+        let summary = py.detach(move || inner.lock().as_ref().and_then(|l| l.last_summary.clone()));
         match summary {
             Some(s) => Ok(Some(serialize_to_pydict(py, &s)?)),
             None => Ok(None),
@@ -1037,28 +1003,25 @@ impl AutoModel {
     fn model_path(&self, py: Python<'_>) -> Option<String> {
         let inner = self.inner.clone();
         py.detach(move || {
-            inner.lock().ok().and_then(|g| {
-                g.as_ref()
-                    .map(|l| l.model_path.to_string_lossy().into_owned())
-            })
+            inner
+                .lock()
+                .as_ref()
+                .map(|l| l.model_path.to_string_lossy().into_owned())
         })
     }
 
     fn unload(&self, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.clone();
         let loaded = self.loaded.clone();
-        py.detach(move || -> anyhow::Result<()> {
+        py.detach(move || {
             let dropped = {
-                let mut guard = inner
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
+                let mut guard = inner.lock();
                 loaded.store(false, Ordering::Release);
                 guard.take()
             };
             drop(dropped);
-            Ok(())
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))
+        });
+        Ok(())
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -1102,13 +1065,10 @@ where
     loop {
         py.check_signals()?;
         let step = py.detach(|| match inner.try_lock() {
-            Ok(mut guard) => Step::Ready(f(&mut guard)),
-            Err(std::sync::TryLockError::WouldBlock) => {
+            Some(mut guard) => Step::Ready(f(&mut guard)),
+            None => {
                 std::thread::sleep(Duration::from_millis(5));
                 Step::Busy
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                Step::Ready(Err(anyhow::anyhow!("model lock poisoned")))
             }
         });
         match step {
@@ -1121,20 +1081,15 @@ where
 fn lock_engine_with_cancel<'a>(
     inner: &'a Mutex<Option<LoadedSession>>,
     cancel: &AtomicBool,
-) -> anyhow::Result<Option<std::sync::MutexGuard<'a, Option<LoadedSession>>>> {
+) -> Option<MutexGuard<'a, Option<LoadedSession>>> {
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(None);
+            return None;
         }
-        match inner.try_lock() {
-            Ok(guard) => return Ok(Some(guard)),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                anyhow::bail!("model lock poisoned");
-            }
+        if let Some(guard) = inner.try_lock() {
+            return Some(guard);
         }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1157,7 +1112,7 @@ impl AutoModel {
 
             let worker = std::thread::spawn(move || {
                 let res = (|| -> anyhow::Result<(String, GenerateSummary)> {
-                    let Some(mut guard) = lock_engine_with_cancel(&inner, &worker_cancel)? else {
+                    let Some(mut guard) = lock_engine_with_cancel(&inner, &worker_cancel) else {
                         return Ok((
                             String::new(),
                             GenerateSummary {
@@ -1202,11 +1157,7 @@ impl AutoModel {
                     });
                     return Err(err);
                 }
-                match py.detach(|| {
-                    rx.lock()
-                        .map_err(|_| RecvTimeoutError::Disconnected)
-                        .and_then(|r| r.recv_timeout(Duration::from_millis(25)))
-                }) {
+                match py.detach(|| rx.lock().recv_timeout(Duration::from_millis(25))) {
                     Ok(res) => {
                         py.detach(move || {
                             let _ = worker.join();
@@ -1251,7 +1202,7 @@ impl AutoModel {
 
         let worker = std::thread::spawn(move || {
             let res = (|| -> anyhow::Result<Option<GenerateSummary>> {
-                let Some(mut guard) = lock_engine_with_cancel(&inner, &worker_cancel)? else {
+                let Some(mut guard) = lock_engine_with_cancel(&inner, &worker_cancel) else {
                     return Ok(None);
                 };
                 let loaded = guard
@@ -1348,9 +1299,7 @@ fn pull(
     let rev_owned = revision.map(str::to_string);
     let local_res =
         py.detach(move || pull_model(&spec_owned, cache_dir, quant_owned, rev_owned, progress_cb));
-    if let Ok(mut guard) = cb_err_slot.lock()
-        && let Some(py_err) = guard.take()
-    {
+    if let Some(py_err) = cb_err_slot.lock().take() {
         return Err(py_err);
     }
     let local = local_res.map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;

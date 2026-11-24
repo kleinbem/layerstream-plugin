@@ -3,8 +3,8 @@
 //! lazy 0-VRAM idle residency.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
@@ -18,6 +18,7 @@ use layerstream_core::{
     CancelledError, ChatMessage, DraftModelProposer, EngineConfig, GenerateOptions, KvCacheType,
     LsSampleParams, PromptTooLongError, Residency, StreamEngine,
 };
+use parking_lot::{Mutex as StdMutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -101,37 +102,29 @@ impl AppState {
 
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        if let Ok(guard) = self.active_cancel.lock()
-            && let Some(flag) = guard.as_ref()
-        {
+        if let Some(flag) = self.active_cancel.lock().as_ref() {
             flag.store(true, Ordering::SeqCst);
         }
     }
 
     pub fn model_count(&self) -> usize {
-        self.registry.read().map(|r| r.len()).unwrap_or(0)
+        self.registry.read().len()
     }
 
     pub fn registry_snapshot(&self) -> ModelRegistry {
-        self.registry.read().map(|r| r.clone()).unwrap_or_default()
+        self.registry.read().clone()
     }
 
     pub fn set_registry(&self, new_registry: ModelRegistry) {
-        if let Ok(mut guard) = self.registry.write() {
-            *guard = new_registry;
-        }
+        *self.registry.write() = new_registry;
     }
 
     pub fn set_loading_status(&self, status: Option<String>) {
-        if let Ok(mut guard) = self.loading_status.write() {
-            *guard = status;
-        }
+        *self.loading_status.write() = status;
     }
 
     pub fn set_loading_error(&self, err: Option<String>) {
-        if let Ok(mut guard) = self.loading_error.write() {
-            *guard = err;
-        }
+        *self.loading_error.write() = err;
     }
 
     /// Atomically publishes a background pull failure before clearing `loading_status`,
@@ -142,22 +135,20 @@ impl AppState {
     }
 
     pub fn loading_status(&self) -> Option<String> {
-        self.loading_status.read().ok().and_then(|g| g.clone())
+        self.loading_status.read().clone()
     }
 
     pub fn loading_error(&self) -> Option<String> {
-        self.loading_error.read().ok().and_then(|g| g.clone())
+        self.loading_error.read().clone()
     }
 
     fn register_active_cancel(&self, flag: Arc<AtomicBool>) -> ActiveCancelGuard {
-        if let Ok(mut guard) = self.active_cancel.lock() {
-            if self.shutdown.load(Ordering::SeqCst) {
-                flag.store(true, Ordering::SeqCst);
-            }
-            *guard = Some(flag.clone());
-        } else if self.shutdown.load(Ordering::SeqCst) {
+        let mut guard = self.active_cancel.lock();
+        if self.shutdown.load(Ordering::SeqCst) {
             flag.store(true, Ordering::SeqCst);
         }
+        *guard = Some(flag.clone());
+        drop(guard);
         ActiveCancelGuard {
             slot: self.active_cancel.clone(),
             flag,
@@ -290,9 +281,8 @@ struct ActiveCancelGuard {
 
 impl Drop for ActiveCancelGuard {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.slot.lock()
-            && guard.as_ref().is_some_and(|f| Arc::ptr_eq(f, &self.flag))
-        {
+        let mut guard = self.slot.lock();
+        if guard.as_ref().is_some_and(|f| Arc::ptr_eq(f, &self.flag)) {
             *guard = None;
         }
     }
@@ -468,11 +458,7 @@ pub fn models_list_json(registry: &ModelRegistry) -> Value {
 }
 
 async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
-    let payload = state
-        .registry
-        .read()
-        .map(|r| models_list_json(&r))
-        .unwrap_or_else(|_| json!({ "object": "list", "data": [] }));
+    let payload = models_list_json(&state.registry.read());
     Json(payload)
 }
 
@@ -1280,12 +1266,7 @@ fn resolve_model(
             format!("model is still downloading: {status}"),
         )));
     }
-    let Ok(registry) = state.registry.read() else {
-        return Err(Box::new(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "model registry lock poisoned",
-        )));
-    };
+    let registry = state.registry.read();
     if let Some(id) = requested {
         if let Some(entry) = registry.get(id) {
             return Ok(entry.clone());

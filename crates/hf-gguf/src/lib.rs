@@ -20,9 +20,64 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// Error returned by Hugging Face GGUF discovery, quant recommendation, and download operations.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum HfError {
+    /// Invalid `hf://` URI, repo ID, filename, or model specification.
+    #[error("{0}")]
+    InvalidSpec(String),
+    /// Requested local file or Hugging Face GGUF artifact was not found.
+    #[error("{0}")]
+    NotFound(String),
+    /// HTTP transport or non-success status error.
+    #[error("{0}")]
+    Http(String),
+    /// Failed to parse JSON metadata from the Hugging Face Hub API.
+    #[error("{context}: {source}")]
+    Json {
+        context: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Local filesystem or lock I/O error.
+    #[error("{context}: {source}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Download integrity, resume, or size validation failure.
+    #[error("{0}")]
+    DownloadFailed(String),
+    /// Download was aborted by a caller-supplied progress callback.
+    #[error("{0}")]
+    Cancelled(String),
+}
+
+impl HfError {
+    pub(crate) fn io(context: impl Into<String>, source: std::io::Error) -> Self {
+        Self::Io {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
+impl From<std::io::Error> for HfError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io {
+            context: "I/O error".to_string(),
+            source,
+        }
+    }
+}
+
+/// Convenience `Result` alias for `hf-gguf`.
+pub type Result<T> = std::result::Result<T, HfError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DownloadProgress {
@@ -55,7 +110,7 @@ impl HfSpec {
     /// Parses `hf://org/repo:path/to/file.gguf[@revision]` or `hf://org/repo/file.gguf[@revision]`.
     pub fn parse(uri: &str) -> Result<Self> {
         let Some(rest) = uri.strip_prefix(HF_PREFIX) else {
-            bail!("not an hf:// URI: {uri}");
+            return Err(HfError::InvalidSpec(format!("not an hf:// URI: {uri}")));
         };
         let (body, revision) = match rest.rsplit_once('@') {
             Some((b, rev)) if !rev.is_empty() && !rev.contains('/') => (b, rev.to_string()),
@@ -72,7 +127,9 @@ impl HfSpec {
             let repo = parts.next().unwrap_or("");
             let tail = parts.next().unwrap_or("");
             if org.is_empty() || repo.is_empty() || tail.is_empty() {
-                bail!("invalid hf:// spec '{uri}'; expected hf://org/repo:filename.gguf");
+                return Err(HfError::InvalidSpec(format!(
+                    "invalid hf:// spec '{uri}'; expected hf://org/repo:filename.gguf"
+                )));
             }
             let repo_slice = &body[..org.len() + 1 + repo.len()];
             let clean_file = if let Some(after_resolve) = tail.strip_prefix("resolve/") {
@@ -100,7 +157,9 @@ impl HfSpec {
                 .split('/')
                 .any(|seg| seg.is_empty() || seg == "." || seg == "..")
         {
-            bail!("invalid Hugging Face repo id '{repo_id}' in '{uri}' (expected org/repo)");
+            return Err(HfError::InvalidSpec(format!(
+                "invalid Hugging Face repo id '{repo_id}' in '{uri}' (expected org/repo)"
+            )));
         }
         if filename.is_empty()
             || filename.contains("..")
@@ -110,7 +169,9 @@ impl HfSpec {
                 .split('/')
                 .any(|seg| seg.is_empty() || seg == "." || seg == "..")
         {
-            bail!("invalid Hugging Face filename '{filename}' in '{uri}'");
+            return Err(HfError::InvalidSpec(format!(
+                "invalid Hugging Face filename '{filename}' in '{uri}'"
+            )));
         }
 
         Ok(Self {
@@ -458,7 +519,7 @@ pub fn ensure_hf_downloaded_with_progress(
         return hub_paths
             .into_iter()
             .next()
-            .context("empty shard expansion");
+            .ok_or_else(|| HfError::DownloadFailed("empty shard expansion".into()));
     }
 
     let token = load_hf_token();
@@ -502,7 +563,7 @@ pub fn ensure_hf_downloaded_with_progress(
         )?;
     }
 
-    primary_path.context("empty shard expansion")
+    primary_path.ok_or_else(|| HfError::DownloadFailed("empty shard expansion".into()))
 }
 
 fn is_complete_cached_file(path: &Path) -> bool {
@@ -545,9 +606,13 @@ impl PartLock {
             .write(true)
             .truncate(false)
             .open(lock_path)
-            .with_context(|| format!("open download lock {}", lock_path.display()))?;
-        file.lock()
-            .with_context(|| format!("acquire exclusive lock on {}", lock_path.display()))?;
+            .map_err(|e| HfError::io(format!("open download lock {}", lock_path.display()), e))?;
+        file.lock().map_err(|e| {
+            HfError::io(
+                format!("acquire exclusive lock on {}", lock_path.display()),
+                e,
+            )
+        })?;
         Ok(Self { _file: file })
     }
 }
@@ -617,7 +682,9 @@ fn resolve_redirect_url(base_url: &str, location: &str) -> Result<String> {
         return Ok(loc.to_string());
     }
     let origin = url_origin(base_url).ok_or_else(|| {
-        anyhow::anyhow!("cannot resolve relative redirect '{loc}' against '{base_url}'")
+        HfError::Http(format!(
+            "cannot resolve relative redirect '{loc}' against '{base_url}'"
+        ))
     })?;
     if loc.starts_with('/') {
         Ok(format!("{origin}{loc}"))
@@ -776,7 +843,7 @@ fn download_with_resume(
 ) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("create cache directory {}", parent.display()))?;
+            .map_err(|e| HfError::io(format!("create cache directory {}", parent.display()), e))?;
     }
 
     let lock_path = lock_path_for(dest);
@@ -787,10 +854,10 @@ fn download_with_resume(
         .unwrap_or_else(|| lock_path.clone());
     let inserted = ACTIVE_THREAD_PART_LOCKS.with(|set| set.borrow_mut().insert(lock_key.clone()));
     if !inserted {
-        bail!(
+        return Err(HfError::DownloadFailed(format!(
             "re-entrant download of '{}' from inside progress callback would deadlock",
             dest.display()
-        );
+        )));
     }
     let _thread_reentry_guard = ThreadPartLockGuard(lock_key);
     let _lock = PartLock::acquire(&lock_path)?;
@@ -887,7 +954,7 @@ fn download_with_resume(
             }
             let resp = req
                 .call()
-                .with_context(|| format!("HTTP GET failed for {current_url}"))?;
+                .map_err(|e| HfError::Http(format!("HTTP GET failed for {current_url}: {e}")))?;
             let code = resp.status().as_u16();
             if matches!(code, 301 | 302 | 303 | 307 | 308)
                 && let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok())
@@ -901,7 +968,9 @@ fn download_with_resume(
             }
             return Ok((resp, redirected, hub_sha256));
         }
-        bail!("too many redirects downloading {url}")
+        Err(HfError::Http(format!(
+            "too many redirects downloading {url}"
+        )))
     };
 
     let (mut resp, mut hub_redirected, mut hub_sha256) =
@@ -933,11 +1002,10 @@ fn download_with_resume(
 
     if (existing_len == 0 && status != 200) || (existing_len > 0 && status != 200 && status != 206)
     {
-        bail!(
+        return Err(HfError::Http(format!(
             "Hugging Face download failed for hf://{}:{} (HTTP {status} from {url})",
-            spec.repo_id,
-            spec.filename
-        );
+            spec.repo_id, spec.filename
+        )));
     }
 
     let resp_etag = extract_etag(resp.headers());
@@ -963,11 +1031,10 @@ fn download_with_resume(
         (resp, hub_redirected, hub_sha256) = send_get(0, None)?;
         status = resp.status().as_u16();
         if status != 200 {
-            bail!(
+            return Err(HfError::Http(format!(
                 "Hugging Face restart download failed for hf://{}:{} (HTTP {status} from {url})",
-                spec.repo_id,
-                spec.filename
-            );
+                spec.repo_id, spec.filename
+            )));
         }
     }
 
@@ -1015,13 +1082,13 @@ fn download_with_resume(
             .create(true)
             .append(true)
             .open(&part_path)
-            .with_context(|| format!("open {} for resume", part_path.display()))?;
+            .map_err(|e| HfError::io(format!("open {} for resume", part_path.display()), e))?;
         (f, h)
     } else {
         existing_len = 0;
         let _ = fs::remove_file(&meta_path);
-        let f =
-            File::create(&part_path).with_context(|| format!("create {}", part_path.display()))?;
+        let f = File::create(&part_path)
+            .map_err(|e| HfError::io(format!("create {}", part_path.display()), e))?;
         write_part_meta(
             &meta_path,
             &PartMeta {
@@ -1074,12 +1141,12 @@ fn download_with_resume(
     loop {
         let n = reader
             .read(&mut buf)
-            .with_context(|| format!("network read error downloading {url}"))?;
+            .map_err(|e| HfError::io(format!("network read error downloading {url}"), e))?;
         if n == 0 {
             break;
         }
         file.write_all(&buf[..n])
-            .with_context(|| format!("write error for {}", part_path.display()))?;
+            .map_err(|e| HfError::io(format!("write error for {}", part_path.display()), e))?;
         if let Some(h) = hasher.as_mut() {
             h.update(&buf[..n]);
         }
@@ -1151,13 +1218,10 @@ fn download_with_resume(
         if tty_stderr {
             eprintln!();
         }
-        bail!(
+        return Err(HfError::DownloadFailed(format!(
             "truncated download for hf://{}:{} (got {} bytes, expected {})",
-            spec.repo_id,
-            spec.filename,
-            downloaded,
-            expected
-        );
+            spec.repo_id, spec.filename, downloaded, expected
+        )));
     }
 
     if let (Some(expected_hex), Some(h)) = (&final_sha256, hasher) {
@@ -1168,21 +1232,21 @@ fn download_with_resume(
             }
             let _ = fs::remove_file(&part_path);
             let _ = fs::remove_file(&meta_path);
-            bail!(
+            return Err(HfError::DownloadFailed(format!(
                 "SHA-256 mismatch for hf://{}:{} (expected {}, got {}); removed corrupt partial file",
-                spec.repo_id,
-                spec.filename,
-                expected_hex,
-                actual_hex
-            );
+                spec.repo_id, spec.filename, expected_hex, actual_hex
+            )));
         }
     }
 
-    fs::rename(&part_path, dest).with_context(|| {
-        format!(
-            "rename completed download {} -> {}",
-            part_path.display(),
-            dest.display()
+    fs::rename(&part_path, dest).map_err(|e| {
+        HfError::io(
+            format!(
+                "rename completed download {} -> {}",
+                part_path.display(),
+                dest.display()
+            ),
+            e,
         )
     })?;
     let _ = fs::remove_file(&meta_path);

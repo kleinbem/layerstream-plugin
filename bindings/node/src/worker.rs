@@ -92,22 +92,18 @@ pub struct NativeWorkerStream {
 impl NativeWorkerStream {
     #[napi(getter)]
     pub fn summary(&self) -> Option<GenerateSummaryJs> {
-        let guard = self.last_summary.lock().ok()?;
-        guard.as_ref().map(summary_to_js)
+        self.last_summary.lock().as_ref().map(summary_to_js)
     }
 
     #[napi]
     pub fn cancel(&self) {
         self.closed.store(true, Ordering::SeqCst);
         let _ = self.cancel_handle.cancel();
-        if let Ok(mut guard) = self.inner.lock()
-            && let Some(stream) = guard.as_mut()
-        {
+        let mut guard = self.inner.lock();
+        if let Some(stream) = guard.as_mut() {
             stream.close();
-            if let Some(s) = stream.summary()
-                && let Ok(mut sg) = self.last_summary.lock()
-            {
-                *sg = Some(s);
+            if let Some(s) = stream.summary() {
+                *self.last_summary.lock() = Some(s);
             }
         }
     }
@@ -122,10 +118,7 @@ impl NativeWorkerStream {
         let closed = Arc::clone(&self.closed);
         run_blocking(move || {
             let mut stream = {
-                let mut guard = inner
-                    .lock()
-                    .map_err(|_| generic_err("worker stream lock poisoned"))?;
-                let Some(s) = guard.take() else {
+                let Some(s) = inner.lock().take() else {
                     return Ok(None);
                 };
                 s
@@ -134,14 +127,10 @@ impl NativeWorkerStream {
             if closed.load(Ordering::SeqCst) {
                 stream.close();
             }
-            if let Some(s) = stream.summary()
-                && let Ok(mut sg) = last_summary.lock()
-            {
-                *sg = Some(s);
+            if let Some(s) = stream.summary() {
+                *last_summary.lock() = Some(s);
             }
-            if let Ok(mut guard) = inner.lock() {
-                *guard = Some(stream);
-            }
+            *inner.lock() = Some(stream);
             if closed.load(Ordering::SeqCst) {
                 return Ok(None);
             }
@@ -158,23 +147,16 @@ impl NativeWorkerStream {
         let last_summary = Arc::clone(&self.last_summary);
         run_blocking(move || {
             let mut stream = {
-                let mut guard = inner
-                    .lock()
-                    .map_err(|_| generic_err("worker stream lock poisoned"))?;
-                let Some(s) = guard.take() else {
+                let Some(s) = inner.lock().take() else {
                     return Ok(());
                 };
                 s
             };
             stream.close();
-            if let Some(s) = stream.summary()
-                && let Ok(mut sg) = last_summary.lock()
-            {
-                *sg = Some(s);
+            if let Some(s) = stream.summary() {
+                *last_summary.lock() = Some(s);
             }
-            if let Ok(mut guard) = inner.lock() {
-                *guard = Some(stream);
-            }
+            *inner.lock() = Some(stream);
             Ok(())
         })
         .await

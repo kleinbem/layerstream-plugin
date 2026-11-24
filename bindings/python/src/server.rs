@@ -2,10 +2,11 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
@@ -31,16 +32,15 @@ pub struct ServerHandle {
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
-        if let Ok(mut st) = self.inner.lock() {
-            if let Some(app_state) = st.state.take() {
-                app_state.request_shutdown();
-            }
-            if let Some(tx) = st.shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-            if let Some(h) = st.worker.take() {
-                let _ = h.join();
-            }
+        let mut st = self.inner.lock();
+        if let Some(app_state) = st.state.take() {
+            app_state.request_shutdown();
+        }
+        if let Some(tx) = st.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(h) = st.worker.take() {
+            let _ = h.join();
         }
     }
 }
@@ -68,10 +68,7 @@ impl ServerHandle {
 
     fn stop(&self, py: Python<'_>) -> PyResult<()> {
         let (app_state, tx, worker) = {
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("server handle lock poisoned"))?;
+            let mut guard = self.inner.lock();
             (
                 guard.state.take(),
                 guard.shutdown_tx.take(),
@@ -99,13 +96,13 @@ impl ServerHandle {
                 return Err(err);
             }
             let finished = py.detach(|| {
-                let guard = self.inner.lock().ok()?;
+                let guard = self.inner.lock();
                 if guard.finished.load(Ordering::Acquire) {
-                    return Some(true);
+                    return true;
                 }
-                Some(guard.worker.as_ref().is_some_and(|w| w.is_finished()))
+                guard.worker.as_ref().is_some_and(|w| w.is_finished())
             });
-            if finished.unwrap_or(true) {
+            if finished {
                 self.stop(py)?;
                 return Ok(());
             }
@@ -292,9 +289,7 @@ pub(crate) fn start_server(
         Ok((cfg, host_owned))
     });
 
-    if let Ok(mut guard) = cb_err_slot.lock()
-        && let Some(py_err) = guard.take()
-    {
+    if let Some(py_err) = cb_err_slot.lock().take() {
         return Err(py_err);
     }
     let (server_cfg, bind_host) = cfg_res.map_err(map_open_err)?;

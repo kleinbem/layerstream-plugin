@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use crate::{GgufIoError, Result};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
@@ -157,15 +157,24 @@ impl GgufIndex {
         let mut total_file_bytes = 0u64;
 
         for (shard_idx, shard_path) in shards.iter().enumerate() {
-            let file = File::open(shard_path)
-                .with_context(|| format!("failed to open GGUF shard {}", shard_path.display()))?;
+            let file = File::open(shard_path).map_err(|e| {
+                GgufIoError::io(
+                    format!("failed to open GGUF shard {}", shard_path.display()),
+                    e,
+                )
+            })?;
             let file_len = file.metadata()?.len();
             shard_sizes.push(file_len);
             total_file_bytes += file_len;
 
             let mut reader = BufReader::new(file);
-            let parsed = parse_single_header(&mut reader, shard_idx, file_len, false)
-                .with_context(|| format!("failed to parse GGUF header {}", shard_path.display()))?;
+            let parsed =
+                parse_single_header(&mut reader, shard_idx, file_len, false).map_err(|e| {
+                    GgufIoError::InvalidFormat(format!(
+                        "failed to parse GGUF header {}: {e}",
+                        shard_path.display()
+                    ))
+                })?;
 
             if shard_idx == 0 {
                 kv_all = parsed.kv;
@@ -234,7 +243,7 @@ impl GgufIndex {
             let loc = self
                 .tensors
                 .get(name)
-                .with_context(|| format!("tensor '{name}' missing from GGUF index"))?;
+                .ok_or_else(|| GgufIoError::MissingTensor(name.to_string()))?;
             resolved.push((loc.resolved(), src_off, dst_offset, len, tensor_idx));
         }
         self.plan_coalesced_sub_slices_resolved(&resolved)
@@ -258,26 +267,30 @@ impl GgufIndex {
             let shard_size = self.shard_sizes[loc.shard_idx];
             if let Some(tensor_bytes) = loc.encoded_byte_len {
                 let Some(rel_end) = src_off.checked_add(len as u64) else {
-                    bail!(
+                    return Err(GgufIoError::OutOfBounds(format!(
                         "tensor slice idx={tensor_idx} offset {src_off} + len {len} overflows u64"
-                    );
+                    )));
                 };
                 if rel_end > tensor_bytes {
-                    bail!(
+                    return Err(GgufIoError::OutOfBounds(format!(
                         "tensor slice idx={tensor_idx} [{src_off}, {rel_end}) exceeds tensor byte length {tensor_bytes}"
-                    );
+                    )));
                 }
             }
             let Some(abs_offset) = loc.abs_offset.checked_add(src_off) else {
-                bail!("tensor slice idx={tensor_idx} absolute offset overflows u64");
+                return Err(GgufIoError::OutOfBounds(format!(
+                    "tensor slice idx={tensor_idx} absolute offset overflows u64"
+                )));
             };
             let Some(abs_end) = abs_offset.checked_add(len as u64) else {
-                bail!("tensor slice idx={tensor_idx} absolute end overflows u64");
+                return Err(GgufIoError::OutOfBounds(format!(
+                    "tensor slice idx={tensor_idx} absolute end overflows u64"
+                )));
             };
             if abs_end > shard_size {
-                bail!(
+                return Err(GgufIoError::OutOfBounds(format!(
                     "tensor slice idx={tensor_idx} [{abs_offset}, {abs_end}) exceeds shard size {shard_size}"
-                );
+                )));
             }
             items.push(Item {
                 shard_idx: loc.shard_idx,
@@ -355,7 +368,7 @@ fn infer_layer_count(tensors: &HashMap<String, TensorLocation>) -> Result<u32> {
         None => Ok(0),
         Some(m) => m
             .checked_add(1)
-            .context("GGUF block_count exceeds u32::MAX"),
+            .ok_or_else(|| GgufIoError::InvalidFormat("GGUF block_count exceeds u32::MAX".into())),
     }
 }
 
@@ -379,7 +392,10 @@ fn discover_shards(primary: &Path) -> Result<Vec<PathBuf>> {
         for idx in 1..=total {
             let candidate = parent.join(format!("{prefix}-{idx:05}-of-{total:05}.gguf"));
             if !candidate.is_file() {
-                bail!("missing multi-part GGUF shard: {}", candidate.display());
+                return Err(GgufIoError::InvalidFormat(format!(
+                    "missing multi-part GGUF shard: {}",
+                    candidate.display()
+                )));
             }
             shards.push(candidate);
         }
@@ -432,7 +448,8 @@ pub fn check_gguf_draft_compatible(
 ) -> Result<()> {
     let target_tokens = read_gguf_vocab_tokens(target_path.as_ref())?;
     let draft_tokens = read_gguf_vocab_tokens(draft_path.as_ref())?;
-    check_vocab_lists_compatible(&target_tokens, &draft_tokens).map_err(|msg| anyhow::anyhow!(msg))
+    check_vocab_lists_compatible(&target_tokens, &draft_tokens)
+        .map_err(GgufIoError::IncompatibleDraft)
 }
 
 pub fn check_vocab_lists_compatible(
@@ -471,15 +488,23 @@ pub fn check_vocab_lists_compatible(
 fn read_gguf_vocab_tokens(path: &Path) -> Result<Vec<String>> {
     let shards = discover_shards(path)?;
     let primary = &shards[0];
-    let file = File::open(primary)
-        .with_context(|| format!("failed to open GGUF for vocab check {}", primary.display()))?;
+    let file = File::open(primary).map_err(|e| {
+        GgufIoError::io(
+            format!("failed to open GGUF for vocab check {}", primary.display()),
+            e,
+        )
+    })?;
     let file_len = file.metadata()?.len();
     let mut reader = BufReader::new(file);
-    let parsed = parse_single_header(&mut reader, 0, file_len, true)
-        .with_context(|| format!("failed to parse GGUF header {}", primary.display()))?;
-    parsed
-        .vocab_tokens
-        .context("GGUF header missing tokenizer.ggml.tokens array")
+    let parsed = parse_single_header(&mut reader, 0, file_len, true).map_err(|e| {
+        GgufIoError::InvalidFormat(format!(
+            "failed to parse GGUF header {}: {e}",
+            primary.display()
+        ))
+    })?;
+    parsed.vocab_tokens.ok_or_else(|| {
+        GgufIoError::InvalidFormat("GGUF header missing tokenizer.ggml.tokens array".into())
+    })
 }
 
 fn parse_single_header<R: Read + Seek>(
@@ -491,21 +516,30 @@ fn parse_single_header<R: Read + Seek>(
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != GGUF_MAGIC {
-        bail!("invalid GGUF magic: {:?}", magic);
+        return Err(GgufIoError::InvalidFormat(format!(
+            "invalid GGUF magic: {:?}",
+            magic
+        )));
     }
 
     let version = read_u32(r)?;
     if !(2..=3).contains(&version) {
-        bail!("unsupported GGUF version: {version}");
+        return Err(GgufIoError::InvalidFormat(format!(
+            "unsupported GGUF version: {version}"
+        )));
     }
 
     let tensor_count_u64 = read_u64(r)?;
     let kv_count_u64 = read_u64(r)?;
     if tensor_count_u64 > MAX_GGUF_TENSORS as u64 {
-        bail!("GGUF tensor_count {tensor_count_u64} exceeds safety limit {MAX_GGUF_TENSORS}");
+        return Err(GgufIoError::InvalidFormat(format!(
+            "GGUF tensor_count {tensor_count_u64} exceeds safety limit {MAX_GGUF_TENSORS}"
+        )));
     }
     if kv_count_u64 > MAX_GGUF_KV_COUNT as u64 {
-        bail!("GGUF kv_count {kv_count_u64} exceeds safety limit {MAX_GGUF_KV_COUNT}");
+        return Err(GgufIoError::InvalidFormat(format!(
+            "GGUF kv_count {kv_count_u64} exceeds safety limit {MAX_GGUF_KV_COUNT}"
+        )));
     }
     let tensor_count = tensor_count_u64 as usize;
     let kv_count = kv_count_u64 as usize;
@@ -519,7 +553,9 @@ fn parse_single_header<R: Read + Seek>(
             let elem_type = read_u32(r)?;
             let len = read_u64(r)?;
             if elem_type != 8 || len > MAX_GGUF_ARRAY_ELEMS {
-                bail!("unexpected tokenizer.ggml.tokens array type={elem_type} len={len}");
+                return Err(GgufIoError::InvalidFormat(format!(
+                    "unexpected tokenizer.ggml.tokens array type={elem_type} len={len}"
+                )));
             }
             let mut toks = Vec::with_capacity((len as usize).min(262_144));
             for _ in 0..len {
@@ -539,7 +575,9 @@ fn parse_single_header<R: Read + Seek>(
         .map(u64::from)
         .unwrap_or(GGUF_DEFAULT_ALIGNMENT);
     if alignment == 0 || !alignment.is_power_of_two() {
-        bail!("invalid GGUF general.alignment: {alignment} (must be non-zero power of two)");
+        return Err(GgufIoError::InvalidFormat(format!(
+            "invalid GGUF general.alignment: {alignment} (must be non-zero power of two)"
+        )));
     }
 
     if capture_vocab {
@@ -555,7 +593,9 @@ fn parse_single_header<R: Read + Seek>(
         let name = read_string(r, file_len)?;
         let n_dims_u32 = read_u32(r)?;
         if n_dims_u32 as usize > MAX_GGUF_TENSOR_DIMS {
-            bail!("GGUF tensor '{name}' n_dims {n_dims_u32} exceeds limit {MAX_GGUF_TENSOR_DIMS}");
+            return Err(GgufIoError::InvalidFormat(format!(
+                "GGUF tensor '{name}' n_dims {n_dims_u32} exceeds limit {MAX_GGUF_TENSOR_DIMS}"
+            )));
         }
         let n_dims = n_dims_u32 as usize;
         let mut dims = Vec::with_capacity(n_dims);
@@ -574,7 +614,7 @@ fn parse_single_header<R: Read + Seek>(
     for (name, dims, ggml_type, rel_offset) in raw_tensors {
         let abs_offset = data_start
             .checked_add(rel_offset)
-            .context("GGUF tensor offset overflow")?;
+            .ok_or_else(|| GgufIoError::InvalidFormat("GGUF tensor offset overflow".into()))?;
         tensors.push(TensorLocation {
             name,
             shard_idx,
@@ -604,7 +644,9 @@ fn read_kv_value_depth<R: Read + Seek>(
     depth: u32,
 ) -> Result<KvValue> {
     if depth > MAX_GGUF_ARRAY_DEPTH {
-        bail!("GGUF metadata array nesting depth exceeds limit {MAX_GGUF_ARRAY_DEPTH}");
+        return Err(GgufIoError::InvalidFormat(format!(
+            "GGUF metadata array nesting depth exceeds limit {MAX_GGUF_ARRAY_DEPTH}"
+        )));
     }
     match val_type {
         0 => {
@@ -639,12 +681,14 @@ fn read_kv_value_depth<R: Read + Seek>(
             let elem_type = read_u32(r)?;
             let len = read_u64(r)?;
             if len > MAX_GGUF_ARRAY_ELEMS {
-                bail!("GGUF array length {len} exceeds safety limit {MAX_GGUF_ARRAY_ELEMS}");
+                return Err(GgufIoError::InvalidFormat(format!(
+                    "GGUF array length {len} exceeds safety limit {MAX_GGUF_ARRAY_ELEMS}"
+                )));
             }
             if let Some(elem_size) = fixed_kv_type_size(elem_type) {
-                let bytes = len
-                    .checked_mul(elem_size)
-                    .context("GGUF array byte size overflow")?;
+                let bytes = len.checked_mul(elem_size).ok_or_else(|| {
+                    GgufIoError::InvalidFormat("GGUF array byte size overflow".into())
+                })?;
                 skip_bytes(r, bytes, file_len)?;
             } else {
                 for _ in 0..len {
@@ -662,7 +706,9 @@ fn read_kv_value_depth<R: Read + Seek>(
             skip_bytes(r, 8, file_len)?;
             Ok(KvValue::Other)
         } // FLOAT64
-        other => bail!("unknown GGUF KV type id: {other}"),
+        other => Err(GgufIoError::InvalidFormat(format!(
+            "unknown GGUF KV type id: {other}"
+        ))),
     }
 }
 
@@ -693,9 +739,9 @@ fn read_string<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<String> {
     let pos = r.stream_position()?;
     let remaining = file_len.saturating_sub(pos);
     if len_u64 > MAX_GGUF_STRING_BYTES as u64 || len_u64 > remaining {
-        bail!(
+        return Err(GgufIoError::InvalidFormat(format!(
             "GGUF string length {len_u64} exceeds bounds (max={MAX_GGUF_STRING_BYTES}, remaining={remaining})"
-        );
+        )));
     }
     let mut buf = vec![0u8; len_u64 as usize];
     r.read_exact(&mut buf)?;
@@ -704,9 +750,13 @@ fn read_string<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<String> {
 
 fn skip_bytes<R: Seek>(r: &mut R, n: u64, file_len: u64) -> Result<()> {
     let pos = r.stream_position()?;
-    let target = pos.checked_add(n).context("GGUF seek offset overflow")?;
+    let target = pos
+        .checked_add(n)
+        .ok_or_else(|| GgufIoError::InvalidFormat("GGUF seek offset overflow".into()))?;
     if target > file_len {
-        bail!("GGUF skip past EOF ({target} > {file_len})");
+        return Err(GgufIoError::InvalidFormat(format!(
+            "GGUF skip past EOF ({target} > {file_len})"
+        )));
     }
     r.seek(SeekFrom::Start(target))?;
     Ok(())
@@ -938,5 +988,151 @@ mod tests {
             idx.plan_coalesced_sub_slices(&[("t0", 240, 0, 32, 0)])
                 .is_err()
         );
+    }
+
+    fn write_gguf_string(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    fn build_minimal_gguf(
+        arch: &str,
+        n_layers: u32,
+        vocab: Option<&[&str]>,
+        tensors: &[(&str, &[u64], u32, u64)],
+        payload_bytes: usize,
+    ) -> Vec<u8> {
+        let mut kv_count = 2u64;
+        if vocab.is_some() {
+            kv_count += 1;
+        }
+        let mut buf = gguf_header(3, tensors.len() as u64, kv_count);
+
+        // general.architecture = STRING (8)
+        write_gguf_string(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        write_gguf_string(&mut buf, arch);
+
+        // <arch>.block_count = UINT32 (4)
+        write_gguf_string(&mut buf, &format!("{arch}.block_count"));
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&n_layers.to_le_bytes());
+
+        // Optional tokenizer.ggml.tokens = ARRAY (9) of STRING (8)
+        if let Some(tokens) = vocab {
+            write_gguf_string(&mut buf, "tokenizer.ggml.tokens");
+            buf.extend_from_slice(&9u32.to_le_bytes());
+            buf.extend_from_slice(&8u32.to_le_bytes());
+            buf.extend_from_slice(&(tokens.len() as u64).to_le_bytes());
+            for tok in tokens {
+                write_gguf_string(&mut buf, tok);
+            }
+        }
+
+        for &(name, dims, ggml_type, rel_offset) in tensors {
+            write_gguf_string(&mut buf, name);
+            buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for &d in dims {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            buf.extend_from_slice(&ggml_type.to_le_bytes());
+            buf.extend_from_slice(&rel_offset.to_le_bytes());
+        }
+
+        let aligned = align_up(buf.len() as u64, GGUF_DEFAULT_ALIGNMENT) as usize;
+        buf.resize(aligned + payload_bytes, 0xAB);
+        buf
+    }
+
+    #[test]
+    fn opens_single_and_multi_shard_gguf_and_reports_missing_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s1 = dir.path().join("model-00001-of-00002.gguf");
+        let s2 = dir.path().join("model-00002-of-00002.gguf");
+
+        let bytes1 = build_minimal_gguf(
+            "qwen3",
+            2,
+            None,
+            &[("blk.0.attn_q.weight", &[64], 0, 0)],
+            512,
+        );
+        std::fs::write(&s1, &bytes1).unwrap();
+
+        // Missing second shard must fail closed with InvalidFormat.
+        let err = GgufIndex::open(&s1).unwrap_err();
+        assert!(matches!(err, GgufIoError::InvalidFormat(_)));
+        assert!(err.to_string().contains("missing multi-part GGUF shard"));
+
+        let bytes2 = build_minimal_gguf(
+            "qwen3",
+            2,
+            None,
+            &[("blk.1.attn_q.weight", &[64], 0, 0)],
+            512,
+        );
+        std::fs::write(&s2, &bytes2).unwrap();
+
+        let idx = GgufIndex::open(&s1).unwrap();
+        assert_eq!(idx.shards.len(), 2);
+        assert_eq!(idx.meta.architecture, "qwen3");
+        assert_eq!(idx.meta.n_layers, 2);
+        assert_eq!(idx.tensors["blk.0.attn_q.weight"].shard_idx, 0);
+        assert_eq!(idx.tensors["blk.1.attn_q.weight"].shard_idx, 1);
+
+        // Missing tensor returns typed GgufIoError::MissingTensor.
+        let miss = idx
+            .plan_coalesced_spans(&[("nonexistent.weight", 0, 16)])
+            .unwrap_err();
+        assert!(matches!(miss, GgufIoError::MissingTensor(ref n) if n == "nonexistent.weight"));
+    }
+
+    #[test]
+    fn checks_vocab_lists_and_gguf_draft_compatibility() {
+        let base: Vec<String> = (0..10).map(|i| format!("tok_{i}")).collect();
+        assert!(check_vocab_lists_compatible(&base, &base).is_ok());
+
+        // Trailing padded tokens within MAX_DRAFT_VOCAB_PAD_DELTA are allowed.
+        let mut padded = base.clone();
+        padded.extend((0..16).map(|i| format!("pad_{i}")));
+        assert!(check_vocab_lists_compatible(&padded, &base).is_ok());
+
+        // Empty vocab fails.
+        assert!(check_vocab_lists_compatible(&[], &base).is_err());
+
+        // Mismatched token ID fails.
+        let mut mismatch = base.clone();
+        mismatch[3] = "DIFFERENT".to_string();
+        assert!(check_vocab_lists_compatible(&base, &mismatch).is_err());
+
+        // Excess padding delta fails.
+        let mut too_many = base.clone();
+        too_many.extend((0..=MAX_DRAFT_VOCAB_PAD_DELTA).map(|i| format!("extra_{i}")));
+        assert!(check_vocab_lists_compatible(&too_many, &base).is_err());
+
+        // End-to-end file-based check via `check_gguf_draft_compatible`.
+        let dir = tempfile::tempdir().unwrap();
+        let target_p = dir.path().join("target.gguf");
+        let draft_ok = dir.path().join("draft_ok.gguf");
+        let draft_bad = dir.path().join("draft_bad.gguf");
+        std::fs::write(
+            &target_p,
+            build_minimal_gguf("llama", 1, Some(&["a", "b", "c", "pad"]), &[], 64),
+        )
+        .unwrap();
+        std::fs::write(
+            &draft_ok,
+            build_minimal_gguf("llama", 1, Some(&["a", "b", "c"]), &[], 64),
+        )
+        .unwrap();
+        std::fs::write(
+            &draft_bad,
+            build_minimal_gguf("llama", 1, Some(&["a", "X", "c"]), &[], 64),
+        )
+        .unwrap();
+
+        assert!(check_gguf_draft_compatible(&target_p, &draft_ok).is_ok());
+        let err = check_gguf_draft_compatible(&target_p, &draft_bad).unwrap_err();
+        assert!(matches!(err, GgufIoError::IncompatibleDraft(_)));
     }
 }

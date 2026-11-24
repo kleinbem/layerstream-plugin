@@ -11,8 +11,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -31,6 +31,7 @@ use layerstream_server::{
     AppState, MAX_REQUEST_BODY_BYTES, ModelRegistry, ServerConfig, WORKER_TOKEN_HEADER, api_error,
     build_router_with_token, models_list_json, with_api_key_auth,
 };
+use parking_lot::{Mutex as StdMutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -161,9 +162,7 @@ pub async fn run_worker_process() -> Result<()> {
         let shutdown_tx = shutdown_tx.clone();
         move || {
             state.request_shutdown();
-            if let Ok(mut guard) = shutdown_tx.lock()
-                && let Some(tx) = guard.take()
-            {
+            if let Some(tx) = shutdown_tx.lock().take() {
                 let _ = tx.send(());
             }
         }
@@ -282,9 +281,7 @@ struct CoordinatorPermit {
 
 impl Drop for CoordinatorPermit {
     fn drop(&mut self) {
-        if let Ok(mut ts) = self.activity.last_finished.lock() {
-            *ts = Instant::now();
-        }
+        *self.activity.last_finished.lock() = Instant::now();
         self.activity.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -361,30 +358,24 @@ impl WorkerCoordinator {
     }
 
     pub fn model_count(&self) -> usize {
-        self.registry.read().map(|r| r.len()).unwrap_or(0)
+        self.registry.read().len()
     }
 
     pub fn registry_snapshot(&self) -> ModelRegistry {
-        self.registry.read().map(|r| r.clone()).unwrap_or_default()
+        self.registry.read().clone()
     }
 
     pub fn set_registry(&self, new_registry: ModelRegistry) {
-        if let Ok(mut guard) = self.registry.write() {
-            *guard = new_registry;
-            self.registry_generation.fetch_add(1, Ordering::SeqCst);
-        }
+        *self.registry.write() = new_registry;
+        self.registry_generation.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn set_loading_status(&self, status: Option<String>) {
-        if let Ok(mut guard) = self.loading_status.write() {
-            *guard = status;
-        }
+        *self.loading_status.write() = status;
     }
 
     pub fn set_loading_error(&self, err: Option<String>) {
-        if let Ok(mut guard) = self.loading_error.write() {
-            *guard = err;
-        }
+        *self.loading_error.write() = err;
     }
 
     pub fn set_loading_failed(&self, err: String) {
@@ -393,11 +384,11 @@ impl WorkerCoordinator {
     }
 
     pub fn loading_status(&self) -> Option<String> {
-        self.loading_status.read().ok().and_then(|g| g.clone())
+        self.loading_status.read().clone()
     }
 
     pub fn loading_error(&self) -> Option<String> {
-        self.loading_error.read().ok().and_then(|g| g.clone())
+        self.loading_error.read().clone()
     }
 
     pub fn request_shutdown(&self) {
@@ -472,12 +463,8 @@ impl WorkerCoordinator {
         if guard.is_none() || self.activity.in_flight.load(Ordering::SeqCst) != 0 {
             return false;
         }
-        let expired = self
-            .activity
-            .last_finished
-            .lock()
-            .map(|ts| now.saturating_duration_since(*ts) >= self.config.idle_timeout)
-            .unwrap_or(false);
+        let expired = now.saturating_duration_since(*self.activity.last_finished.lock())
+            >= self.config.idle_timeout;
         if !expired {
             return false;
         }
@@ -489,7 +476,6 @@ impl WorkerCoordinator {
         let models: Vec<WorkerModelSpec> = self
             .registry
             .read()
-            .map_err(|_| anyhow!("model registry lock poisoned"))?
             .list()
             .into_iter()
             .map(|entry| WorkerModelSpec {
@@ -735,11 +721,7 @@ async fn coord_health(State(state): State<WorkerCoordinator>) -> impl IntoRespon
 }
 
 async fn coord_list_models(State(state): State<WorkerCoordinator>) -> impl IntoResponse {
-    let payload = state
-        .registry
-        .read()
-        .map(|r| models_list_json(&r))
-        .unwrap_or_else(|_| json!({ "object": "list", "data": [] }));
+    let payload = models_list_json(&state.registry.read());
     Json(payload)
 }
 
@@ -835,12 +817,7 @@ async fn coord_proxy_inference(
     };
     let requested_model = parsed.get("model").and_then(Value::as_str);
     {
-        let Ok(registry) = state.registry.read() else {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "model registry lock poisoned",
-            );
-        };
+        let registry = state.registry.read();
         if let Some(id) = requested_model {
             if registry.get(id).is_none() {
                 return api_error(
@@ -1218,9 +1195,7 @@ mod tests {
                 loop {
                     match stdin_reader.read(&mut buf).await {
                         Ok(0) | Err(_) => {
-                            if let Ok(mut g) = tx_eof.lock()
-                                && let Some(tx) = g.take()
-                            {
+                            if let Some(tx) = tx_eof.lock().take() {
                                 let _ = tx.send(());
                             }
                             break;

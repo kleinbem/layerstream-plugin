@@ -29,6 +29,7 @@ hyper-util.workspace = true
 layerstream-core = { path = "../layerstream-core", features = ["hf"] }
 layerstream-server = { path = "../layerstream-server" }
 mesh-llm-plugin.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

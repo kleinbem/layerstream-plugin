@@ -29,14 +29,9 @@ impl PyWorkerStream {
         if self.closed.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("worker stream lock poisoned"))?;
-        let Some(mut stream) = guard.take() else {
+        let Some(mut stream) = self.inner.lock().take() else {
             return Ok(None);
         };
-        drop(guard);
 
         let res = py.detach(move || {
             let next = stream.next_chunk();
@@ -50,9 +45,7 @@ impl PyWorkerStream {
                 stream
             });
         }
-        if let Ok(mut guard) = self.inner.lock() {
-            *guard = Some(stream);
-        }
+        *self.inner.lock() = Some(stream);
         if was_closed {
             return Ok(None);
         }
@@ -65,31 +58,21 @@ impl PyWorkerStream {
         py.detach(move || {
             let _ = cancel_handle.cancel();
         });
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("worker stream lock poisoned"))?;
-        let Some(mut stream) = guard.take() else {
+        let Some(mut stream) = self.inner.lock().take() else {
             return Ok(());
         };
-        drop(guard);
 
         let stream = py.detach(move || {
             stream.close();
             stream
         });
-        if let Ok(mut guard) = self.inner.lock() {
-            *guard = Some(stream);
-        }
+        *self.inner.lock() = Some(stream);
         Ok(())
     }
 
     #[getter]
     fn summary<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("worker stream lock poisoned"))?;
+        let guard = self.inner.lock();
         let Some(sum) = guard.as_ref().and_then(WorkerStream::summary) else {
             return Ok(None);
         };
@@ -145,7 +128,7 @@ impl PyWorkerClient {
                     cb.bind(py).call1((dict,))?;
                     Ok::<(), PyErr>(())
                 })
-                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map_err(|e| layerstream_core::hf::HfError::Cancelled(e.to_string()))
             });
             f
         });

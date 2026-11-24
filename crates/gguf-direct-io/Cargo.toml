@@ -15,11 +15,11 @@ categories = ["filesystem", "parsing"]
 workspace = true
 
 [dependencies]
-anyhow.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
 quick_cache.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

@@ -633,7 +633,8 @@ fn auto_draft_family_mapping_and_progress_callbacks() {
     }
 
     // Callback returning Err aborts uncached download immediately.
-    let abort_cb: ProgressCallback = Arc::new(|_ev| bail!("user aborted download"));
+    let abort_cb: ProgressCallback =
+        Arc::new(|_ev| Err(HfError::Cancelled("user aborted download".into())));
     let err =
         ensure_hf_downloaded_with_progress("hf://Org/Repo:other.gguf", tmp.path(), Some(&abort_cb))
             .unwrap_err();
@@ -694,4 +695,83 @@ fn find_shards_in_hf_hub_root_resolves_ref_sha_and_rejects_partial_shards() {
     let found_multi =
         find_shards_in_hf_hub_root(&spec_multi, &spec_multi.expand_shards(), hub).unwrap();
     assert_eq!(found_multi, vec![s1, s2]);
+}
+
+#[test]
+fn typed_hf_errors_and_alias_resolution_and_cache_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let local_gguf = tmp.path().join("local.gguf");
+    fs::write(&local_gguf, b"GGUF\x03\x00\x00\x00test").unwrap();
+
+    // Typed InvalidSpec on malformed hf:// URI and empty spec.
+    assert!(matches!(
+        HfSpec::parse("not-hf://org/repo:a.gguf").unwrap_err(),
+        HfError::InvalidSpec(_)
+    ));
+    assert!(matches!(
+        resolve_pretrained_model("   ", &PretrainedResolveOptions::default()).unwrap_err(),
+        HfError::InvalidSpec(_)
+    ));
+
+    // Typed NotFound on missing local path.
+    let missing = tmp.path().join("missing.gguf");
+    assert!(matches!(
+        resolve_pretrained_model(
+            missing.to_str().unwrap(),
+            &PretrainedResolveOptions::default()
+        )
+        .unwrap_err(),
+        HfError::NotFound(_)
+    ));
+
+    // Local paths pass through `resolve_model_spec` preserving `alias=`.
+    let aliased = format!("my-model={}", local_gguf.display());
+    assert_eq!(resolve_model_spec(&aliased, tmp.path()).unwrap(), aliased);
+    assert!(is_model_spec_cached(
+        local_gguf.to_str().unwrap(),
+        tmp.path()
+    ));
+    assert!(!is_model_spec_cached(
+        "hf://nonexistent-org/nonexistent-repo:missing-unique-xyz.gguf",
+        tmp.path()
+    ));
+
+    // `recommend_candidates` selects quant matching available VRAM budget.
+    let cands = vec![
+        HfGgufCandidate {
+            quant: "Q4_K_M".to_string(),
+            primary_file: "Model-Q4_K_M.gguf".to_string(),
+            shard_count: 1,
+            total_bytes: 16 * 1024 * 1024 * 1024,
+        },
+        HfGgufCandidate {
+            quant: "Q2_K".to_string(),
+            primary_file: "Model-Q2_K.gguf".to_string(),
+            shard_count: 1,
+            total_bytes: 6 * 1024 * 1024 * 1024,
+        },
+    ];
+    let recs_small_vram = recommend_candidates(
+        "org/Model-GGUF",
+        "main",
+        &cands,
+        12 * 1024 * 1024 * 1024,
+        2500.0,
+        false,
+    );
+    let best_small = recs_small_vram.iter().find(|r| r.recommended).unwrap();
+    assert_eq!(best_small.candidate.quant, "Q2_K");
+    assert_eq!(best_small.verdict, "RESIDENT");
+
+    let recs_large_vram = recommend_candidates(
+        "org/Model-GGUF",
+        "main",
+        &cands,
+        48 * 1024 * 1024 * 1024,
+        2500.0,
+        false,
+    );
+    let best_large = recs_large_vram.iter().find(|r| r.recommended).unwrap();
+    assert_eq!(best_large.candidate.quant, "Q4_K_M");
+    assert_eq!(best_large.verdict, "RESIDENT");
 }
