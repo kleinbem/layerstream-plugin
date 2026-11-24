@@ -21,14 +21,14 @@ check-versions:
     test "$cargo_ver" = "$node_cargo_ver"; \
     test "$cargo_ver" = "$node_pkg_ver"
 
-# Run fast local preflight checks (versions, formatting, lint, flake eval, workarounds)
+# Run fast local preflight checks (versions, formatting, lint, flake eval)
 preflight: check-versions
     cargo fmt --all -- --check
     (cd bindings/python && cargo fmt -- --check)
     (cd bindings/node && cargo fmt -- --check)
     nix develop .#python -c bash -c 'cd bindings/python && ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py && ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py'
     nix fmt -- --ci
-    command -v nix-check-workarounds >/dev/null && nix-check-workarounds . || true
+    if command -v nix-check-workarounds >/dev/null; then nix-check-workarounds .; fi
 
 # Format Rust, Python, and Nix files
 fmt:
