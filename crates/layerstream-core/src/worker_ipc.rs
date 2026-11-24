@@ -13,16 +13,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
-
-/// Acquires a mutex without panicking if a previous holder panicked while holding it.
-fn lock_unpoisoned<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -415,7 +411,7 @@ impl WorkerClient {
             .spawn(move || reader_loop(reader, reader_state))?;
 
         {
-            let mut st = lock_unpoisoned(&state);
+            let mut st = state.lock();
             st.reader_thread = Some(reader_thread);
         }
 
@@ -435,7 +431,7 @@ impl WorkerClient {
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
                 {
-                    let mut st = lock_unpoisoned(&client.state);
+                    let mut st = client.state.lock();
                     st.model_path = model_path;
                 }
                 Ok(client)
@@ -448,12 +444,12 @@ impl WorkerClient {
     }
 
     pub fn is_loaded(&self) -> bool {
-        let mut st = lock_unpoisoned(&self.state);
+        let mut st = self.state.lock();
         st.loaded && st.is_child_alive()
     }
 
     pub fn worker_pid(&self) -> Option<u32> {
-        let mut st = lock_unpoisoned(&self.state);
+        let mut st = self.state.lock();
         if !st.loaded {
             return None;
         }
@@ -461,7 +457,7 @@ impl WorkerClient {
     }
 
     pub fn model_path(&self) -> Option<String> {
-        let st = lock_unpoisoned(&self.state);
+        let st = self.state.lock();
         if st.loaded {
             st.model_path.clone()
         } else {
@@ -470,13 +466,13 @@ impl WorkerClient {
     }
 
     pub fn last_summary(&self) -> Option<GenerateSummary> {
-        let st = lock_unpoisoned(&self.state);
+        let st = self.state.lock();
         st.last_summary.clone()
     }
 
     fn send_cmd(&self, msg: &Value) -> Result<()> {
-        let _send_guard = lock_unpoisoned(&self.send_lock);
-        let mut st = lock_unpoisoned(&self.state);
+        let _send_guard = self.send_lock.lock();
+        let mut st = self.state.lock();
         if !st.loaded {
             return Err(anyhow!(WorkerError::new(
                 "RuntimeError",
@@ -502,7 +498,7 @@ impl WorkerClient {
         on_progress: Option<ProgressCallback>,
     ) -> Result<(Value, Option<GenerateSummary>)> {
         let (req_id, rx) = {
-            let mut st = lock_unpoisoned(&self.state);
+            let mut st = self.state.lock();
             if !st.loaded || st.sock_writer.is_none() {
                 return Err(anyhow!(WorkerError::new(
                     "RuntimeError",
@@ -517,7 +513,7 @@ impl WorkerClient {
 
         let send_res = self.send_cmd(&json!({"id": req_id, "op": op, "params": params}));
         if let Err(err) = send_res {
-            let mut st = lock_unpoisoned(&self.state);
+            let mut st = self.state.lock();
             st.pending_rpc.remove(&req_id);
             return Err(err);
         }
@@ -537,7 +533,7 @@ impl WorkerClient {
                     break msg;
                 }
                 Err(_) => {
-                    let mut st = lock_unpoisoned(&self.state);
+                    let mut st = self.state.lock();
                     st.pending_rpc.remove(&req_id);
                     return Err(anyhow!(WorkerError::new(
                         "RuntimeError",
@@ -548,7 +544,7 @@ impl WorkerClient {
         };
 
         {
-            let mut st = lock_unpoisoned(&self.state);
+            let mut st = self.state.lock();
             st.pending_rpc.remove(&req_id);
         }
 
@@ -569,7 +565,7 @@ impl WorkerClient {
             .filter(|v| !v.is_null())
             .and_then(|v| serde_json::from_value(v.clone()).ok());
         if let Some(ref sum) = summary {
-            let mut st = lock_unpoisoned(&self.state);
+            let mut st = self.state.lock();
             st.last_summary = Some(sum.clone());
         }
         Ok((resp.get("result").cloned().unwrap_or(Value::Null), summary))
@@ -712,7 +708,7 @@ impl WorkerClient {
 
     fn start_stream(&self, op: &str, params: Value) -> Result<WorkerStream> {
         let (req_id, rx) = {
-            let mut st = lock_unpoisoned(&self.state);
+            let mut st = self.state.lock();
             if !st.loaded || st.sock_writer.is_none() {
                 return Err(anyhow!(WorkerError::new(
                     "RuntimeError",
@@ -726,7 +722,7 @@ impl WorkerClient {
         };
 
         if let Err(err) = self.send_cmd(&json!({"id": req_id, "op": op, "params": params})) {
-            let mut st = lock_unpoisoned(&self.state);
+            let mut st = self.state.lock();
             st.active_streams.remove(&req_id);
             return Err(err);
         }
@@ -744,8 +740,8 @@ impl WorkerClient {
     /// Gracefully shut down, kill if necessary, and reap the isolated worker process.
     pub fn unload(&self) {
         let (child_opt, stdin_opt, reader_opt) = {
-            let _send_guard = lock_unpoisoned(&self.send_lock);
-            let mut st = lock_unpoisoned(&self.state);
+            let _send_guard = self.send_lock.lock();
+            let mut st = self.state.lock();
             st.loaded = false;
             if let Some(mut sock) = st.sock_writer.take() {
                 let _ =
@@ -816,8 +812,8 @@ pub struct WorkerCancelHandle {
 impl WorkerCancelHandle {
     /// Sends a non-blocking cancel RPC to the isolated worker for this stream's request ID.
     pub fn cancel(&self) -> bool {
-        let _send_guard = lock_unpoisoned(&self.send_lock);
-        let mut st = lock_unpoisoned(&self.state);
+        let _send_guard = self.send_lock.lock();
+        let mut st = self.state.lock();
         let cancel_id = st.alloc_id();
         if let Some(sock) = st.sock_writer.as_mut() {
             send_json_line(
@@ -854,7 +850,7 @@ impl WorkerStream {
             Ok(WorkerStreamEvent::Done(summary)) => {
                 self.done = true;
                 self.summary = summary.clone();
-                let mut st = lock_unpoisoned(&self.state);
+                let mut st = self.state.lock();
                 st.active_streams.remove(&self.req_id);
                 if let Some(sum) = summary {
                     st.last_summary = Some(sum);
@@ -863,13 +859,13 @@ impl WorkerStream {
             }
             Ok(WorkerStreamEvent::Error(err)) => {
                 self.done = true;
-                let mut st = lock_unpoisoned(&self.state);
+                let mut st = self.state.lock();
                 st.active_streams.remove(&self.req_id);
                 Err(anyhow!(err))
             }
             Err(_) => {
                 self.done = true;
-                let mut st = lock_unpoisoned(&self.state);
+                let mut st = self.state.lock();
                 st.active_streams.remove(&self.req_id);
                 Ok(None)
             }
@@ -883,8 +879,8 @@ impl WorkerStream {
         self.done = true;
 
         let cancel_sent = {
-            let _send_guard = lock_unpoisoned(&self.send_lock);
-            let mut st = lock_unpoisoned(&self.state);
+            let _send_guard = self.send_lock.lock();
+            let mut st = self.state.lock();
             let cancel_id = st.alloc_id();
             if let Some(sock) = st.sock_writer.as_mut() {
                 send_json_line(
@@ -904,7 +900,7 @@ impl WorkerStream {
                     Ok(WorkerStreamEvent::Done(summary)) => {
                         self.summary = summary.clone();
                         if let Some(sum) = summary {
-                            let mut st = lock_unpoisoned(&self.state);
+                            let mut st = self.state.lock();
                             st.last_summary = Some(sum);
                         }
                         break;
@@ -917,7 +913,7 @@ impl WorkerStream {
             }
         }
 
-        let mut st = lock_unpoisoned(&self.state);
+        let mut st = self.state.lock();
         st.active_streams.remove(&self.req_id);
     }
 }
@@ -943,7 +939,7 @@ fn reader_loop(mut reader: BufReader<TcpStream>, state: Arc<Mutex<WorkerState>>)
             continue;
         };
 
-        let st = lock_unpoisoned(&state);
+        let st = state.lock();
         if let Some(tx) = st.pending_rpc.get(&req_id).cloned() {
             drop(st);
             let _ = tx.send(msg);
@@ -980,7 +976,7 @@ fn reader_loop(mut reader: BufReader<TcpStream>, state: Arc<Mutex<WorkerState>>)
     }
 
     // Wake any blocked callers if the worker disconnected unexpectedly.
-    let mut st = lock_unpoisoned(&state);
+    let mut st = state.lock();
     st.loaded = false;
     for (_, tx) in st.pending_rpc.drain() {
         let _ = tx.send(json!({
@@ -1052,7 +1048,7 @@ pub fn run_worker_server(port: u16) -> Result<()> {
 
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     {
-        let mut w = lock_unpoisoned(&writer);
+        let mut w = writer.lock();
         send_json_line(&mut w, &json!({"token": token}))?;
     }
 
@@ -1087,7 +1083,7 @@ pub fn run_worker_server(port: u16) -> Result<()> {
                 .and_then(|p| p.get("target_id"))
                 .and_then(Value::as_u64)
             {
-                let mut cs = lock_unpoisoned(&cancel_state);
+                let mut cs = cancel_state.lock();
                 cs.0.insert(target_id);
                 if let Some(flag) = cs.1.get(&target_id) {
                     flag.store(true, Ordering::Relaxed);
@@ -1102,7 +1098,7 @@ pub fn run_worker_server(port: u16) -> Result<()> {
 
     clean_shutdown.store(true, Ordering::Release);
     {
-        let cs = lock_unpoisoned(&cancel_state);
+        let cs = cancel_state.lock();
         for flag in cs.1.values() {
             flag.store(true, Ordering::Relaxed);
         }
@@ -1120,9 +1116,8 @@ fn worker_engine_loop(
     let mut session: Option<LoadedSession> = None;
 
     let send = |msg: &Value| {
-        if let Ok(mut w) = writer.lock() {
-            let _ = send_json_line(&mut w, msg);
-        }
+        let mut w = writer.lock();
+        let _ = send_json_line(&mut w, msg);
     };
 
     while let Ok(Some(cmd)) = work_rx.recv() {
@@ -1135,7 +1130,7 @@ fn worker_engine_loop(
         let params = cmd.get("params").cloned().unwrap_or_else(|| json!({}));
 
         let already_cancelled = {
-            let mut cs = lock_unpoisoned(&cancel_state);
+            let mut cs = cancel_state.lock();
             cs.0.remove(&req_id)
         };
         if already_cancelled {
@@ -1155,12 +1150,11 @@ fn worker_engine_loop(
                     let on_progress: Option<ProgressCallback> = if open.stream_progress {
                         let pw = Arc::clone(&writer);
                         Some(Arc::new(move |ev: &DownloadProgress| {
-                            if let Ok(mut w) = pw.lock() {
-                                let _ = send_json_line(
-                                    &mut w,
-                                    &json!({"id": req_id, "event": "progress", "progress": ev}),
-                                );
-                            }
+                            let mut w = pw.lock();
+                            let _ = send_json_line(
+                                &mut w,
+                                &json!({"id": req_id, "event": "progress", "progress": ev}),
+                            );
                             Ok(())
                         }))
                     } else {
@@ -1295,7 +1289,7 @@ fn worker_engine_loop(
 
                             let cancel_flag = Arc::new(AtomicBool::new(false));
                             {
-                                let mut cs = lock_unpoisoned(&cancel_state);
+                                let mut cs = cancel_state.lock();
                                 if cs.0.remove(&req_id) {
                                     cancel_flag.store(true, Ordering::Relaxed);
                                 }
@@ -1325,7 +1319,7 @@ fn worker_engine_loop(
                             );
 
                             {
-                                let mut cs = lock_unpoisoned(&cancel_state);
+                                let mut cs = cancel_state.lock();
                                 cs.1.remove(&req_id);
                                 cs.0.remove(&req_id);
                             }

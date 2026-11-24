@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 struct LoadedSlot<E> {
@@ -64,22 +64,21 @@ impl<E: Send + 'static> EngineLease<E> {
     where
         F: FnOnce() -> Result<E>,
     {
-        let needs_load = match self.slot.as_ref() {
-            Some(existing) => existing.model_id != model_id,
-            None => true,
-        };
-        if needs_load {
+        if matches!(self.slot.as_ref(), Some(existing) if existing.model_id != model_id) {
             // Drop previous model FIRST so its GPU buffers are freed before allocating the next one.
             *self.slot = None;
             self.loaded.store(false, Ordering::SeqCst);
+        }
+        if self.slot.is_none() {
             let engine = loader()?;
-            *self.slot = Some(LoadedSlot {
+            let slot = self.slot.insert(LoadedSlot {
                 model_id: model_id.to_string(),
                 engine,
             });
             self.loaded.store(true, Ordering::SeqCst);
+            return Ok(&mut slot.engine);
         }
-        Ok(&mut self.slot.as_mut().expect("slot just loaded").engine)
+        Ok(&mut self.slot.as_mut().context("resident slot missing")?.engine)
     }
 }
 

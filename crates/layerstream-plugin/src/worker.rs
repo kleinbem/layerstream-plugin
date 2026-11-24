@@ -526,25 +526,16 @@ impl WorkerCoordinator {
         guard: &mut OwnedMutexGuard<Option<RunningWorker>>,
     ) -> Result<(SocketAddr, String)> {
         let current_gen = self.registry_generation.load(Ordering::SeqCst);
-        let need_spawn = match guard.as_mut() {
-            Some(existing) => {
-                if existing.is_alive() && existing.registry_generation == current_gen {
-                    false
-                } else {
-                    stop_worker_locked(guard, &self.loaded).await;
-                    true
-                }
+        if let Some(existing) = guard.as_mut() {
+            if existing.is_alive() && existing.registry_generation == current_gen {
+                return Ok((existing.addr, existing.token.clone()));
             }
-            None => true,
-        };
-
-        if need_spawn {
-            let worker = self.spawn_worker().await?;
-            self.loaded.store(true, Ordering::SeqCst);
-            **guard = Some(worker);
+            stop_worker_locked(guard, &self.loaded).await;
         }
 
-        let running = guard.as_ref().expect("worker just initialized");
+        let worker = self.spawn_worker().await?;
+        self.loaded.store(true, Ordering::SeqCst);
+        let running = guard.insert(worker);
         Ok((running.addr, running.token.clone()))
     }
 
