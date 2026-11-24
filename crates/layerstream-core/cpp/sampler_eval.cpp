@@ -282,8 +282,10 @@ int32_t ls_sample_from_logits_with_history(
     }
     SamplerHandle pen = make_penalties_sampler(n_vocab, sample_params, penalty_tokens, n_penalty_tokens, 0);
     SamplerHandle flt = make_filter_chain(sample_params);
-    std::vector<llama_token_data> cand_buf;
-    std::vector<ProbEntry> dist;
+    thread_local std::vector<llama_token_data> cand_buf;
+    thread_local std::vector<ProbEntry> dist;
+    cand_buf.clear();
+    dist.clear();
     int32_t greedy_id = 0;
     if (!run_sampler_step(logits, n_vocab, pen.smpl, nullptr, flt.smpl, is_greedy, cand_buf, dist, greedy_id)) {
         return 0;
@@ -333,8 +335,10 @@ void ls_verify_sample_from_logits_with_history(
     const bool is_greedy = (sample_params->temperature <= 0.0f);
     SamplerHandle pen = make_penalties_sampler(n_vocab, sample_params, penalty_tokens, n_penalty_tokens, k);
     SamplerHandle flt = make_filter_chain(sample_params);
-    std::vector<llama_token_data> cand_buf;
-    std::vector<ProbEntry> dist;
+    thread_local std::vector<llama_token_data> cand_buf;
+    thread_local std::vector<ProbEntry> dist;
+    cand_buf.clear();
+    dist.clear();
 
     if (is_greedy) {
         int32_t best = 0;
@@ -816,8 +820,10 @@ int ls_engine_eval_with_grammar(
         const bool is_greedy = (!sample_params || sample_params->temperature <= 0.0f);
         SamplerHandle pen = make_penalties_sampler(n_vocab, sample_params, penalty_tokens, n_penalty_tokens, 0);
         SamplerHandle flt = make_filter_chain(sample_params);
-        std::vector<llama_token_data> cand_buf;
-        std::vector<ProbEntry> dist;
+        thread_local std::vector<llama_token_data> cand_buf;
+        thread_local std::vector<ProbEntry> dist;
+        cand_buf.clear();
+        dist.clear();
         int32_t greedy_id = 0;
         if (!run_sampler_step(
                 raw_logits,
@@ -897,8 +903,10 @@ int ls_engine_eval_verify_with_grammar(
         SamplerHandle pen = make_penalties_sampler(n_vocab, sample_params, penalty_tokens, n_penalty_tokens, k);
         SamplerHandle flt = make_filter_chain(sample_params);
 
-        std::vector<llama_token_data> cand_buf;
-        std::vector<ProbEntry> dist;
+        thread_local std::vector<llama_token_data> cand_buf;
+        thread_local std::vector<ProbEntry> dist;
+        cand_buf.clear();
+        dist.clear();
         std::mt19937 rng(sample_params ? sample_params->seed : 42u);
         std::uniform_real_distribution<double> uni(0.0, 1.0);
         int32_t best_id = 0;
