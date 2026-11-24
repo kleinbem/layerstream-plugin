@@ -21,14 +21,7 @@ pub type LsLoadTensorsCb = unsafe extern "C" fn(
     dst_cap: usize,
 ) -> c_int;
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LsSpanSlice {
-    pub src_offset: u64,
-    pub dst_offset: u64,
-    pub len: u64,
-    pub tensor_idx: u32,
-}
+pub type LsSpanSlice = gguf_direct_io::DirectSpanSlice;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

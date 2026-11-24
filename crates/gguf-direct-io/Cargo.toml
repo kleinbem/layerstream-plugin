@@ -1,0 +1,26 @@
+[package]
+name = "gguf-direct-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure-Rust GGUF v2/v3 header parser, 4K-aligned coalesced span planner, and O_DIRECT pread reader"
+repository = "https://github.com/kleinbem/layerstream-plugin"
+homepage = "https://github.com/kleinbem/layerstream-plugin"
+readme = "README.md"
+keywords = ["gguf", "o-direct", "llm", "llama-cpp", "io"]
+categories = ["filesystem", "parsing"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+quick_cache.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

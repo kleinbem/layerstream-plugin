@@ -1,11 +1,11 @@
 pub mod chat_parse;
 pub mod engine;
 pub mod ffi;
-pub mod gguf_index;
+pub use gguf_direct_io::gguf_index;
 pub use json_schema_gbnf as grammar;
 #[cfg(feature = "hf")]
 pub mod hf;
-pub mod io_reader;
+pub use gguf_direct_io::io_reader;
 pub mod openai;
 pub mod residency;
 #[cfg(feature = "hf")]
