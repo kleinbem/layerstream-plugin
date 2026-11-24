@@ -1,6 +1,6 @@
 # layerstream (Python SDK)
 
-Native Python SDK (`PyO3` + `maturin`) for [`layerstream-core`](../../crates/layerstream-core): an out-of-core GGUF layer-streaming inference engine backed by unpatched `llama.cpp`, `O_DIRECT` / `F_NOCACHE` async ping-pong GPU streaming, auto-sized hybrid residency, sparse MoE TinyLFU expert caching, and speculative decoding.
+Native Python SDK (`PyO3` + `maturin`) for [`layerstream-core`](https://github.com/kleinbem/layerstream-plugin/tree/main/crates/layerstream-core): an out-of-core GGUF layer-streaming inference engine backed by unpatched `llama.cpp`, `O_DIRECT` / `F_NOCACHE` async ping-pong GPU streaming, auto-sized hybrid residency, sparse MoE TinyLFU expert caching, and speculative decoding.
 
 ## Installation (Python 3.14+, Zero Compile Required)
 
@@ -104,4 +104,4 @@ python3 -m zipfile -e dist/*.whl .wheel-local
 PYTHONPATH=.wheel-local pytest -v
 ```
 
-See the root [README.md](../../README.md) for bare-metal benchmarks (vs AirLLM, HF `accelerate`, and stock `llama.cpp`) and Mesh-LLM plugin usage.
+See the root [README.md](https://github.com/kleinbem/layerstream-plugin/blob/main/README.md) for bare-metal benchmarks (vs AirLLM, HF `accelerate`, and stock `llama.cpp`) and Mesh-LLM plugin usage.

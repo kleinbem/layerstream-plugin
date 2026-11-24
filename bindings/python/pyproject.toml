@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin>=1.8,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -7,7 +7,7 @@ name = "layerstream"
 version = "0.4.0"
 description = "Out-of-core GGUF layer-streaming LLM inference engine with O_DIRECT GPU streaming"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 requires-python = ">=3.14"
 keywords = [
     "llm",
@@ -23,7 +23,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.14",
@@ -33,6 +32,9 @@ classifiers = [
 
 [project.optional-dependencies]
 cuda = [
+    "layerstream-cuda13==0.4.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+]
+cuda13 = [
     "layerstream-cuda13==0.4.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 dev = [
