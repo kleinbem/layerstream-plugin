@@ -108,7 +108,7 @@ jobs:
         working-directory: bindings/node
         run: |
           node --test test/layerstream.test.js
-          node --input-type=module -e 'import { AutoModel, OpenAI, version } from "./index.mjs"; if (!version || typeof AutoModel.fromPretrained !== "function" || typeof OpenAI !== "function") process.exit(1);'
+          node --input-type=module -e 'import { AutoModel, OpenAI, version } from "./index.js"; if (!version || typeof AutoModel.fromPretrained !== "function" || typeof OpenAI !== "function") process.exit(1);'
           mkdir -p dist
           npm pack --pack-destination dist
 

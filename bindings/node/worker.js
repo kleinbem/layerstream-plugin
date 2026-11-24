@@ -1,7 +1,8 @@
 // Thin Node.js adapter around the unified Rust isolated-worker IPC client & server
 // (`layerstream-core::worker_ipc`).
 
-const native = require("./native.js");
+import path from "node:path";
+import native from "./native.js";
 
 function createAbortError(signal) {
   if (signal?.reason instanceof Error) {
@@ -22,7 +23,7 @@ class IsolatedWorkerClient {
   static async create(model, openWire) {
     const client = await native.NativeWorkerClient.spawn(
       process.execPath,
-      [__filename],
+      [import.meta.filename],
       model,
       JSON.stringify(openWire || {}),
     );
@@ -135,7 +136,7 @@ class IsolatedWorkerClient {
   }
 }
 
-if (require.main === module) {
+if (process.argv[1] && path.resolve(process.argv[1]) === import.meta.filename) {
   const idx = process.argv.indexOf("--worker-port");
   if (idx === -1 || idx + 1 >= process.argv.length) {
     process.exit(2);
@@ -149,6 +150,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = {
-  IsolatedWorkerClient,
-};
+export { IsolatedWorkerClient };

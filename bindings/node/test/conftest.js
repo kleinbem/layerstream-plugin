@@ -1,5 +1,5 @@
-const fs = require("node:fs");
-const path = require("node:path");
+import fs from "node:fs";
+import path from "node:path";
 
 function writeSyntheticMixedDenseMoeGguf(
   destPath,
@@ -274,6 +274,4 @@ function writeSyntheticMixedDenseMoeGguf(
   return destPath;
 }
 
-module.exports = {
-  writeSyntheticMixedDenseMoeGguf,
-};
+export { writeSyntheticMixedDenseMoeGguf };

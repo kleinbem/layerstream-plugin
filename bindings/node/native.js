@@ -1,5 +1,8 @@
-const fs = require("node:fs");
-const path = require("node:path");
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
+
+const requireAddon = createRequire(import.meta.url);
 
 function resolveNativeTriple() {
   const { platform, arch } = process;
@@ -16,11 +19,11 @@ function loadNativeAddon() {
   if (process.env.LAYERSTREAM_NATIVE_PATH) {
     candidates.push(path.resolve(process.env.LAYERSTREAM_NATIVE_PATH));
   }
-  candidates.push(path.join(__dirname, `layerstream.${triple}.node`));
+  candidates.push(path.join(import.meta.dirname, `layerstream.${triple}.node`));
 
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {
-      return require(candidate);
+      return requireAddon(candidate);
     }
   }
 
@@ -30,4 +33,4 @@ function loadNativeAddon() {
   );
 }
 
-module.exports = loadNativeAddon();
+export default loadNativeAddon();

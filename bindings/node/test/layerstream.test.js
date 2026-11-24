@@ -1,27 +1,27 @@
-const assert = require("node:assert/strict");
-const crypto = require("node:crypto");
-const fs = require("node:fs");
-const http = require("node:http");
-const os = require("node:os");
-const path = require("node:path");
-const { after, before, describe, test } = require("node:test");
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import path from "node:path";
+import { after, before, describe, test } from "node:test";
 
-const {
+import {
   AutoModel,
-  OpenAI,
-  StreamTagParser,
   check,
   formatToolsSystemPrompt,
   inspectGguf,
   jsonObjectGbnf,
   jsonSchemaToGbnf,
+  OpenAI,
   parseAssistantOutput,
   probeGpuMemory,
   pull,
   recommend,
+  StreamTagParser,
   version,
-} = require("../index.js");
-const { writeSyntheticMixedDenseMoeGguf } = require("./conftest.js");
+} from "../index.js";
+import { writeSyntheticMixedDenseMoeGguf } from "./conftest.js";
 
 let tmpDir;
 let syntheticGguf;

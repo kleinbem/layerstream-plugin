@@ -23,26 +23,23 @@
     "openai",
     "napi-rs"
   ],
+  "type": "module",
   "main": "./index.js",
   "types": "./index.d.ts",
   "exports": {
     ".": {
       "types": "./index.d.ts",
-      "import": "./index.mjs",
-      "require": "./index.js"
+      "default": "./index.js"
     },
     "./openai": {
       "types": "./openai.d.ts",
-      "import": "./openai.mjs",
-      "require": "./openai.js"
+      "default": "./openai.js"
     }
   },
   "files": [
     "index.js",
-    "index.mjs",
     "index.d.ts",
     "openai.js",
-    "openai.mjs",
     "openai.d.ts",
     "native.js",
     "worker.js",

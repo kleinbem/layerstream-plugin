@@ -1,7 +1,8 @@
-const crypto = require("node:crypto");
-const native = require("./native.js");
+import crypto from "node:crypto";
+import { AutoModel } from "./index.js";
+import native from "./native.js";
 
-const ASYNC_DISPOSE = Symbol.asyncDispose || Symbol.for("nodejs.dispose.async");
+const ASYNC_DISPOSE = Symbol.asyncDispose;
 
 function isPlainObject(val) {
   return val !== null && typeof val === "object" && !Array.isArray(val);
@@ -18,7 +19,7 @@ function createAbortError(signal) {
 }
 
 function throwIfAborted(signal) {
-  if (signal && signal.aborted) {
+  if (signal?.aborted) {
     throw createAbortError(signal);
   }
 }
@@ -209,7 +210,7 @@ class ChatCompletionStream {
               const summary = this._stream.summary;
               const rawReason = summary?.finishReason ?? "stop";
               let finishReason = "stop";
-              if (this._tagParser && this._tagParser.hasToolCalls) {
+              if (this._tagParser?.hasToolCalls) {
                 finishReason = "tool_calls";
               } else if (rawReason === "length") {
                 finishReason = "length";
@@ -368,7 +369,6 @@ class ModelManager {
       const spec = this._initialModel;
       const p = (async () => {
         try {
-          const { AutoModel } = require("./index.js");
           const loaded = await AutoModel.fromPretrained(spec, this._openOptions);
           this._models.set(spec, loaded);
           this._owned.add(spec);
@@ -396,12 +396,12 @@ class ModelManager {
       );
     }
     const existing = this._models.get(key);
-    if (existing && existing.isLoaded) {
+    if (existing?.isLoaded) {
       return { modelId: key, engine: existing };
     }
     if (!existing && this._models.size === 1 && this._defaultId) {
       const def = this._models.get(this._defaultId);
-      if (def && def.isLoaded && (!requestedModel || requestedModel === def.modelPath)) {
+      if (def?.isLoaded && (!requestedModel || requestedModel === def.modelPath)) {
         return { modelId: this._defaultId, engine: def };
       }
     }
@@ -410,7 +410,6 @@ class ModelManager {
     if (!inFlight) {
       const p = (async () => {
         try {
-          const { AutoModel } = require("./index.js");
           const loaded = await AutoModel.fromPretrained(key, this._openOptions);
           this._models.set(key, loaded);
           this._owned.add(key);
@@ -707,8 +706,4 @@ class OpenAI {
   }
 }
 
-module.exports = {
-  ChatCompletionStream,
-  CompletionStream,
-  OpenAI,
-};
+export { ChatCompletionStream, CompletionStream, OpenAI };
