@@ -12,12 +12,19 @@ from os import PathLike
 from types import TracebackType
 from typing import Any, override
 
+_DLL_DIR_HANDLES: list[Any] = []
+
 
 def _configure_native_backends() -> list[str]:
     """Preload companion CUDA 13 runtimes (if installed) and configure dynamic ggml backend paths."""
     rtld_global = getattr(os, "RTLD_GLOBAL", ctypes.RTLD_GLOBAL)
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     local_backends = os.path.join(pkg_dir, "_backends")
+
+    # On Windows, register `_backends` with the DLL loader so `llama.dll` / `ggml*.dll` resolve.
+    if os.name == "nt" and os.path.isdir(local_backends) and hasattr(os, "add_dll_directory"):
+        with contextlib.suppress(OSError):
+            _DLL_DIR_HANDLES.append(os.add_dll_directory(local_backends))
 
     # On NixOS, store-built `python3` ignores `NIX_LD_LIBRARY_PATH` and `/run/opengl-driver/lib`
     # when `dlopen`ing portable manylinux wheels; preload host C++/Vulkan/CUDA driver libraries if present.

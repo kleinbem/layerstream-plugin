@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "cc",
@@ -851,7 +851,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror",
  "tokio",
  "tracing",
  "ureq",
@@ -859,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-plugin"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -886,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
