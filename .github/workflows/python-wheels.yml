@@ -19,6 +19,8 @@ on:
       - "crates/layerstream-server/**"
       - "Cargo.toml"
       - ".github/workflows/python-wheels.yml"
+  schedule:
+    - cron: "0 4 * * 0"
   workflow_dispatch:
 
 permissions:
