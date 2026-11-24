@@ -28,10 +28,10 @@ jobs:
   lint-python:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Checkout pinned llama.cpp
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
           ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
@@ -46,7 +46,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
 
@@ -114,10 +114,10 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Checkout pinned llama.cpp
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
           ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
@@ -168,7 +168,7 @@ jobs:
             ln -sf /opt/vk/bin/glslc /opt/vk/bin/cmake /opt/vk/bin/ninja /usr/local/bin/
           args: ${{ matrix.args }}
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
 
@@ -197,7 +197,7 @@ jobs:
           layerstream --version
           python -m pytest -v
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         with:
           python-version: "3.15"
@@ -211,7 +211,7 @@ jobs:
           expected=$(awk -F'"' '/^version =/{print $2; exit}' ../../Cargo.toml)
           python -c "import layerstream, sys; assert layerstream.__version__ == sys.argv[1], (layerstream.__version__, sys.argv[1])" "$expected"
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: layerstream-wheel-${{ matrix.target }}
           path: bindings/python/dist/*.whl
