@@ -406,6 +406,9 @@ impl WorkerCoordinator {
     }
 
     async fn wait_shutdown(&self) {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
         let mut rx = self.shutdown_tx.subscribe();
         let _ = rx.wait_for(|&shutting_down| shutting_down).await;
     }
@@ -1010,10 +1013,19 @@ async fn coord_proxy_inference(
                             Some(Ok(frame)) => {
                                 if let Ok(data) = frame.into_data()
                                     && !data.is_empty()
-                                    && tx.send(Ok(data)).await.is_err()
                                 {
-                                    client_disconnected = true;
-                                    break;
+                                    let send_res = tokio::select! {
+                                        biased;
+                                        _ = state_bg.wait_shutdown() => {
+                                            shutdown_hit = true;
+                                            break;
+                                        }
+                                        res = tx.send(Ok(data)) => res,
+                                    };
+                                    if send_res.is_err() {
+                                        client_disconnected = true;
+                                        break;
+                                    }
                                 }
                             }
                             Some(Err(err)) => {

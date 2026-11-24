@@ -74,15 +74,13 @@ jobs:
           python3 - "$current_sha" "$latest_sha" <<'PY'
           import pathlib, sys
           old, new = sys.argv[1], sys.argv[2]
-          targets = [
-              pathlib.Path("flake.nix"),
-              *sorted(pathlib.Path(".github/workflows").glob("*.yml")),
-          ]
-          for p in targets:
-              text = p.read_text()
-              if old in text:
-                  p.write_text(text.replace(old, new))
-                  print(f"Updated {p}")
+          # GITHUB_TOKEN cannot push commits modifying `.github/workflows/*.yml`;
+          # update `flake.nix` + `flake.lock` here and list workflow files to sync in the PR body.
+          p = pathlib.Path("flake.nix")
+          text = p.read_text()
+          if old in text:
+              p.write_text(text.replace(old, new))
+              print(f"Updated {p}")
           PY
 
           nix flake update llama-cpp-src
@@ -95,7 +93,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$branch"
-          git add flake.nix flake.lock .github/workflows/*.yml
+          git add flake.nix flake.lock
           git commit -m "chore(deps): bump llama.cpp to ${latest_tag} (${latest_sha:0:9})"
           git push --force-with-lease origin "$branch"
 
@@ -104,5 +102,5 @@ jobs:
               --base main \
               --head "$branch" \
               --title "chore(deps): bump llama.cpp to ${latest_tag}" \
-              --body "Automated weekly bump of pinned \`ggml-org/llama.cpp\` from \`${current_sha:0:9}\` to \`${latest_sha:0:9}\` (\`${latest_tag}\`)."
+              --body "Automated weekly bump of pinned \`ggml-org/llama.cpp\` in \`flake.nix\`/\`flake.lock\` from \`${current_sha:0:9}\` to \`${latest_sha:0:9}\` (\`${latest_tag}\`). Note: sync the pinned SHA in \`.github/workflows/*.yml\` before merging."
           fi
