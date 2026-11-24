@@ -1,0 +1,108 @@
+name: Maintenance
+
+on:
+  schedule:
+    # Weekly on Sunday at 03:00 UTC
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-flake-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: DeterminateSystems/determinate-nix-action@4b040423529d49b1a19ba918742e0aa9aa95031a # v3.24.3
+
+      - name: Update nixpkgs in flake.lock and open PR if changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          nix flake update nixpkgs
+          if git diff --quiet flake.lock; then
+            echo "flake.lock already up to date."
+            exit 0
+          fi
+
+          branch="chore/update-flake-lock"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add flake.lock
+          git commit -m "chore(nix): update nixpkgs in flake.lock"
+          git push --force-with-lease origin "$branch"
+
+          if ! gh pr list --head "$branch" --base main --state open --json number --jq '.[0].number' | grep -q .; then
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "chore(nix): update nixpkgs in flake.lock" \
+              --body "Automated weekly \`nixpkgs\` update in \`flake.lock\`."
+          fi
+
+  bump-llama-cpp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: DeterminateSystems/determinate-nix-action@4b040423529d49b1a19ba918742e0aa9aa95031a # v3.24.3
+
+      - name: Check latest ggml-org/llama.cpp release and open bump PR if newer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          current_sha=$(sed -n 's|.*github:ggml-org/llama.cpp/\([0-9a-f]\{40\}\).*|\1|p' flake.nix | head -n1)
+          if [ -z "$current_sha" ]; then
+            echo "Could not parse current llama.cpp SHA from flake.nix" >&2
+            exit 1
+          fi
+
+          latest_tag=$(gh api repos/ggml-org/llama.cpp/releases/latest --jq '.tag_name')
+          latest_sha=$(gh api "repos/ggml-org/llama.cpp/commits/${latest_tag}" --jq '.sha')
+          echo "Current llama.cpp: ${current_sha}"
+          echo "Latest  llama.cpp: ${latest_sha} (${latest_tag})"
+
+          if [ "$current_sha" = "$latest_sha" ]; then
+            echo "llama.cpp already at latest release ${latest_tag}."
+            exit 0
+          fi
+
+          python3 - "$current_sha" "$latest_sha" <<'PY'
+          import pathlib, sys
+          old, new = sys.argv[1], sys.argv[2]
+          targets = [
+              pathlib.Path("flake.nix"),
+              *sorted(pathlib.Path(".github/workflows").glob("*.yml")),
+          ]
+          for p in targets:
+              text = p.read_text()
+              if old in text:
+                  p.write_text(text.replace(old, new))
+                  print(f"Updated {p}")
+          PY
+
+          nix flake update llama-cpp-src
+          if git diff --quiet; then
+            echo "No changes after update."
+            exit 0
+          fi
+
+          branch="chore/bump-llama-cpp"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add flake.nix flake.lock .github/workflows/*.yml
+          git commit -m "chore(deps): bump llama.cpp to ${latest_tag} (${latest_sha:0:9})"
+          git push --force-with-lease origin "$branch"
+
+          if ! gh pr list --head "$branch" --base main --state open --json number --jq '.[0].number' | grep -q .; then
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "chore(deps): bump llama.cpp to ${latest_tag}" \
+              --body "Automated weekly bump of pinned \`ggml-org/llama.cpp\` from \`${current_sha:0:9}\` to \`${latest_sha:0:9}\` (\`${latest_tag}\`)."
+          fi

@@ -1,0 +1,533 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: "--features vulkan,dynamic-backends"
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            features: "--features vulkan,dynamic-backends"
+            archive: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            features: "--features metal"
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: ""
+            archive: zip
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify tag matches workspace, plugin, Python, and Node versions
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          tag_ver="${GITHUB_REF_NAME#v}"
+          cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)
+          plugin_ver=$(awk -F'"' '/^version =/{print $2; exit}' plugin.toml)
+          py_cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python/Cargo.toml)
+          py_proj_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python/pyproject.toml)
+          py_cuda_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/python-cuda13/pyproject.toml)
+          node_cargo_ver=$(awk -F'"' '/^version =/{print $2; exit}' bindings/node/Cargo.toml)
+          node_pkg_ver=$(awk -F'"' '/"version"[[:space:]]*:/{print $4; exit}' bindings/node/package.json)
+          echo "tag=${tag_ver} Cargo=${cargo_ver} plugin=${plugin_ver} py=${py_proj_ver} py_cuda=${py_cuda_ver} node=${node_pkg_ver}"
+          test "$tag_ver" = "$cargo_ver"
+          test "$tag_ver" = "$plugin_ver"
+          test "$tag_ver" = "$py_cargo_ver"
+          test "$tag_ver" = "$py_proj_ver"
+          test "$tag_ver" = "$py_cuda_ver"
+          test "$tag_ver" = "$node_cargo_ver"
+          test "$tag_ver" = "$node_pkg_ver"
+
+      - name: Checkout pinned llama.cpp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
+          path: third_party/llama.cpp
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-14 g++-14 cmake ninja-build pkg-config protobuf-compiler libvulkan-dev glslc spirv-headers
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja protobuf
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Build release binary
+        env:
+          LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
+        run: |
+          cargo build --locked --release -p layerstream-plugin ${{ matrix.features }}
+
+      - name: Package and smoke-test Unix plugin archive
+        if: matrix.archive == 'tar.gz'
+        run: |
+          version=$(awk -F'"' '/^version =/{print $2; exit}' plugin.toml)
+          stable="layerstream-${{ matrix.target }}"
+          versioned="layerstream-${version}-${{ matrix.target }}"
+          root="${stable}/layerstream"
+          mkdir -p "$root"
+          cp target/release/layerstream-plugin "$root/layerstream"
+          for lib in target/release/libggml*.so* target/release/libllama*.so* target/release/libggml*.dylib target/release/libllama*.dylib; do
+            [ -e "$lib" ] && cp "$lib" "$root/"
+          done
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            codesign --force --sign - "$root/layerstream"
+            codesign --verify --strict "$root/layerstream"
+            for lib in "$root"/*.dylib; do
+              if [ -e "$lib" ]; then
+                codesign --force --sign - "$lib"
+                codesign --verify --strict "$lib"
+              fi
+            done
+          fi
+          cp plugin.toml "$root/plugin.toml"
+          cp README.md "$root/README.md"
+          cp LICENSE "$root/LICENSE"
+          cp -r licenses "$root/licenses"
+          tar czf "${stable}.tar.gz" -C "$stable" layerstream
+          cp "${stable}.tar.gz" "${versioned}.tar.gz"
+          sha256sum "${stable}.tar.gz" > "${stable}.tar.gz.sha256"
+          sha256sum "${versioned}.tar.gz" > "${versioned}.tar.gz.sha256"
+          mkdir -p smoke-extract
+          tar xzf "${stable}.tar.gz" -C smoke-extract
+          ./smoke-extract/layerstream/layerstream --help
+
+      - name: Package and smoke-test Windows plugin archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path plugin.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $stable = "layerstream-${{ matrix.target }}"
+          $versioned = "layerstream-$version-${{ matrix.target }}"
+          $root = "$stable\layerstream"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item target\release\layerstream-plugin.exe "$root\layerstream.exe"
+          Get-ChildItem target\release\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination "$root"
+          Copy-Item plugin.toml "$root\plugin.toml"
+          Copy-Item README.md "$root\README.md"
+          Copy-Item LICENSE "$root\LICENSE"
+          Copy-Item -Recurse licenses "$root\licenses"
+          Compress-Archive -Path "$root" -DestinationPath "$stable.zip" -Force
+          Copy-Item "$stable.zip" "$versioned.zip" -Force
+          $hash = (Get-FileHash "$stable.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stable.zip" | Out-File -Encoding ascii "$stable.zip.sha256"
+          "$hash  $versioned.zip" | Out-File -Encoding ascii "$versioned.zip.sha256"
+          Expand-Archive -Path "$stable.zip" -DestinationPath "smoke-extract" -Force
+          .\smoke-extract\layerstream\layerstream.exe --help
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: layerstream-${{ matrix.target }}
+          path: |
+            layerstream-*.tar.gz
+            layerstream-*.tar.gz.sha256
+            layerstream-*.zip
+            layerstream-*.zip.sha256
+
+  build-wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Workaround: `--auditwheel skip` preserves unhashed `libggml-*.so` names for runtime
+          # `dlopen` plugin loading; `audit_wheel_elf.py` enforces manylinux_2_34 ELF bounds
+          # (upstream: pypa/auditwheel#594).
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            container: "2_34"
+            manylinux: "2_34"
+            vulkan_sdk: "/opt/vk"
+            args: "--auditwheel skip --locked --release --out dist --features vulkan,dynamic-backends"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            container: "2_34"
+            manylinux: "2_34"
+            vulkan_sdk: "/opt/vk"
+            args: "--auditwheel skip --locked --release --out dist --features vulkan,dynamic-backends"
+          - os: macos-15
+            target: aarch64-apple-darwin
+            container: ""
+            manylinux: ""
+            vulkan_sdk: ""
+            args: "--locked --release --out dist --features metal"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            container: ""
+            manylinux: ""
+            vulkan_sdk: ""
+            args: "--locked --release --out dist --features vulkan,dynamic-backends"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout pinned llama.cpp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
+          path: third_party/llama.cpp
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - name: Install Windows Vulkan SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile vulkan-sdk.exe
+          Start-Process -Wait -FilePath .\vulkan-sdk.exe -ArgumentList "--accept-licenses --default-answer --confirm-command install"
+          Remove-Item -Force vulkan-sdk.exe
+          $vk = (Get-ChildItem C:\VulkanSDK | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          "VULKAN_SDK=$vk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$vk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "CARGO_TARGET_DIR=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Activate MSVC x64 developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        if: runner.os != 'Linux'
+
+      - name: Build PyPI-compatible abi3 wheel (Vulkan on Linux/Windows, Metal on macOS)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          LAYERSTREAM_PORTABLE_WHEEL: "1"
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
+          VULKAN_SDK: ${{ matrix.vulkan_sdk || env.VULKAN_SDK }}
+          CMAKE_PREFIX_PATH: ${{ matrix.vulkan_sdk || env.VULKAN_SDK }}
+          CMAKE_GENERATOR: ${{ runner.os == 'Windows' && 'Ninja' || '' }}
+        with:
+          command: build
+          working-directory: bindings/python
+          container: ${{ matrix.container }}
+          manylinux: ${{ matrix.manylinux }}
+          before-script-linux: |
+            dnf install -y bzip2
+            arch=$(uname -m)
+            if [ "$arch" = "aarch64" ]; then mamba_plat="linux-aarch64"; else mamba_plat="linux-64"; fi
+            curl -fsSL "https://micro.mamba.pm/api/micromamba/${mamba_plat}/latest" | tar -xj -C /usr/local/bin --strip-components=1 bin/micromamba
+            MAMBA_ROOT_PREFIX=/opt/mamba micromamba create -y -p /opt/vk -c conda-forge shaderc libvulkan-headers libvulkan-loader spirv-headers cmake ninja
+            ln -sf /opt/vk/bin/glslc /opt/vk/bin/cmake /opt/vk/bin/ninja /usr/local/bin/
+          args: ${{ matrix.args }}
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      - name: Verify PyPI wheel ELF symbols, metadata, CLI, pytest + hypothesis, and SHA-256
+        working-directory: bindings/python
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo chown -R "$(id -u):$(id -g)" dist python/layerstream/_backends || true
+            python scripts/audit_wheel_elf.py dist/*.whl
+          fi
+          uv pip install --system pytest pytest-asyncio pytest-timeout hypothesis twine
+          python -m twine check --strict dist/*.whl
+          for whl in dist/*.whl; do
+            case "$whl" in
+              *-linux_*.whl)
+                echo "ERROR: un-repaired linux_* wheel tag would be rejected by PyPI: $whl" >&2
+                exit 1
+                ;;
+            esac
+          done
+          uv pip install --system --reinstall dist/*.whl
+          layerstream --version
+          python -m pytest -v
+          (
+            cd dist
+            for f in *.whl; do
+              shasum -a 256 "$f" > "${f}.sha256"
+            done
+          )
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: layerstream-python-${{ matrix.target }}
+          path: |
+            bindings/python/dist/*.whl
+            bindings/python/dist/*.whl.sha256
+
+  build-cuda-wheel:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            container: quay.io/pypa/manylinux_2_34_x86_64
+            cuda_repo_arch: x86_64
+            wheel_plat: manylinux_2_34_x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            container: quay.io/pypa/manylinux_2_34_aarch64
+            cuda_repo_arch: sbsa
+            wheel_plat: manylinux_2_34_aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout pinned llama.cpp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
+          path: third_party/llama.cpp
+
+      - name: Build layerstream-cuda13 ${{ matrix.wheel_plat }} wheel inside manylinux_2_34
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/io" \
+            -w /io/bindings/python-cuda13 \
+            ${{ matrix.container }} \
+            bash -euxo pipefail -c '
+              dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/${{ matrix.cuda_repo_arch }}/cuda-rhel9.repo
+              dnf install -y cuda-nvcc-13-5 cuda-cudart-devel-13-5 libcublas-devel-13-5 cuda-driver-devel-13-5 cuda-nvml-devel-13-5
+              [ -x "$(command -v g++)" ] || dnf install -y gcc-c++
+              export CC="$(command -v gcc)"
+              export CXX="$(command -v g++)"
+              export CUDAHOSTCXX="$CXX"
+              export CMAKE_CUDA_HOST_COMPILER="$CXX"
+              PY_BIN=$(ls -1d /opt/python/cp314-cp314/bin/python /opt/python/cp315-cp315/bin/python 2>/dev/null | head -n 1)
+              PY_DIR=$(dirname "$PY_BIN")
+              "$PY_BIN" -m pip install --upgrade pip "setuptools>=77" wheel "cmake>=3.31" ninja
+              export PATH="$PY_DIR:/usr/local/cuda-13.5/bin:$PATH"
+              export CUDAToolkit_ROOT="/usr/local/cuda-13.5"
+              export LLAMA_CPP_DIR="/io/third_party/llama.cpp"
+              export LAYERSTREAM_CUDA_WHEEL_PLAT="${{ matrix.wheel_plat }}"
+              "$PY_BIN" scripts/build_wheel.py --out dist
+              "$PY_BIN" /io/bindings/python/scripts/audit_wheel_elf.py dist/*.whl
+            '
+          sudo chown -R "$(id -u):$(id -g)" bindings/python-cuda13/dist bindings/python-cuda13/build bindings/python-cuda13/python/layerstream_cuda13/_backends || true
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - name: Verify layerstream-cuda13 metadata and record SHA-256
+        working-directory: bindings/python-cuda13
+        run: |
+          python -m pip install --upgrade pip twine
+          python -m twine check --strict dist/*.whl
+          (
+            cd dist
+            for f in *.whl; do
+              shasum -a 256 "$f" > "${f}.sha256"
+            done
+          )
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: layerstream-python-cuda13-${{ matrix.target }}
+          path: |
+            bindings/python-cuda13/dist/*.whl
+            bindings/python-cuda13/dist/*.whl.sha256
+
+  build-node:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            napi_triple: linux-x64-gnu
+            features: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            napi_triple: linux-arm64-gnu
+            features: ""
+          - os: macos-15
+            target: aarch64-apple-darwin
+            napi_triple: darwin-arm64
+            features: "metal"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout pinned llama.cpp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
+          path: third_party/llama.cpp
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Build native Node addon, run smoke tests, and record SHA-256
+        working-directory: bindings/node
+        env:
+          LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
+        run: |
+          extra_args=()
+          if [ -n "${{ matrix.features }}" ]; then
+            extra_args+=(--features "${{ matrix.features }}")
+          fi
+          node scripts/build-native.mjs --release --locked --triple "${{ matrix.napi_triple }}" "${extra_args[@]}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            codesign --force --sign - "layerstream.${{ matrix.napi_triple }}.node"
+            codesign --verify --strict "layerstream.${{ matrix.napi_triple }}.node"
+          fi
+          node --test test/layerstream.test.js
+          mkdir -p dist
+          cp "layerstream.${{ matrix.napi_triple }}.node" dist/
+          version=$(node -p 'require("./package.json").version')
+          npm pack --pack-destination dist
+          mv "dist/layerstream-${version}.tgz" "dist/layerstream-node-${version}-${{ matrix.napi_triple }}.tgz"
+          (
+            cd dist
+            for f in *.node *.tgz; do
+              [ -e "$f" ] || continue
+              shasum -a 256 "$f" > "${f}.sha256"
+            done
+          )
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: layerstream-node-release-${{ matrix.napi_triple }}
+          path: |
+            bindings/node/dist/*.node
+            bindings/node/dist/*.node.sha256
+            bindings/node/dist/*.tgz
+            bindings/node/dist/*.tgz.sha256
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+      - build-wheels
+      - build-cuda-wheel
+      - build-node
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          assets=(
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
+            artifacts/*.zip
+            artifacts/*.zip.sha256
+            artifacts/*.whl
+            artifacts/*.whl.sha256
+            artifacts/*.node
+            artifacts/*.node.sha256
+            artifacts/*.tgz
+            artifacts/*.tgz.sha256
+          )
+          test "${#assets[@]}" -gt 0
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            "${assets[@]}" \
+            --generate-notes
+
+  publish-pypi:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+      - build-wheels
+      - build-cuda-wheel
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check PyPI opt-in variable
+        if: vars.PYPI_PUBLISH != 'true'
+        run: |
+          echo "Skipping PyPI upload because vars.PYPI_PUBLISH is not set to 'true' in repository, org, or pypi environment."
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: vars.PYPI_PUBLISH == 'true'
+        with:
+          pattern: layerstream-python-*
+          path: pypi-dist
+          merge-multiple: true
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: vars.PYPI_PUBLISH == 'true'
+        with:
+          python-version: "3.14"
+
+      - name: Verify wheel metadata and split PyPI distributions
+        if: vars.PYPI_PUBLISH == 'true'
+        run: |
+          python -m pip install --upgrade pip twine
+          python -m twine check --strict pypi-dist/*.whl
+          mkdir -p pypi-dist-base pypi-dist-cuda13
+          cp pypi-dist/layerstream-*.whl pypi-dist-base/
+          cp pypi-dist/layerstream_cuda13-*.whl pypi-dist-cuda13/
+
+      - name: Publish layerstream to PyPI via Trusted Publishing (OIDC + PEP 740)
+        if: vars.PYPI_PUBLISH == 'true'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: pypi-dist-base
+          skip-existing: true
+          attestations: true
+
+      - name: Publish layerstream-cuda13 to PyPI via Trusted Publishing (OIDC + PEP 740)
+        if: vars.PYPI_PUBLISH == 'true' && vars.PYPI_PUBLISH_CUDA == 'true'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: pypi-dist-cuda13
+          skip-existing: true
+          attestations: true
