@@ -1465,11 +1465,13 @@ def test_cli_inspect_check_chat_and_rust_axum_server(
         assert bad_exc.value.code == 400
 
         # Non-streaming `/v1/chat/completions` with modern samplers (`min_p`, `repeat_penalty`).
+        # Keep greedy `temperature: 0.0` so the tiny random-weights synthetic GGUF does not
+        # occasionally sample EOS on token 1.
         chat_body = json.dumps(
             {
                 "messages": [{"role": "user", "content": "a b c"}],
                 "max_tokens": 6,
-                "temperature": 0.6,
+                "temperature": 0.0,
                 "min_p": 0.05,
                 "repeat_penalty": 1.15,
             }
