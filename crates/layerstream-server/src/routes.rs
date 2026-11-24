@@ -510,6 +510,8 @@ struct ChatCompletionRequest {
     seed: Option<u32>,
     #[serde(default)]
     stop: Option<StopSpec>,
+    #[serde(default)]
+    response_format: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -556,6 +558,8 @@ struct TextCompletionRequest {
     seed: Option<u32>,
     #[serde(default)]
     stop: Option<StopSpec>,
+    #[serde(default)]
+    response_format: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -716,13 +720,20 @@ async fn chat_completions(
         .or(req.max_tokens)
         .unwrap_or(512)
         .clamp(1, state.config.n_ctx.max(1) as usize);
+    let compiled_rf = match req.response_format.as_ref() {
+        Some(rf) => match layerstream_core::compile_response_format(rf, false) {
+            Ok(c) => Some(c),
+            Err(e) => return api_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        },
+        None => None,
+    };
     let opts = GenerateOptions {
         max_tokens,
         sample,
         stop: req.stop.map(StopSpec::into_vec).unwrap_or_default(),
         enable_ngram_speculation: state.config.enable_ngram_speculation,
         max_draft_tokens: state.config.max_draft_tokens,
-        grammar: None,
+        grammar: compiled_rf.and_then(|c| c.grammar),
     };
 
     let req_id = format!("chatcmpl-ls-{}", unix_now_nanos());
@@ -1027,6 +1038,13 @@ async fn text_completions(
         Err(err) => return api_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
     };
 
+    let compiled_rf = match req.response_format.as_ref() {
+        Some(rf) => match layerstream_core::compile_response_format(rf, false) {
+            Ok(c) => Some(c),
+            Err(e) => return api_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        },
+        None => None,
+    };
     let opts = GenerateOptions {
         max_tokens: req
             .max_tokens
@@ -1036,7 +1054,7 @@ async fn text_completions(
         stop: req.stop.map(StopSpec::into_vec).unwrap_or_default(),
         enable_ngram_speculation: state.config.enable_ngram_speculation,
         max_draft_tokens: state.config.max_draft_tokens,
-        grammar: None,
+        grammar: compiled_rf.and_then(|c| c.grammar),
     };
 
     let req_id = format!("cmpl-ls-{}", unix_now_nanos());

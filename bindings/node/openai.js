@@ -58,52 +58,25 @@ function compileResponseFormat(responseFormat) {
   }
 
   if (isPlainObject(responseFormat)) {
-    const rfType = responseFormat.type;
-    if (rfType === "text") {
-      return { grammar: undefined, parser: null };
-    }
-    if (rfType === "json_object") {
-      return { grammar: native.jsonObjectGbnf(), parser: (raw) => JSON.parse(raw) };
-    }
-    if (rfType === "json_schema") {
-      let schema;
-      let validator = (raw) => JSON.parse(raw);
+    let validator = (raw) => JSON.parse(raw);
+    if (responseFormat.type === "json_schema") {
       if (responseFormat.json_schema !== undefined) {
         if (!isPlainObject(responseFormat.json_schema)) {
           throw new TypeError("response_format.json_schema must be an object");
         }
-        schema = responseFormat.json_schema.schema;
         if (typeof responseFormat.json_schema.parse === "function") {
           const fn = responseFormat.json_schema.parse.bind(responseFormat.json_schema);
           validator = (raw) => fn(JSON.parse(raw));
         }
-      } else {
-        schema = responseFormat.schema;
-        if (typeof responseFormat.parse === "function") {
-          const fn = responseFormat.parse.bind(responseFormat);
-          validator = (raw) => fn(JSON.parse(raw));
-        }
+      } else if (typeof responseFormat.parse === "function") {
+        const fn = responseFormat.parse.bind(responseFormat);
+        validator = (raw) => fn(JSON.parse(raw));
       }
-      if (schema === undefined || schema === null) {
-        throw new RangeError("response_format 'json_schema' requires an explicit 'schema'");
-      }
-      return {
-        grammar: native.jsonSchemaToGbnf(JSON.stringify(schema)),
-        parser: validator,
-      };
     }
-    if (rfType === "gbnf") {
-      const g = responseFormat.grammar;
-      if (typeof g !== "string" || g.trim().length === 0) {
-        throw new RangeError("response_format 'gbnf' requires a non-empty 'grammar' string");
-      }
-      return { grammar: g, parser: null };
-    }
-
-    // Raw JSON Schema (primitive `{ type: "string" }`, `{ enum: [...] }`, object/array schemas, etc.)
+    const compiled = native.compileResponseFormat(JSON.stringify(responseFormat), true);
     return {
-      grammar: native.jsonSchemaToGbnf(JSON.stringify(responseFormat)),
-      parser: (raw) => JSON.parse(raw),
+      grammar: compiled.grammar ?? undefined,
+      parser: compiled.expectsJson ? validator : null,
     };
   }
 

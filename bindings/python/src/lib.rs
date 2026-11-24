@@ -15,8 +15,9 @@ use layerstream_core::worker_ipc::{
 };
 use layerstream_core::{
     ChatMessage, GenerateOptions, GenerateSummary, IncomingChatMessage, KvCacheType,
-    LsSampleParams, StreamDelta, StreamEngine, StreamTagParser, format_tools_system_prompt,
-    inject_tools_into_messages, json_object_gbnf, json_schema_to_gbnf, parse_assistant_output,
+    LsSampleParams, StreamDelta, StreamEngine, StreamTagParser, compile_response_format,
+    format_tools_system_prompt, inject_tools_into_messages, json_object_gbnf, json_schema_to_gbnf,
+    parse_assistant_output,
 };
 use layerstream_server::{AppState, ModelRegistry, ServerConfig, serve_with_state_until};
 use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyTypeError, PyValueError};
@@ -2131,6 +2132,18 @@ impl PyWorkerClient {
     }
 }
 
+#[pyfunction(name = "compile_response_format")]
+#[pyo3(signature = (response_format, allow_raw_schema=false))]
+fn py_compile_response_format(
+    response_format: &Bound<'_, PyAny>,
+    allow_raw_schema: bool,
+) -> PyResult<(Option<String>, bool)> {
+    let val = pyany_to_json_value(response_format, 0)?;
+    let compiled = compile_response_format(&val, allow_raw_schema)
+        .map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+    Ok((compiled.grammar, compiled.expects_json))
+}
+
 #[pyfunction(name = "run_worker_server")]
 fn py_run_worker_server(py: Python<'_>, port: u16) -> PyResult<()> {
     py.detach(move || run_worker_server(port))
@@ -2157,6 +2170,7 @@ fn _layerstream(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check, m)?)?;
     m.add_function(wrap_pyfunction!(py_json_schema_to_gbnf, m)?)?;
     m.add_function(wrap_pyfunction!(py_json_object_gbnf, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compile_response_format, m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_assistant_output, m)?)?;
     m.add_function(wrap_pyfunction!(py_format_tools_system_prompt, m)?)?;
     Ok(())
