@@ -224,6 +224,7 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "15.0"
           VULKAN_SDK: ${{ matrix.vulkan_sdk || env.VULKAN_SDK }}
           CMAKE_PREFIX_PATH: ${{ matrix.vulkan_sdk || env.VULKAN_SDK }}
+          CMAKE_GENERATOR: ${{ runner.os == 'Windows' && 'Ninja' || '' }}
         with:
           command: build
           working-directory: bindings/python

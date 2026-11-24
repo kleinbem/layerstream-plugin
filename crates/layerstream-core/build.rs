@@ -294,7 +294,10 @@ fn main() {
         }
     }
 
-    if target_os != "windows" && env::var("CMAKE_GENERATOR").is_err() && which_ninja() {
+    let has_explicit_gen = env::var("CMAKE_GENERATOR")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    if target_os != "windows" && !has_explicit_gen && which_ninja() {
         cfg.generator("Ninja");
     }
 
