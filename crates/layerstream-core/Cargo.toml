@@ -25,6 +25,7 @@ gguf-direct-io = { path = "../gguf-direct-io" }
 hf-gguf = { path = "../hf-gguf", optional = true }
 json-schema-gbnf = { path = "../json-schema-gbnf" }
 libc.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

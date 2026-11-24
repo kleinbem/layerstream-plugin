@@ -387,6 +387,7 @@ dependencies = [
  "hf-gguf",
  "json-schema-gbnf",
  "libc",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",
