@@ -209,6 +209,7 @@ jobs:
           $vk = (Get-ChildItem C:\VulkanSDK | Sort-Object Name -Descending | Select-Object -First 1).FullName
           "VULKAN_SDK=$vk" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$vk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "CARGO_TARGET_DIR=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Activate MSVC x64 developer environment
         if: runner.os == 'Windows'
