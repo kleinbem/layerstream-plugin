@@ -41,6 +41,24 @@ pub struct TensorLocation {
     pub dims: Vec<u64>,
 }
 
+/// Compact `Copy` view of a `TensorLocation` for O(1) indexed lookup on MoE hot paths.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedTensorLoc {
+    pub shard_idx: usize,
+    pub abs_offset: u64,
+    pub encoded_byte_len: Option<u64>,
+}
+
+impl TensorLocation {
+    pub fn resolved(&self) -> ResolvedTensorLoc {
+        ResolvedTensorLoc {
+            shard_idx: self.shard_idx,
+            abs_offset: self.abs_offset,
+            encoded_byte_len: self.encoded_byte_len(),
+        }
+    }
+}
+
 /// Returns `(block_elems, block_bytes)` for standard GGML tensor types, or `None` for unknown
 /// future types so callers can fail-open on unrecognized quant formats.
 fn ggml_type_block_layout(ggml_type: u32) -> Option<(u64, u64)> {
@@ -211,6 +229,21 @@ impl GgufIndex {
         &self,
         requests: &[(&str, u64, usize, usize, u32)],
     ) -> Result<Vec<CoalescedSpan>> {
+        let mut resolved = Vec::with_capacity(requests.len());
+        for &(name, src_off, dst_offset, len, tensor_idx) in requests {
+            let loc = self
+                .tensors
+                .get(name)
+                .with_context(|| format!("tensor '{name}' missing from GGUF index"))?;
+            resolved.push((loc.resolved(), src_off, dst_offset, len, tensor_idx));
+        }
+        self.plan_coalesced_sub_slices_resolved(&resolved)
+    }
+
+    pub fn plan_coalesced_sub_slices_resolved(
+        &self,
+        requests: &[(ResolvedTensorLoc, u64, usize, usize, u32)],
+    ) -> Result<Vec<CoalescedSpan>> {
         #[derive(Clone)]
         struct Item {
             shard_idx: usize,
@@ -221,31 +254,29 @@ impl GgufIndex {
         }
 
         let mut items = Vec::with_capacity(requests.len());
-        for &(name, src_off, dst_offset, len, tensor_idx) in requests {
-            let loc = self
-                .tensors
-                .get(name)
-                .with_context(|| format!("tensor '{name}' missing from GGUF index"))?;
+        for &(loc, src_off, dst_offset, len, tensor_idx) in requests {
             let shard_size = self.shard_sizes[loc.shard_idx];
-            if let Some(tensor_bytes) = loc.encoded_byte_len() {
+            if let Some(tensor_bytes) = loc.encoded_byte_len {
                 let Some(rel_end) = src_off.checked_add(len as u64) else {
-                    bail!("tensor slice '{name}' offset {src_off} + len {len} overflows u64");
+                    bail!(
+                        "tensor slice idx={tensor_idx} offset {src_off} + len {len} overflows u64"
+                    );
                 };
                 if rel_end > tensor_bytes {
                     bail!(
-                        "tensor slice '{name}' [{src_off}, {rel_end}) exceeds tensor byte length {tensor_bytes}"
+                        "tensor slice idx={tensor_idx} [{src_off}, {rel_end}) exceeds tensor byte length {tensor_bytes}"
                     );
                 }
             }
             let Some(abs_offset) = loc.abs_offset.checked_add(src_off) else {
-                bail!("tensor slice '{name}' absolute offset overflows u64");
+                bail!("tensor slice idx={tensor_idx} absolute offset overflows u64");
             };
             let Some(abs_end) = abs_offset.checked_add(len as u64) else {
-                bail!("tensor slice '{name}' absolute end overflows u64");
+                bail!("tensor slice idx={tensor_idx} absolute end overflows u64");
             };
             if abs_end > shard_size {
                 bail!(
-                    "tensor slice '{name}' [{abs_offset}, {abs_end}) exceeds shard size {shard_size}"
+                    "tensor slice idx={tensor_idx} [{abs_offset}, {abs_end}) exceeds shard size {shard_size}"
                 );
             }
             items.push(Item {

@@ -17,13 +17,13 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 use std::ptr::NonNull;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
 
 use crate::ffi::LsSpanSlice;
-use crate::gguf_index::{CoalescedSpan, DIRECT_IO_ALIGN, GgufIndex, align_up};
+use crate::gguf_index::{CoalescedSpan, DIRECT_IO_ALIGN, GgufIndex, ResolvedTensorLoc, align_up};
 
 const PARALLEL_READ_MIN_BYTES: usize = 4 * 1024 * 1024;
 /// Default staging chunk size for fallback O_DIRECT pread (full-layer 256 MiB spans
@@ -366,6 +366,163 @@ fn auto_expert_cache_budget_bytes() -> usize {
     }
 }
 
+/// Persistent scoped worker pool that eliminates per-layer OS thread spawn/join overhead.
+///
+/// The calling thread executes task `0`; `n_tasks - 1` parked background threads execute
+/// tasks `1..n_tasks`. `run()` blocks until every background task finishes (even on panic)
+/// before returning, so stack borrows remain valid for the entire dispatch.
+struct ScopedWorkerPool {
+    dispatch_lock: Mutex<()>,
+    shared: Arc<PoolShared>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+struct PoolShared {
+    state: Mutex<PoolState>,
+    work_cv: Condvar,
+    done_cv: Condvar,
+}
+
+struct PoolState {
+    generation: u64,
+    active_bg: usize,
+    done_bg: usize,
+    shutdown: bool,
+    task_fn: Option<*const (dyn Fn(usize) + Sync + 'static)>,
+}
+
+// SAFETY: `task_fn` points to a `Sync` closure live on the dispatching thread's stack until
+// `done_bg == active_bg`; `PoolState` is only accessed under `PoolShared::state`.
+unsafe impl Send for PoolState {}
+
+impl ScopedWorkerPool {
+    fn new(max_threads: usize) -> Self {
+        let bg_count = max_threads.saturating_sub(1);
+        let shared = Arc::new(PoolShared {
+            state: Mutex::new(PoolState {
+                generation: 0,
+                active_bg: 0,
+                done_bg: 0,
+                shutdown: false,
+                task_fn: None,
+            }),
+            work_cv: Condvar::new(),
+            done_cv: Condvar::new(),
+        });
+        let mut handles = Vec::with_capacity(bg_count);
+        for bg_idx in 0..bg_count {
+            let worker_id = bg_idx + 1;
+            let sh = Arc::clone(&shared);
+            let h = std::thread::Builder::new()
+                .name(format!("ls-io-{worker_id}"))
+                .spawn(move || {
+                    let mut seen_gen = 0u64;
+                    loop {
+                        let task_ptr = {
+                            let mut st = sh.state.lock().unwrap_or_else(|e| e.into_inner());
+                            while !st.shutdown && st.generation == seen_gen {
+                                st = sh.work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                            }
+                            if st.shutdown {
+                                break;
+                            }
+                            seen_gen = st.generation;
+                            if worker_id <= st.active_bg {
+                                st.task_fn
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(ptr) = task_ptr {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                // SAFETY: `run()` holds `dispatch_lock` and waits until `done_bg == active_bg`
+                                // before clearing `task_fn` and returning, so `ptr` is valid and `Sync`.
+                                let f: &(dyn Fn(usize) + Sync) = unsafe { &*ptr };
+                                f(worker_id);
+                            }));
+                            let mut st = sh.state.lock().unwrap_or_else(|e| e.into_inner());
+                            st.done_bg += 1;
+                            if st.done_bg == st.active_bg {
+                                sh.done_cv.notify_one();
+                            }
+                        }
+                    }
+                });
+            if let Ok(handle) = h {
+                handles.push(handle);
+            }
+        }
+        Self {
+            dispatch_lock: Mutex::new(()),
+            shared,
+            handles,
+        }
+    }
+
+    fn run<F: Fn(usize) + Sync>(&self, n_tasks: usize, f: F) {
+        if n_tasks == 0 {
+            return;
+        }
+        let max_tasks = self.handles.len() + 1;
+        let actual_tasks = n_tasks.min(max_tasks);
+        if actual_tasks <= 1 {
+            for idx in 0..n_tasks {
+                f(idx);
+            }
+            return;
+        }
+
+        let _dispatch_guard = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let active_bg = actual_tasks - 1;
+        let trait_obj: &(dyn Fn(usize) + Sync) = &f;
+        // SAFETY: Erasing the lifetime to `'static` is sound because `WaitGuard` blocks until
+        // all `active_bg` background workers finish and clears `task_fn` before `f` is dropped.
+        let erased: *const (dyn Fn(usize) + Sync + 'static) =
+            unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync), _>(trait_obj) };
+
+        {
+            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.active_bg = active_bg;
+            st.done_bg = 0;
+            st.task_fn = Some(erased);
+            st.generation = st.generation.wrapping_add(1);
+            self.shared.work_cv.notify_all();
+        }
+
+        struct WaitGuard<'a>(&'a PoolShared);
+        impl Drop for WaitGuard<'_> {
+            fn drop(&mut self) {
+                let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+                while st.done_bg < st.active_bg {
+                    st = self.0.done_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                st.task_fn = None;
+                st.active_bg = 0;
+            }
+        }
+        let _wait = WaitGuard(&self.shared);
+
+        // Calling thread executes task 0 (and any overflow tasks if n_tasks > max_tasks).
+        f(0);
+        for extra in actual_tasks..n_tasks {
+            f(extra);
+        }
+    }
+}
+
+impl Drop for ScopedWorkerPool {
+    fn drop(&mut self) {
+        {
+            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.shutdown = true;
+            self.shared.work_cv.notify_all();
+        }
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
 pub struct LayerIoPool {
     index: GgufIndex,
     shards: Vec<ShardHandle>,
@@ -375,9 +532,10 @@ pub struct LayerIoPool {
     moe_io_threads: usize,
     max_chunk_bytes: usize,
     profile_enabled: bool,
+    workers: ScopedWorkerPool,
     scratch: Mutex<Option<AlignedBuf>>,
     moe_scratches: Mutex<Vec<AlignedBuf>>,
-    span_cache: Mutex<HashMap<i32, Vec<CoalescedSpan>>>,
+    span_cache: Mutex<HashMap<i32, Arc<[CoalescedSpan]>>>,
     expert_cache: Mutex<ExpertSliceLru>,
     bytes_read: AtomicU64,
     span_reads: AtomicU64,
@@ -466,6 +624,8 @@ impl LayerIoPool {
             .and_then(|v| v.parse::<usize>().ok())
             .map(|mb| mb.saturating_mul(1024 * 1024));
 
+        let workers = ScopedWorkerPool::new(io_threads.max(moe_io_threads));
+
         Ok(Self {
             index,
             shards,
@@ -475,6 +635,7 @@ impl LayerIoPool {
             moe_io_threads,
             max_chunk_bytes,
             profile_enabled,
+            workers,
             scratch: Mutex::new(None),
             moe_scratches: Mutex::new(Vec::new()),
             span_cache: Mutex::new(HashMap::new()),
@@ -563,9 +724,10 @@ impl LayerIoPool {
                 let Some(reqs) = requests else {
                     return Ok(0);
                 };
-                let planned = self.index.plan_coalesced_spans(reqs)?;
+                let planned: Arc<[CoalescedSpan]> =
+                    Arc::from(self.index.plan_coalesced_spans(reqs)?);
                 if let Ok(mut cache) = self.span_cache.lock() {
-                    cache.insert(layer_idx, planned.clone());
+                    cache.insert(layer_idx, Arc::clone(&planned));
                 }
                 planned
             }
@@ -581,7 +743,7 @@ impl LayerIoPool {
         let mut buf_off = 0usize;
         let mut slice_idx = 0usize;
         let mut span_bytes_total = 0u64;
-        for span in &spans {
+        for span in spans.iter() {
             let handle = &self.shards[span.shard_idx];
             let read_buf = &mut pin_buf[buf_off..buf_off + span.aligned_len];
 
@@ -645,7 +807,7 @@ impl LayerIoPool {
             Some(buf) => buf,
             None => scratch_guard.insert(AlignedBuf::new(4 * 1024 * 1024)?),
         };
-        for span in &spans {
+        for span in spans.iter() {
             self.read_span_into(span, scratch, dst)?;
         }
         Ok(true)
@@ -658,18 +820,18 @@ impl LayerIoPool {
         requests: &[(&str, usize, usize)],
         dst: &mut [u8],
     ) -> Result<()> {
-        let spans = self.index.plan_coalesced_spans(requests)?;
+        let spans: Arc<[CoalescedSpan]> = Arc::from(self.index.plan_coalesced_spans(requests)?);
         if layer_idx >= 0
             && let Ok(mut cache) = self.span_cache.lock()
         {
-            cache.insert(layer_idx, spans.clone());
+            cache.insert(layer_idx, Arc::clone(&spans));
         }
 
         if layer_idx < 0 {
             // One-shot startup load (e.g. resident layers): use an ephemeral scratch buffer
             // so its memory is returned to the OS immediately after initialization.
             let mut ephemeral = AlignedBuf::new(4 * 1024 * 1024)?;
-            for span in &spans {
+            for span in spans.iter() {
                 self.read_span_into(span, &mut ephemeral, dst)?;
             }
             return Ok(());
@@ -683,7 +845,7 @@ impl LayerIoPool {
             Some(buf) => buf,
             None => scratch_guard.insert(AlignedBuf::new(4 * 1024 * 1024)?),
         };
-        for span in &spans {
+        for span in spans.iter() {
             self.read_span_into(span, scratch, dst)?;
         }
         Ok(())
@@ -738,8 +900,22 @@ impl LayerIoPool {
             }
         }
 
+        // Resolve each request's tensor location once so expert cache lookup and span planning
+        // share the same `ResolvedTensorLoc` without double-hashing tensor names.
+        let mut resolved_reqs: Vec<(ResolvedTensorLoc, u64, usize, usize, u32)> =
+            Vec::with_capacity(requests.len());
+        for &(name, src_off, dst_off, len, tidx) in requests {
+            let loc = self
+                .index
+                .tensors
+                .get(name)
+                .with_context(|| format!("tensor '{name}' missing from GGUF index"))?
+                .resolved();
+            resolved_reqs.push((loc, src_off, dst_off, len, tidx));
+        }
+
         // 1. Check bounded hot-expert RAM LRU cache first.
-        let mut misses: Vec<(&str, u64, usize, usize, u32)> = Vec::new();
+        let mut misses: Vec<(ResolvedTensorLoc, u64, usize, usize, u32)> = Vec::new();
         let mut miss_meta: Vec<(SliceKey, usize, usize)> = Vec::new();
         let cache_enabled = {
             let mut cache = self
@@ -750,33 +926,23 @@ impl LayerIoPool {
             if budget > 0 {
                 let mut hits = 0u64;
                 let mut hit_bytes = 0u64;
-                misses.reserve(requests.len());
-                miss_meta.reserve(requests.len());
-                for &(name, src_off, dst_off, len, tidx) in requests {
-                    let end = dst_off
-                        .checked_add(len)
-                        .context("slice dst_offset overflow")?;
-                    if end > dst.len() {
-                        bail!(
-                            "slice dst range [{dst_off}..{end}) exceeds dst_cap {}",
-                            dst.len()
-                        );
+                misses.reserve(resolved_reqs.len());
+                miss_meta.reserve(resolved_reqs.len());
+                for &(loc, src_off, dst_off, len, tidx) in &resolved_reqs {
+                    let end = dst_off + len;
+                    let key = SliceKey {
+                        shard_idx: loc.shard_idx,
+                        file_offset: loc.abs_offset.saturating_add(src_off),
+                        len,
+                    };
+                    if let Some(cached) = cache.get_and_touch(key) {
+                        dst[dst_off..end].copy_from_slice(cached);
+                        hits += 1;
+                        hit_bytes += len as u64;
+                        continue;
                     }
-                    if let Some(loc) = self.index.tensors.get(name) {
-                        let key = SliceKey {
-                            shard_idx: loc.shard_idx,
-                            file_offset: loc.abs_offset.saturating_add(src_off),
-                            len,
-                        };
-                        if let Some(cached) = cache.get_and_touch(key) {
-                            dst[dst_off..end].copy_from_slice(cached);
-                            hits += 1;
-                            hit_bytes += len as u64;
-                            continue;
-                        }
-                        miss_meta.push((key, dst_off, len));
-                    }
-                    misses.push((name, src_off, dst_off, len, tidx));
+                    miss_meta.push((key, dst_off, len));
+                    misses.push((loc, src_off, dst_off, len, tidx));
                 }
                 if hits > 0 {
                     self.cache_hits.fetch_add(hits, Ordering::Relaxed);
@@ -793,16 +959,16 @@ impl LayerIoPool {
             }
         };
 
-        let active_reqs: &[(&str, u64, usize, usize, u32)] = if cache_enabled {
+        let active_reqs: &[(ResolvedTensorLoc, u64, usize, usize, u32)] = if cache_enabled {
             if misses.is_empty() {
                 return Ok(());
             }
             &misses
         } else {
-            requests
+            &resolved_reqs
         };
 
-        let spans = self.index.plan_coalesced_sub_slices(active_reqs)?;
+        let spans = self.index.plan_coalesced_sub_slices_resolved(active_reqs)?;
         let n_workers = self.moe_io_threads.min(spans.len()).max(1);
         if n_workers <= 1 {
             let mut scratch_guard = self
@@ -825,39 +991,8 @@ impl LayerIoPool {
             }
             self.record_io_sample(batch_bytes, t_wall.elapsed().as_micros() as u64);
         } else {
-            // Verify all destination ranges are in-bounds and mutually disjoint before
-            // parallelizing copies into `dst`.
-            let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(active_reqs.len());
-            for span in &spans {
-                for sl in &span.slices {
-                    let end = sl
-                        .dst_offset
-                        .checked_add(sl.len)
-                        .context("slice dst_offset overflow")?;
-                    if end > dst.len() {
-                        bail!(
-                            "slice dst range [{}..{}) exceeds dst_cap {}",
-                            sl.dst_offset,
-                            end,
-                            dst.len()
-                        );
-                    }
-                    ranges.push((sl.dst_offset, end));
-                }
-            }
-            ranges.sort_unstable_by_key(|r| r.0);
-            for w in ranges.windows(2) {
-                if w[0].1 > w[1].0 {
-                    bail!(
-                        "overlapping slice destination ranges [{}..{}) and [{}..{})",
-                        w[0].0,
-                        w[0].1,
-                        w[1].0,
-                        w[1].1
-                    );
-                }
-            }
-
+            // Destination ranges for all requests were validated in-bounds and mutually disjoint
+            // above, and `active_reqs` is a subset of `requests`.
             #[derive(Clone, Copy)]
             struct SendDstPtr(*mut u8, usize);
             impl SendDstPtr {
@@ -868,8 +1003,21 @@ impl LayerIoPool {
             }
             // SAFETY: Each parallel worker thread writes strictly to disjoint byte ranges within `dst`.
             unsafe impl Send for SendDstPtr {}
-            // SAFETY: Disjoint destination ranges are verified during span planning before spawning workers.
+            // SAFETY: Disjoint destination ranges are verified during request validation above.
             unsafe impl Sync for SendDstPtr {}
+
+            #[derive(Clone, Copy)]
+            struct SendScratchPtr(*mut AlignedBuf);
+            impl SendScratchPtr {
+                #[inline]
+                fn as_ptr(self) -> *mut AlignedBuf {
+                    self.0
+                }
+            }
+            // SAFETY: Worker `w` exclusively accesses `scratches[w]` (disjoint elements).
+            unsafe impl Send for SendScratchPtr {}
+            // SAFETY: Worker `w` exclusively accesses `scratches[w]` (disjoint elements).
+            unsafe impl Sync for SendScratchPtr {}
 
             let mut scratches = self
                 .moe_scratches
@@ -879,43 +1027,38 @@ impl LayerIoPool {
                 scratches.push(AlignedBuf::new(2 * 1024 * 1024)?);
             }
 
-            let dst_ptr = SendDstPtr(dst.as_mut_ptr(), dst.len());
+            let dst_send = SendDstPtr(dst.as_mut_ptr(), dst.len());
+            let scratches_base = SendScratchPtr(scratches.as_mut_ptr());
             let chunk_len = spans.len().div_ceil(n_workers);
+            let actual_workers = spans.len().div_ceil(chunk_len);
             let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
             let batch_bytes = AtomicU64::new(0);
             let t_wall = std::time::Instant::now();
-            std::thread::scope(|s| {
-                for (span_chunk, scratch_buf) in spans
-                    .chunks(chunk_len)
-                    .zip(scratches.iter_mut().take(n_workers))
-                {
-                    let err_slot = &first_err;
-                    let bytes_acc = &batch_bytes;
-                    let dst_send = dst_ptr;
-                    s.spawn(move || {
-                        let (base, len) = dst_send.parts();
-                        let mut local_bytes = 0u64;
-                        for span in span_chunk {
-                            match self.read_sparse_span_into_disjoint_ptr(
-                                span,
-                                scratch_buf,
-                                base,
-                                len,
-                            ) {
-                                Ok(n) => local_bytes = local_bytes.saturating_add(n),
-                                Err(e) => {
-                                    if let Ok(mut g) = err_slot.lock()
-                                        && g.is_none()
-                                    {
-                                        *g = Some(e);
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                        bytes_acc.fetch_add(local_bytes, Ordering::Relaxed);
-                    });
+            self.workers.run(actual_workers, |w| {
+                let start = w * chunk_len;
+                let end = (start + chunk_len).min(spans.len());
+                if start >= end {
+                    return;
                 }
+                let (base, len) = dst_send.parts();
+                // SAFETY: `w < actual_workers <= n_workers <= scratches.len()`, and each worker `w`
+                // has unique exclusive access to `scratches[w]` while `scratches` lock is held.
+                let scratch_buf = unsafe { &mut *scratches_base.as_ptr().add(w) };
+                let mut local_bytes = 0u64;
+                for span in &spans[start..end] {
+                    match self.read_sparse_span_into_disjoint_ptr(span, scratch_buf, base, len) {
+                        Ok(n) => local_bytes = local_bytes.saturating_add(n),
+                        Err(e) => {
+                            if let Ok(mut g) = first_err.lock()
+                                && g.is_none()
+                            {
+                                *g = Some(e);
+                            }
+                            return;
+                        }
+                    }
+                }
+                batch_bytes.fetch_add(local_bytes, Ordering::Relaxed);
             });
             self.record_io_sample(
                 batch_bytes.load(Ordering::Relaxed),
@@ -1130,20 +1273,39 @@ impl LayerIoPool {
             return matches!(pread_exact_or_eof(file, buf, base_offset), Ok(n) if n >= valid_len);
         }
 
-        let ok = std::sync::atomic::AtomicBool::new(true);
-        std::thread::scope(|s| {
-            for (idx, chunk) in buf.chunks_mut(chunk_size).enumerate() {
-                let rel_off = idx * chunk_size;
-                let file_off = base_offset + rel_off as u64;
-                let expected = valid_len.saturating_sub(rel_off).min(chunk.len());
-                if expected == 0 {
-                    continue;
-                }
-                let ok_ref = &ok;
-                s.spawn(move || match pread_exact_or_eof(file, chunk, file_off) {
-                    Ok(n) if n >= expected => {}
-                    _ => ok_ref.store(false, Ordering::Relaxed),
-                });
+        #[derive(Clone, Copy)]
+        struct SendBufPtr(*mut u8, usize);
+        impl SendBufPtr {
+            #[inline]
+            fn parts(self) -> (*mut u8, usize) {
+                (self.0, self.1)
+            }
+        }
+        // SAFETY: Each worker `idx` writes strictly to its disjoint slice `[idx * chunk_size .. end)`.
+        unsafe impl Send for SendBufPtr {}
+        // SAFETY: Disjoint chunks are partitioned by `chunk_size` across unique worker indices.
+        unsafe impl Sync for SendBufPtr {}
+
+        let buf_ptr = SendBufPtr(buf.as_mut_ptr(), buf.len());
+        let n_chunks = buf.len().div_ceil(chunk_size);
+        let ok = AtomicBool::new(true);
+        self.workers.run(n_chunks, |idx| {
+            let (base, total_len) = buf_ptr.parts();
+            let rel_off = idx * chunk_size;
+            if rel_off >= total_len {
+                return;
+            }
+            let chunk_len = (total_len - rel_off).min(chunk_size);
+            let expected = valid_len.saturating_sub(rel_off).min(chunk_len);
+            if expected == 0 {
+                return;
+            }
+            let file_off = base_offset + rel_off as u64;
+            // SAFETY: `[rel_off .. rel_off + chunk_len)` is within `buf` and disjoint across worker indices.
+            let chunk = unsafe { std::slice::from_raw_parts_mut(base.add(rel_off), chunk_len) };
+            match pread_exact_or_eof(file, chunk, file_off) {
+                Ok(n) if n >= expected => {}
+                _ => ok.store(false, Ordering::Relaxed),
             }
         });
         ok.load(Ordering::Relaxed)
@@ -1608,5 +1770,19 @@ mod tests {
         ];
         let mut dst = vec![0u8; 8192];
         assert!(pool.load_slices_into(&bad, &mut dst).is_err());
+    }
+
+    #[test]
+    fn scoped_worker_pool_runs_parallel_and_overflow_batches() {
+        let pool = ScopedWorkerPool::new(4);
+        for n_tasks in [0usize, 1, 2, 4, 7] {
+            let hits: Vec<AtomicU64> = (0..n_tasks).map(|_| AtomicU64::new(0)).collect();
+            pool.run(n_tasks, |idx| {
+                hits[idx].fetch_add(1, Ordering::Relaxed);
+            });
+            for h in &hits {
+                assert_eq!(h.load(Ordering::Relaxed), 1);
+            }
+        }
     }
 }
