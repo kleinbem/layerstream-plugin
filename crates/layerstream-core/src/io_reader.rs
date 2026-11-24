@@ -105,7 +105,7 @@ struct ShardHandle {
     sparse_buffered: File,
 }
 
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct IoStats {
     pub bytes_read: u64,
     pub span_reads: u64,

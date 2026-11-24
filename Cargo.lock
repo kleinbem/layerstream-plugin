@@ -846,6 +846,7 @@ dependencies = [
  "anyhow",
  "cc",
  "cmake",
+ "getrandom 0.4.3",
  "libc",
  "serde",
  "serde_json",

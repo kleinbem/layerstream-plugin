@@ -16,6 +16,7 @@ python-stage-backends = []
 
 [dependencies]
 anyhow.workspace = true
+getrandom.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
