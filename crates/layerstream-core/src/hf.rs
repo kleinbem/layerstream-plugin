@@ -2185,6 +2185,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
+        // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
         unsafe { std::env::set_var("HF_ENDPOINT", format!("http://{addr}")) };
 
         // 1. Pre-populate partial `.part` + matching `.part.meta` ETag -> verifies 206 resume + SHA-256.
@@ -2239,6 +2240,7 @@ mod tests {
         assert_eq!(fs::read(&local4).unwrap(), payload_v2);
         assert_eq!(hits.load(Ordering::SeqCst), 4);
 
+        // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
         unsafe { std::env::remove_var("HF_ENDPOINT") };
         let _ = fs::remove_dir_all(&tmp);
         server.join().unwrap();
@@ -2267,11 +2269,13 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
+        // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
         unsafe {
             std::env::set_var("HF_ENDPOINT", format!("http://{addr}"));
             std::env::set_var("LAYERSTREAM_HF_READ_TIMEOUT_SECS", "1");
         }
         let err = ensure_hf_downloaded("hf://stallorg/stallrepo:model.gguf", &tmp);
+        // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
         unsafe {
             std::env::remove_var("HF_ENDPOINT");
             std::env::remove_var("LAYERSTREAM_HF_READ_TIMEOUT_SECS");
@@ -2425,6 +2429,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
+        // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
         unsafe {
             std::env::set_var("HF_ENDPOINT", format!("http://{hub_addr}"));
             std::env::set_var("HF_TOKEN", "hf_test_secret_token");
@@ -2432,6 +2437,7 @@ mod tests {
 
         let res = ensure_hf_downloaded("hf://testorg/xetrepo:model.gguf", &tmp);
 
+        // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
         unsafe {
             std::env::remove_var("HF_ENDPOINT");
             std::env::remove_var("HF_TOKEN");
@@ -2545,6 +2551,7 @@ mod tests {
         });
 
         let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
         unsafe { std::env::set_var("HF_ENDPOINT", format!("http://{addr}")) };
 
         let opts = PretrainedResolveOptions {
@@ -2570,6 +2577,7 @@ mod tests {
             "missing guidance: {msg}"
         );
 
+        // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
         unsafe { std::env::remove_var("HF_ENDPOINT") };
         server.join().unwrap();
     }
@@ -2627,6 +2635,7 @@ mod tests {
         });
 
         let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
         unsafe { std::env::set_var("HF_ENDPOINT", format!("http://{addr}")) };
 
         let events: Arc<Mutex<Vec<DownloadProgress>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2670,6 +2679,7 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("user aborted download"));
 
+        // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
         unsafe { std::env::remove_var("HF_ENDPOINT") };
         server.join().unwrap();
     }

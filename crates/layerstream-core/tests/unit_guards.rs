@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::undocumented_unsafe_blocks)]
 
 //! Pure unit tests covering review findings:
 //! - P1-2: padded-vocab draft compatibility (`152,064` vs `151,936`)
