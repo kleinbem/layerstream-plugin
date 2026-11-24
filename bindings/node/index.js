@@ -1,7 +1,7 @@
-const path = require("node:path");
-const native = require("./native.js");
-const { IsolatedWorkerClient } = require("./worker.js");
-const { OpenAI } = require("./openai.js");
+import path from "node:path";
+import native from "./native.js";
+import { OpenAI } from "./openai.js";
+import { IsolatedWorkerClient } from "./worker.js";
 
 const ASYNC_DISPOSE = Symbol.asyncDispose;
 const MAX_I32 = 2147483647;
@@ -17,7 +17,7 @@ function createAbortError(signal) {
 }
 
 function mapNativeError(err, signal = undefined) {
-  if (signal && signal.aborted) {
+  if (signal?.aborted) {
     return createAbortError(signal);
   }
   if (err instanceof Error && typeof err.message === "string") {
@@ -298,13 +298,13 @@ class TokenStream {
   [Symbol.asyncIterator]() {
     return {
       next: async () => {
-        if (this._signal && this._signal.aborted) {
+        if (this._signal?.aborted) {
           await this.close();
           throw createAbortError(this._signal);
         }
         try {
           const chunk = await this._inner.nextChunk();
-          if (this._signal && this._signal.aborted) {
+          if (this._signal?.aborted) {
             await this.close();
             throw createAbortError(this._signal);
           }
@@ -438,7 +438,7 @@ class AutoModel {
       throw new TypeError("generation options must be an object");
     }
     const signal = opts.signal;
-    if (signal && signal.aborted) {
+    if (signal?.aborted) {
       throw createAbortError(signal);
     }
     const stream = Boolean(opts.stream ?? false);
@@ -446,7 +446,7 @@ class AutoModel {
     if (stream) {
       const wire = this._buildGenWire(opts, false);
       const wireJson = JSON.stringify(wire);
-      if (signal && signal.aborted) {
+      if (signal?.aborted) {
         throw createAbortError(signal);
       }
       try {
@@ -471,12 +471,12 @@ class AutoModel {
       throw new TypeError("generation options must be an object");
     }
     const signal = opts.signal;
-    if (signal && signal.aborted) {
+    if (signal?.aborted) {
       throw createAbortError(signal);
     }
     const wire = this._buildGenWire(opts, false);
     const wireJson = JSON.stringify(wire);
-    if (signal && signal.aborted) {
+    if (signal?.aborted) {
       throw createAbortError(signal);
     }
 
@@ -486,7 +486,7 @@ class AutoModel {
         { prompt, wire },
         signal,
       );
-      if (signal && signal.aborted) {
+      if (signal?.aborted) {
         throw createAbortError(signal);
       }
       return { text: String(result.text ?? ""), summary };
@@ -504,7 +504,7 @@ class AutoModel {
     }
     try {
       const out = await this._backend.generateWithSummary(prompt, wireJson, cancelTok);
-      if (signal && signal.aborted) {
+      if (signal?.aborted) {
         throw createAbortError(signal);
       }
       return { text: out.text, summary: out.summary };
@@ -523,7 +523,7 @@ class AutoModel {
       throw new TypeError("generation options must be an object");
     }
     const signal = opts.signal;
-    if (signal && signal.aborted) {
+    if (signal?.aborted) {
       throw createAbortError(signal);
     }
     const stream = Boolean(opts.stream ?? false);
@@ -537,7 +537,7 @@ class AutoModel {
       }
       const messagesJson = JSON.stringify(cleanMessages);
       const wireJson = JSON.stringify(wire);
-      if (signal && signal.aborted) {
+      if (signal?.aborted) {
         throw createAbortError(signal);
       }
 
@@ -589,7 +589,7 @@ class AutoModel {
         } else {
           inner = await startPromise;
         }
-        if (signal && signal.aborted) {
+        if (signal?.aborted) {
           await inner.close();
           throw createAbortError(signal);
         }
@@ -613,13 +613,13 @@ class AutoModel {
       throw new TypeError("generation options must be an object");
     }
     const signal = opts.signal;
-    if (signal && signal.aborted) {
+    if (signal?.aborted) {
       throw createAbortError(signal);
     }
     const wire = this._buildGenWire(opts, true);
     const messagesJson = JSON.stringify(cleanMessages);
     const wireJson = JSON.stringify(wire);
-    if (signal && signal.aborted) {
+    if (signal?.aborted) {
       throw createAbortError(signal);
     }
 
@@ -629,7 +629,7 @@ class AutoModel {
         { messages: cleanMessages, wire },
         signal,
       );
-      if (signal && signal.aborted) {
+      if (signal?.aborted) {
         throw createAbortError(signal);
       }
       const payload = wire.parseOutput ? result.parsed : String(result.text ?? "");
@@ -648,7 +648,7 @@ class AutoModel {
     }
     try {
       const out = await this._backend.chatWithSummary(messagesJson, wireJson, cancelTok);
-      if (signal && signal.aborted) {
+      if (signal?.aborted) {
         throw createAbortError(signal);
       }
       const payload = wire.parseOutput ? out.parsed : out.text;
@@ -880,21 +880,22 @@ async function check(model, opts = {}) {
   }
 }
 
+const StreamTagParser = native.StreamTagParser;
 const version = native.version();
 
-module.exports = {
+export {
   AutoModel,
-  OpenAI,
-  StreamTagParser: native.StreamTagParser,
-  TokenStream,
   check,
   formatToolsSystemPrompt,
   inspectGguf,
   jsonObjectGbnf,
   jsonSchemaToGbnf,
+  OpenAI,
   parseAssistantOutput,
   probeGpuMemory,
   pull,
   recommend,
+  StreamTagParser,
+  TokenStream,
   version,
 };
