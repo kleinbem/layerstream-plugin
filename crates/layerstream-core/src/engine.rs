@@ -535,8 +535,12 @@ impl StreamEngine {
 
     pub fn kv_trim(&mut self, pos_min: i32) -> bool {
         let ok = unsafe { ls_engine_kv_trim(self.raw.as_ptr(), pos_min) };
-        if ok && pos_min >= 0 {
-            self.cached_kv_tokens.truncate(pos_min as usize);
+        if ok {
+            if pos_min <= 0 {
+                self.cached_kv_tokens.clear();
+            } else {
+                self.cached_kv_tokens.truncate(pos_min as usize);
+            }
         }
         ok
     }

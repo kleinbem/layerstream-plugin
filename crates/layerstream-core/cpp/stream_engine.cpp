@@ -2116,7 +2116,17 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     }
 
     if (eng->streamed_dense_layers > 0 || eng->streamed_moe_layers > 0) {
-        eng->worker_thread = std::thread([eng]() { eng->worker_loop(); });
+        try {
+            eng->worker_thread = std::thread([eng]() { eng->worker_loop(); });
+        } catch (const std::exception & e) {
+            ls_internal::set_error(err_buf, err_cap, std::string("failed to start I/O worker thread: ") + e.what());
+            ls_engine_free(eng);
+            return nullptr;
+        } catch (...) {
+            ls_internal::set_error(err_buf, err_cap, "failed to start I/O worker thread");
+            ls_engine_free(eng);
+            return nullptr;
+        }
     }
 
     ls_llama::clear_model_no_alloc(eng->model);

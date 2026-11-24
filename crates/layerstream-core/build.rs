@@ -240,6 +240,7 @@ fn main() {
         .define("GGML_OPENMP", "OFF")
         .define("GGML_VULKAN", if use_vulkan { "ON" } else { "OFF" })
         .define("GGML_CUDA", if use_cuda { "ON" } else { "OFF" })
+        .define("GGML_CCACHE", if use_cuda { "OFF" } else { "ON" })
         // Workaround: CUDA graphs hang sm_120 channels under sustained load and churn on sparse MoE
         // pointer updates (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
         .define("GGML_CUDA_GRAPHS", "OFF")

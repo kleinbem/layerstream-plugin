@@ -108,7 +108,7 @@ class IsolatedWorkerClient:
         open_json = json.dumps(_to_worker_open_payload(open_kwargs))
         self._native = NativeWorkerClient.spawn(
             sys.executable,
-            ["-m", "layerstream._worker"],
+            ["-c", "from layerstream._worker import _main; _main()"],
             open_json,
             on_progress=on_progress,
         )
