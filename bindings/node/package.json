@@ -1,6 +1,6 @@
 {
   "name": "layerstream",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Out-of-core GGUF layer-streaming LLM inference engine with O_DIRECT GPU streaming (Node-API / TypeScript)",
   "license": "Apache-2.0",
   "repository": {

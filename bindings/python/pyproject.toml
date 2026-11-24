@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "layerstream"
-version = "0.4.0"
+version = "0.4.1"
 description = "Out-of-core GGUF layer-streaming LLM inference engine with O_DIRECT GPU streaming"
 readme = "README.md"
 license = "Apache-2.0"
@@ -32,10 +32,10 @@ classifiers = [
 
 [project.optional-dependencies]
 cuda = [
-    "layerstream-cuda13==0.4.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+    "layerstream-cuda13==0.4.1; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 cuda13 = [
-    "layerstream-cuda13==0.4.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+    "layerstream-cuda13==0.4.1; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 dev = [
     "pytest>=8.3",

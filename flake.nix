@@ -54,6 +54,9 @@
               cargo
               rustfmt
               clippy
+              rust-analyzer
+              clang-tools
+              sccache
               cmake
               ninja
               pkg-config

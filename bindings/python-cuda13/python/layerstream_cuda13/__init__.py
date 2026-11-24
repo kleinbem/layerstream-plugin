@@ -5,7 +5,7 @@ import glob
 import importlib.util
 import os
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 def backend_dir() -> str:
