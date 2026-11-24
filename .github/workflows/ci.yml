@@ -150,8 +150,9 @@ jobs:
           cat > /tmp/tsan.supp <<'EOF'
           # Rust's prebuilt stdlib (libtest mpmc channel) is not compiled with
           # -Zsanitizer=thread, so TSan sees its memcpy without its atomics.
-          race:std::sync::mpmc
-          race:core::profiling::compiler_copy
+          # Match source paths because Rust v0 symbol names are mangled.
+          race:library/std/src/sync/mpmc
+          race:library/core/src/profiling.rs
           EOF
           TSAN_SO="$(g++-14 -print-file-name=libtsan.so)"
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="setarch x86_64 -R env LD_PRELOAD=${TSAN_SO}" \
