@@ -17,7 +17,7 @@ from typing import Any, Literal, Union, get_args, get_origin, overload, override
 
 from ._layerstream import (
     StreamTagParser,
-    json_object_gbnf,
+    compile_response_format as _native_compile_response_format,
     json_schema_to_gbnf,
     parse_assistant_output,
 )
@@ -393,32 +393,8 @@ def _compile_response_format(response_format: Any) -> tuple[str | None, Any]:
         raise TypeError(f"unsupported response_format class '{cls.__name__}'")
 
     if isinstance(response_format, Mapping):
-        rf = typing.cast(Mapping[str, Any], response_format)
-        match rf.get("type", "text"):
-            case "text":
-                return None, None
-            case "json_object":
-                return json_object_gbnf(), dict
-            case "json_schema":
-                inner: Any = rf.get("json_schema", rf)
-                schema: Any = (
-                    typing.cast(Mapping[str, Any], inner).get("schema", inner)
-                    if isinstance(inner, Mapping)
-                    else inner
-                )
-                if schema is None:
-                    raise ValueError("response_format 'json_schema' requires a 'schema' mapping")
-                return json_schema_to_gbnf(schema), dict
-            case "gbnf":
-                grammar: Any = rf.get("grammar")
-                if not isinstance(grammar, str) or not grammar.strip():
-                    raise ValueError("response_format 'gbnf' requires a non-empty 'grammar' string")
-                return grammar, None
-            case other:
-                raise ValueError(
-                    f"unsupported response_format type '{other}' "
-                    "(expected 'text', 'json_object', 'json_schema', or 'gbnf')"
-                )
+        grammar, expects_json = _native_compile_response_format(response_format, False)
+        return grammar, (dict if expects_json else None)
 
     raise TypeError(
         "response_format must be None, a mapping ({'type': ...}), or a Pydantic/dataclass type"

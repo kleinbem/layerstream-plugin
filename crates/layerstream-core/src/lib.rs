@@ -6,6 +6,7 @@ pub mod grammar;
 #[cfg(feature = "hf")]
 pub mod hf;
 pub mod io_reader;
+pub mod openai;
 pub mod residency;
 #[cfg(feature = "hf")]
 pub mod sdk;
@@ -29,5 +30,8 @@ pub use gguf_index::{
 };
 pub use grammar::{json_object_gbnf, json_schema_to_gbnf};
 pub use io_reader::{IoStats, LayerIoPool, probe_dir_storage_mib_per_s, probe_storage_mib_per_s};
+pub use openai::{
+    CompiledResponseFormat, OpenAiUsage, compile_response_format, normalize_finish_reason,
+};
 pub use residency::{AdmissionPermit, EngineLease, Residency};
 pub use speculator::{DraftModelProposer, NgramProposer, SpeculationStats};

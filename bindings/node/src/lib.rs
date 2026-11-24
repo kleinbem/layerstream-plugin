@@ -17,7 +17,9 @@ use layerstream_core::worker_ipc::{
 use layerstream_core::{
     ChatMessage, GenerateOptions, GenerateSummary, IncomingChatMessage, KvCacheType,
     LsSampleParams, ParsedAssistantOutput, StreamDelta, StreamEngine,
-    StreamTagParser as CoreStreamTagParser, format_tools_system_prompt as core_format_tools,
+    StreamTagParser as CoreStreamTagParser,
+    compile_response_format as core_compile_response_format,
+    format_tools_system_prompt as core_format_tools,
     inject_tools_into_messages as core_inject_tools, json_object_gbnf as core_json_object_gbnf,
     json_schema_to_gbnf as core_json_schema_to_gbnf,
     parse_assistant_output as core_parse_assistant_output,
@@ -2128,6 +2130,27 @@ impl NativeWorkerClient {
         })
         .await
     }
+}
+
+#[napi(object)]
+pub struct CompiledResponseFormatJs {
+    pub grammar: Option<String>,
+    pub expects_json: bool,
+}
+
+#[napi]
+pub fn compile_response_format(
+    rf_json: String,
+    allow_raw_schema: Option<bool>,
+) -> Result<CompiledResponseFormatJs> {
+    let val: JsonValue = serde_json::from_str(&rf_json)
+        .map_err(|e| invalid_arg(format!("invalid response_format JSON: {e}")))?;
+    let compiled = core_compile_response_format(&val, allow_raw_schema.unwrap_or(true))
+        .map_err(|e| invalid_arg(format!("{e:#}")))?;
+    Ok(CompiledResponseFormatJs {
+        grammar: compiled.grammar,
+        expects_json: compiled.expects_json,
+    })
 }
 
 #[napi]
