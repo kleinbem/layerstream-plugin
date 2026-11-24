@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstddef>
+#include <type_traits>
+
 #if defined(LAYERSTREAM_USE_CUDA)
 #define LAYERSTREAM_HAS_CUDA_RT 1
 #include <cuda_runtime.h>
