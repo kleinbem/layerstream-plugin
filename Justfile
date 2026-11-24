@@ -21,8 +21,18 @@ check-versions:
     test "$cargo_ver" = "$node_cargo_ver"; \
     test "$cargo_ver" = "$node_pkg_ver"
 
-# Run fast local preflight checks (versions, formatting, lint, types, flake eval)
-preflight: check-versions
+# Verify no tracked source file exceeds 2,000 lines
+check-loc:
+    @bad=$(git ls-files '*.rs' '*.cpp' '*.hpp' '*.py' '*.js' '*.ts' | xargs wc -l | awk '$1 > 2000 && $2 != "total"'); \
+    if [ -n "$bad" ]; then \
+      echo "ERROR: source files exceeding 2,000 LoC limit:" >&2; \
+      echo "$bad" >&2; \
+      exit 1; \
+    fi; \
+    echo "All tracked source files are <= 2,000 LoC."
+
+# Run fast local preflight checks (versions, LoC limit, formatting, lint, types, flake eval)
+preflight: check-versions check-loc
     cargo fmt --all -- --check
     (cd bindings/python && cargo fmt -- --check)
     (cd bindings/node && cargo fmt -- --check)
