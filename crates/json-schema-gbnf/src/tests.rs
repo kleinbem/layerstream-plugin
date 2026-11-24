@@ -636,3 +636,128 @@ fn validates_error_paths_annotations_and_boolean_schemas() {
     let g_err: GrammarError = serde_err.into();
     assert!(!g_err.to_string().is_empty());
 }
+
+#[test]
+fn compiles_oneof_discriminated_unions_number_xor_int_and_allof_distribution() {
+    // Pydantic-style discriminated union (`oneOf` of objects with disjoint `const` tag).
+    let disc = json_schema_to_gbnf(&json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {"kind": {"const": "a"}, "val": {"type": "integer"}},
+                "required": ["kind", "val"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {"kind": {"const": "b"}, "msg": {"type": "string"}},
+                "required": ["kind", "msg"],
+                "additionalProperties": false
+            }
+        ]
+    }))
+    .unwrap();
+    assert!(disc.contains("\\\"a\\\""));
+    assert!(disc.contains("\\\"b\\\""));
+    assert_all_gbnf_rules_defined(&disc);
+
+    // `oneOf` with non-discriminated same-type array/string branches fails closed.
+    assert!(
+        json_schema_to_gbnf(&json!({
+            "oneOf": [
+                {"type": "array", "items": {"type": "integer"}, "maxItems": 1},
+                {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 3}
+            ]
+        }))
+        .is_err()
+    );
+    assert!(
+        json_schema_to_gbnf(&json!({
+            "oneOf": [
+                {"type": "string", "maxLength": 2},
+                {"type": "string", "minLength": 4, "maxLength": 6}
+            ]
+        }))
+        .is_err()
+    );
+
+    // `oneOf` with `(number XOR integer)` + a third disjoint branch (`string`).
+    let num_xor_str = json_schema_to_gbnf(&json!({
+        "oneOf": [{"type": "number"}, {"type": "integer"}, {"type": "string"}]
+    }))
+    .unwrap();
+    assert!(num_xor_str.contains("json-nonint-number"));
+    assert!(num_xor_str.contains("json-string"));
+    assert_all_gbnf_rules_defined(&num_xor_str);
+
+    // `oneOf` with `(number XOR integer)` + two overlapping extra branches fails closed.
+    assert!(
+        json_schema_to_gbnf(&json!({
+            "oneOf": [
+                {"type": "number"},
+                {"type": "integer"},
+                {"type": "string"},
+                {"type": "string"}
+            ]
+        }))
+        .is_err()
+    );
+
+    // `oneOf` edge cases: empty, single-element, all-false.
+    assert!(json_schema_to_gbnf(&json!({"oneOf": []})).is_err());
+    assert!(json_schema_to_gbnf(&json!({"oneOf": [false, false]})).is_err());
+    let single_oneof = json_schema_to_gbnf(&json!({"oneOf": [{"type": "boolean"}]})).unwrap();
+    assert!(single_oneof.contains("json-bool"));
+
+    // `allOf` distributing over `oneOf` on both left and right sides, plus multi-type intersection.
+    let left_oneof = json_schema_to_gbnf(&json!({
+        "allOf": [
+            {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+            {"type": ["string", "boolean"]}
+        ]
+    }))
+    .unwrap();
+    assert!(left_oneof.contains("json-string"));
+    assert_all_gbnf_rules_defined(&left_oneof);
+
+    let right_oneof = json_schema_to_gbnf(&json!({
+        "allOf": [
+            {"type": ["string", "integer", "boolean"]},
+            {"oneOf": [{"type": "string"}, {"type": "boolean"}]}
+        ]
+    }))
+    .unwrap();
+    assert!(right_oneof.contains("json-string"));
+    assert!(right_oneof.contains("json-bool"));
+    assert_all_gbnf_rules_defined(&right_oneof);
+
+    // `allOf` with enum/items/additionalProperties on only one side and multi-type overlap.
+    let multi_ty = json_schema_to_gbnf(&json!({
+        "allOf": [
+            {"type": ["string", "integer", "boolean"]},
+            {"type": ["string", "boolean"]}
+        ]
+    }))
+    .unwrap();
+    assert!(multi_ty.contains("json-string"));
+    assert!(multi_ty.contains("json-bool"));
+    assert_all_gbnf_rules_defined(&multi_ty);
+
+    let one_sided = json_schema_to_gbnf(&json!({
+        "allOf": [
+            {"type": "array", "items": {"type": "integer"}},
+            {"type": "array", "minItems": 1, "maxItems": 2}
+        ]
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&one_sided);
+
+    let one_sided_obj = json_schema_to_gbnf(&json!({
+        "allOf": [
+            {"type": "object", "additionalProperties": {"type": "boolean"}},
+            {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+        ]
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&one_sided_obj);
+}

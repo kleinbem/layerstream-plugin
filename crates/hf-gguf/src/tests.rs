@@ -1135,3 +1135,258 @@ fn download_handles_416_range_mismatch_etag_change_truncation_sha_mismatch_and_r
     unsafe { std::env::remove_var("HF_ENDPOINT") };
     server.join().unwrap();
 }
+
+fn make_sparse_gguf(path: &Path, arch: &str, tokens: &[&str], sparse_size: u64) {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"GGUF");
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes()); // n_tensors
+    buf.extend_from_slice(&2u64.to_le_bytes()); // n_kv
+
+    let write_s = |b: &mut Vec<u8>, s: &str| {
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b.extend_from_slice(s.as_bytes());
+    };
+    write_s(&mut buf, "general.architecture");
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    write_s(&mut buf, arch);
+
+    write_s(&mut buf, "tokenizer.ggml.tokens");
+    buf.extend_from_slice(&9u32.to_le_bytes());
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    buf.extend_from_slice(&(tokens.len() as u64).to_le_bytes());
+    for tok in tokens {
+        write_s(&mut buf, tok);
+    }
+
+    let mut f = File::create(path).unwrap();
+    std::io::Write::write_all(&mut f, &buf).unwrap();
+    if sparse_size > buf.len() as u64 {
+        f.set_len(sparse_size).unwrap();
+    }
+}
+
+#[test]
+fn resolve_auto_draft_model_with_probe_covers_guards_matching_and_incompatibility() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // Cover all `select_auto_draft_repo` branches including empty-arch hints.
+    assert_eq!(
+        select_auto_draft_repo("", "my-qwen3-8b.gguf"),
+        Some("Qwen/Qwen3-0.6B-GGUF")
+    );
+    assert_eq!(
+        select_auto_draft_repo("", "QwQ-32B.gguf"),
+        Some("Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+    );
+    assert_eq!(
+        select_auto_draft_repo("", "gemma-3-27b.gguf"),
+        Some("ggml-org/gemma-3-1b-it-GGUF")
+    );
+    assert_eq!(
+        select_auto_draft_repo("gemma3", ""),
+        Some("ggml-org/gemma-3-1b-it-GGUF")
+    );
+    assert_eq!(
+        select_auto_draft_repo("llama", "DeepSeek-R1-Distill-Llama-8B"),
+        Some("bartowski/Llama-3.2-1B-Instruct-GGUF")
+    );
+    assert_eq!(select_auto_draft_repo("mistral", "Mistral-7B"), None);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let vocab = &["<bos>", "hello", "world"];
+
+    // Small target (< 2 GiB) -> Ok(None).
+    let small_p = tmp.path().join("small.gguf");
+    make_sparse_gguf(&small_p, "qwen3", vocab, 4096);
+    let small_target = ResolvedModel {
+        local_path: small_p,
+        source_uri: None,
+        resolved_repo: None,
+        selected_quant: None,
+    };
+    assert!(
+        resolve_auto_draft_model(
+            &small_target,
+            Some(tmp.path().to_path_buf()),
+            None,
+            false,
+            None
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // Large 3 GiB sparse target (uses 0 disk blocks on Linux).
+    let big_p = tmp.path().join("big-qwen3.gguf");
+    make_sparse_gguf(&big_p, "qwen3", vocab, 3 * 1024 * 1024 * 1024);
+    let big_target = ResolvedModel {
+        local_path: big_p,
+        source_uri: None,
+        resolved_repo: Some("Qwen/Qwen3-8B-GGUF".into()),
+        selected_quant: Some("Q4_K_M".into()),
+    };
+
+    // Low VRAM (< 1.5 GiB) -> Ok(None).
+    assert!(
+        resolve_auto_draft_model_with_probe(
+            &big_target,
+            Some(tmp.path().to_path_buf()),
+            None,
+            true,
+            None,
+            || Some(512 * 1024 * 1024),
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // Huge VRAM (target fits 100% resident) -> Ok(None).
+    assert!(
+        resolve_auto_draft_model_with_probe(
+            &big_target,
+            Some(tmp.path().to_path_buf()),
+            None,
+            true,
+            None,
+            || Some(16 * 1024 * 1024 * 1024),
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // Unknown architecture -> Ok(None).
+    let mistral_p = tmp.path().join("big-mistral.gguf");
+    make_sparse_gguf(&mistral_p, "mistral", vocab, 3 * 1024 * 1024 * 1024);
+    let mistral_target = ResolvedModel {
+        local_path: mistral_p,
+        source_uri: None,
+        resolved_repo: None,
+        selected_quant: None,
+    };
+    assert!(
+        resolve_auto_draft_model_with_probe(
+            &mistral_target,
+            Some(tmp.path().to_path_buf()),
+            Some(2 * 1024 * 1024 * 1024),
+            true,
+            None,
+            || None,
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // End-to-end mock HTTP server for `resolve_auto_draft_model_with_probe` + `resolve_pretrained_model_with_probe`.
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let draft_ok_file = tmp.path().join("draft_ok_src.gguf");
+    make_sparse_gguf(&draft_ok_file, "qwen3", vocab, 1024);
+    let draft_ok_bytes = fs::read(&draft_ok_file).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let draft_srv = draft_ok_bytes.clone();
+    let server = std::thread::spawn(move || {
+        for stream_res in listener.incoming() {
+            let Ok(mut stream) = stream_res else { break };
+            let mut req_buf = [0u8; 4096];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let req = String::from_utf8_lossy(&req_buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("");
+            if path.ends_with("/__stop") {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                break;
+            } else if path.contains("/api/models/Qwen/Qwen3-0.6B-GGUF/tree/") {
+                let json_body =
+                    r#"[{"type":"file","path":"Qwen3-0.6B-Q4_K_M.gguf","size":500000000}]"#;
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    json_body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(json_body.as_bytes());
+            } else if path.contains("/api/models/Org/Empty-GGUF/tree/") {
+                let json_body = "[]";
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    json_body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(json_body.as_bytes());
+            } else if path.ends_with("Qwen3-0.6B-Q4_K_M.gguf") {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    draft_srv.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(&draft_srv);
+            } else {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        }
+    });
+
+    // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
+    unsafe { std::env::set_var("HF_ENDPOINT", format!("http://{addr}")) };
+    let cache = tmp.path().join("cache");
+
+    // 1. Compatible Qwen3 auto-draft resolves and passes vocab compatibility check!
+    let resolved_draft = resolve_auto_draft_model_with_probe(
+        &big_target,
+        Some(cache.clone()),
+        Some(2 * 1024 * 1024 * 1024),
+        true,
+        Some(Arc::new(|_| Ok(()))),
+        || None,
+    )
+    .unwrap();
+    assert!(resolved_draft.is_some());
+
+    // 2. Progress callback abort propagates `HfError::Cancelled`.
+    let cache2 = tmp.path().join("cache2");
+    let abort_cb: ProgressCallback = Arc::new(|_| Err(HfError::Cancelled("aborted".into())));
+    let err = resolve_auto_draft_model_with_probe(
+        &big_target,
+        Some(cache2),
+        Some(2 * 1024 * 1024 * 1024),
+        true,
+        Some(abort_cb),
+        || None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, HfError::Cancelled(_)));
+
+    // 3. Explicit `hf://` URI with revision override + `-GGUF` repo with no files -> NotFound.
+    let mut uri_opts = PretrainedResolveOptions {
+        revision: Some("v1".into()),
+        cache_dir: Some(cache.clone()),
+        use_gpu: true,
+        ..Default::default()
+    };
+    let res_uri = resolve_pretrained_model_with_probe(
+        "hf://Qwen/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q4_K_M.gguf",
+        &uri_opts,
+        || Some(8 * 1024 * 1024 * 1024),
+    )
+    .unwrap();
+    assert!(res_uri.source_uri.unwrap().ends_with("@v1"));
+
+    uri_opts.revision = None;
+    let empty_err =
+        resolve_pretrained_model_with_probe("Org/Empty-GGUF", &uri_opts, || Some(8 << 30))
+            .unwrap_err();
+    assert!(matches!(empty_err, HfError::NotFound(_)));
+
+    let _ = ureq::get(&format!("http://{addr}/__stop")).call();
+    // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
+    unsafe { std::env::remove_var("HF_ENDPOINT") };
+    server.join().unwrap();
+}
