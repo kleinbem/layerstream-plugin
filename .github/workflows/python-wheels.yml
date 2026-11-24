@@ -66,8 +66,8 @@ jobs:
         working-directory: bindings/python
         run: |
           uv pip install --system ruff pyright pip-audit pytest pytest-asyncio pytest-timeout hypothesis
-          ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts
-          ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts
+          ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../../benchmarks
+          ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../../benchmarks
           pyright python/layerstream tests
           pip-audit --strict
 
