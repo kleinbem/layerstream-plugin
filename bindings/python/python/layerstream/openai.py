@@ -36,26 +36,26 @@ class _OpenAIModel:
     to_dict = model_dump
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class FunctionCall(_OpenAIModel):
     name: str
     arguments: str
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ChatCompletionMessageToolCall(_OpenAIModel):
     id: str
     function: FunctionCall
     type: str = "function"
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ChoiceDeltaToolCallFunction(_OpenAIModel):
     name: str | None = None
     arguments: str | None = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ChoiceDeltaToolCall(_OpenAIModel):
     index: int
     id: str | None = None
@@ -72,7 +72,7 @@ class ChatCompletionMessage(_OpenAIModel):
     parsed: Any = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Choice(_OpenAIModel):
     index: int
     message: ChatCompletionMessage
@@ -80,14 +80,14 @@ class Choice(_OpenAIModel):
     logprobs: None = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class CompletionUsage(_OpenAIModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ChatCompletion(_OpenAIModel):
     id: str
     choices: list[Choice]
@@ -97,7 +97,7 @@ class ChatCompletion(_OpenAIModel):
     usage: CompletionUsage | None = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ChoiceDelta(_OpenAIModel):
     role: str | None = None
     content: str | None = None
@@ -105,7 +105,7 @@ class ChoiceDelta(_OpenAIModel):
     tool_calls: list[ChoiceDeltaToolCall] | None = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ChunkChoice(_OpenAIModel):
     index: int
     delta: ChoiceDelta
@@ -113,7 +113,7 @@ class ChunkChoice(_OpenAIModel):
     logprobs: None = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ChatCompletionChunk(_OpenAIModel):
     id: str
     choices: list[ChunkChoice]
@@ -123,7 +123,7 @@ class ChatCompletionChunk(_OpenAIModel):
     usage: CompletionUsage | None = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class CompletionChoice(_OpenAIModel):
     text: str
     index: int = 0
@@ -131,7 +131,7 @@ class CompletionChoice(_OpenAIModel):
     logprobs: None = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Completion(_OpenAIModel):
     id: str
     choices: list[CompletionChoice]
@@ -141,7 +141,7 @@ class Completion(_OpenAIModel):
     usage: CompletionUsage | None = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ModelObject(_OpenAIModel):
     id: str
     created: int = 0
@@ -153,7 +153,7 @@ def _empty_model_list() -> list[ModelObject]:
     return []
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class SyncPage(_OpenAIModel):
     data: list[ModelObject] = field(default_factory=_empty_model_list)
     object: str = "list"

@@ -423,6 +423,67 @@ void ls_verify_sample_from_logits(
     );
 }
 
+namespace {
+
+int run_decode_batch(
+    ls_engine * eng,
+    const int32_t * tokens,
+    int32_t n_tokens,
+    int32_t pos_start,
+    bool logits_all,
+    const char * prefetch_err_msg,
+    const char * decode_err_msg,
+    char * err_buf,
+    size_t err_cap
+) {
+    llama_context * ctx = ls_internal::engine_ctx(eng);
+    struct BatchExtGuard {
+        llama_batch_ext * batch = nullptr;
+        explicit BatchExtGuard(llama_context * c) : batch(llama_batch_ext_init(c)) {}
+        BatchExtGuard(const BatchExtGuard &) = delete;
+        BatchExtGuard & operator=(const BatchExtGuard &) = delete;
+        ~BatchExtGuard() {
+            if (batch) {
+                llama_batch_ext_free(batch);
+            }
+        }
+    } guard(ctx);
+
+    if (!guard.batch) {
+        ls_internal::set_error(err_buf, err_cap, "llama_batch_ext_init returned null");
+        return -2;
+    }
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const int32_t idx = llama_batch_ext_add_token(guard.batch, 0, tokens[i]);
+        if (idx < 0) {
+            ls_internal::set_error(err_buf, err_cap, "llama_batch_ext_add_token failed");
+            return -2;
+        }
+        const llama_pos pos = pos_start + i;
+        llama_batch_ext_set_pos(guard.batch, idx, &pos);
+        llama_batch_ext_set_output_logits(guard.batch, idx, logits_all || (i == n_tokens - 1));
+    }
+
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = ls_internal::engine_profile_enabled(eng) ? Clock::now() : Clock::time_point{};
+    ls_internal::engine_prepare_decode_pass(eng);
+    if (ls_internal::engine_eval_failed(eng)) {
+        return ls_internal::report_eval_failure(eng, -2, prefetch_err_msg, err_buf, err_cap);
+    }
+
+    const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, guard.batch);
+    if (ls_internal::engine_profile_enabled(eng)) {
+        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count();
+        ls_internal::engine_record_decode_pass_us(eng, static_cast<uint64_t>(dt));
+    }
+    if (rc != 0 || ls_internal::engine_eval_failed(eng)) {
+        return ls_internal::report_eval_failure(eng, rc, decode_err_msg, err_buf, err_cap);
+    }
+    return 0;
+}
+
+}  // namespace
+
 int ls_engine_eval_greedy(
     ls_engine * eng,
     const int32_t * tokens,
@@ -437,32 +498,19 @@ int ls_engine_eval_greedy(
         return -1;
     }
 
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = pos_start + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
-    }
-
-    using Clock = std::chrono::steady_clock;
-    auto t0 = ls_internal::engine_profile_enabled(eng) ? Clock::now() : Clock::time_point{};
-    ls_internal::engine_prepare_decode_pass(eng);
-    if (ls_internal::engine_eval_failed(eng)) {
-        llama_batch_free(batch);
-        return ls_internal::report_eval_failure(eng, -2, "layer prefetch failed before llama_decode", err_buf, err_cap);
-    }
-
-    const int rc = llama_decode(ls_internal::engine_ctx(eng), batch);
-    llama_batch_free(batch);
-    if (ls_internal::engine_profile_enabled(eng)) {
-        ls_internal::engine_record_decode_pass_us(eng, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()));
-    }
-
-    if (rc != 0 || ls_internal::engine_eval_failed(eng)) {
-        return ls_internal::report_eval_failure(eng, rc, "llama_decode failed", err_buf, err_cap);
+    if (const int rc = run_decode_batch(
+            eng,
+            tokens,
+            n_tokens,
+            pos_start,
+            false,
+            "layer prefetch failed before llama_process",
+            "llama_process failed",
+            err_buf,
+            err_cap
+        );
+        rc != 0) {
+        return rc;
     }
 
     const float * logits = llama_get_logits_ith(ls_internal::engine_ctx(eng), n_tokens - 1);
@@ -496,32 +544,19 @@ int ls_engine_eval_sample(
         return -1;
     }
 
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = pos_start + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
-    }
-
-    using Clock = std::chrono::steady_clock;
-    auto t0 = ls_internal::engine_profile_enabled(eng) ? Clock::now() : Clock::time_point{};
-    ls_internal::engine_prepare_decode_pass(eng);
-    if (ls_internal::engine_eval_failed(eng)) {
-        llama_batch_free(batch);
-        return ls_internal::report_eval_failure(eng, -2, "layer prefetch failed before sampled llama_decode", err_buf, err_cap);
-    }
-
-    const int rc = llama_decode(ls_internal::engine_ctx(eng), batch);
-    llama_batch_free(batch);
-    if (ls_internal::engine_profile_enabled(eng)) {
-        ls_internal::engine_record_decode_pass_us(eng, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()));
-    }
-
-    if (rc != 0 || ls_internal::engine_eval_failed(eng)) {
-        return ls_internal::report_eval_failure(eng, rc, "sampled llama_decode failed", err_buf, err_cap);
+    if (const int rc = run_decode_batch(
+            eng,
+            tokens,
+            n_tokens,
+            pos_start,
+            false,
+            "layer prefetch failed before sampled llama_process",
+            "sampled llama_process failed",
+            err_buf,
+            err_cap
+        );
+        rc != 0) {
+        return rc;
     }
 
     const float * logits = llama_get_logits_ith(ls_internal::engine_ctx(eng), n_tokens - 1);
@@ -555,32 +590,19 @@ int ls_engine_eval_verify_greedy(
         return -1;
     }
 
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = pos_start + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = 1; // request logits for every verified position
-    }
-
-    using Clock = std::chrono::steady_clock;
-    auto t0 = ls_internal::engine_profile_enabled(eng) ? Clock::now() : Clock::time_point{};
-    ls_internal::engine_prepare_decode_pass(eng);
-    if (ls_internal::engine_eval_failed(eng)) {
-        llama_batch_free(batch);
-        return ls_internal::report_eval_failure(eng, -2, "layer prefetch failed before verify llama_decode", err_buf, err_cap);
-    }
-
-    const int rc = llama_decode(ls_internal::engine_ctx(eng), batch);
-    llama_batch_free(batch);
-    if (ls_internal::engine_profile_enabled(eng)) {
-        ls_internal::engine_record_decode_pass_us(eng, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()));
-    }
-
-    if (rc != 0 || ls_internal::engine_eval_failed(eng)) {
-        return ls_internal::report_eval_failure(eng, rc, "verify llama_decode failed", err_buf, err_cap);
+    if (const int rc = run_decode_batch(
+            eng,
+            tokens,
+            n_tokens,
+            pos_start,
+            true,
+            "layer prefetch failed before verify llama_process",
+            "verify llama_process failed",
+            err_buf,
+            err_cap
+        );
+        rc != 0) {
+        return rc;
     }
 
     const int32_t n_vocab = llama_vocab_n_tokens(ls_internal::engine_vocab(eng));
@@ -613,32 +635,19 @@ int ls_engine_eval_verify_sample(
         return -1;
     }
 
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = pos_start + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = 1;
-    }
-
-    using Clock = std::chrono::steady_clock;
-    auto t0 = ls_internal::engine_profile_enabled(eng) ? Clock::now() : Clock::time_point{};
-    ls_internal::engine_prepare_decode_pass(eng);
-    if (ls_internal::engine_eval_failed(eng)) {
-        llama_batch_free(batch);
-        return ls_internal::report_eval_failure(eng, -2, "layer prefetch failed before sampled verify llama_decode", err_buf, err_cap);
-    }
-
-    const int rc = llama_decode(ls_internal::engine_ctx(eng), batch);
-    llama_batch_free(batch);
-    if (ls_internal::engine_profile_enabled(eng)) {
-        ls_internal::engine_record_decode_pass_us(eng, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()));
-    }
-
-    if (rc != 0 || ls_internal::engine_eval_failed(eng)) {
-        return ls_internal::report_eval_failure(eng, rc, "sampled verify llama_decode failed", err_buf, err_cap);
+    if (const int rc = run_decode_batch(
+            eng,
+            tokens,
+            n_tokens,
+            pos_start,
+            true,
+            "layer prefetch failed before sampled verify llama_process",
+            "sampled verify llama_process failed",
+            err_buf,
+            err_cap
+        );
+        rc != 0) {
+        return rc;
     }
 
     const int32_t n_vocab = llama_vocab_n_tokens(ls_internal::engine_vocab(eng));
@@ -669,28 +678,6 @@ struct ls_grammar {
     llama_sampler * smpl = nullptr;
     const llama_vocab * vocab = nullptr;
 };
-
-namespace {
-
-struct BatchGuard {
-    llama_batch batch{};
-    bool active = false;
-    explicit BatchGuard(int32_t n_tokens)
-        : batch(llama_batch_init(n_tokens, 0, 1)), active(true) {}
-    BatchGuard(const BatchGuard &) = delete;
-    BatchGuard & operator=(const BatchGuard &) = delete;
-    void free_now() {
-        if (active) {
-            llama_batch_free(batch);
-            active = false;
-        }
-    }
-    ~BatchGuard() {
-        free_now();
-    }
-};
-
-} // namespace
 
 ls_grammar * ls_grammar_create(
     const ls_engine * eng,
@@ -796,32 +783,19 @@ int ls_engine_eval_with_grammar(
     }
 
     try {
-        BatchGuard bg(n_tokens);
-        bg.batch.n_tokens = n_tokens;
-        for (int32_t i = 0; i < n_tokens; ++i) {
-            bg.batch.token[i] = tokens[i];
-            bg.batch.pos[i] = pos_start + i;
-            bg.batch.n_seq_id[i] = 1;
-            bg.batch.seq_id[i][0] = 0;
-            bg.batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
-        }
-
-        using Clock = std::chrono::steady_clock;
-        auto t0 = ls_internal::engine_profile_enabled(eng) ? Clock::now() : Clock::time_point{};
-        ls_internal::engine_prepare_decode_pass(eng);
-        if (ls_internal::engine_eval_failed(eng)) {
-            bg.free_now();
-            return ls_internal::report_eval_failure(eng, -2, "layer prefetch failed before grammar llama_decode", err_buf, err_cap);
-        }
-
-        const int rc = llama_decode(ls_internal::engine_ctx(eng), bg.batch);
-        bg.free_now();
-        if (ls_internal::engine_profile_enabled(eng)) {
-            ls_internal::engine_record_decode_pass_us(eng, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()));
-        }
-
-        if (rc != 0 || ls_internal::engine_eval_failed(eng)) {
-            return ls_internal::report_eval_failure(eng, rc, "grammar llama_decode failed", err_buf, err_cap);
+        if (const int rc = run_decode_batch(
+                eng,
+                tokens,
+                n_tokens,
+                pos_start,
+                false,
+                "layer prefetch failed before grammar llama_process",
+                "grammar llama_process failed",
+                err_buf,
+                err_cap
+            );
+            rc != 0) {
+            return rc;
         }
 
         const float * raw_logits = llama_get_logits_ith(ls_internal::engine_ctx(eng), n_tokens - 1);
@@ -887,32 +861,19 @@ int ls_engine_eval_verify_with_grammar(
     }
 
     try {
-        BatchGuard bg(n_tokens);
-        bg.batch.n_tokens = n_tokens;
-        for (int32_t i = 0; i < n_tokens; ++i) {
-            bg.batch.token[i] = tokens[i];
-            bg.batch.pos[i] = pos_start + i;
-            bg.batch.n_seq_id[i] = 1;
-            bg.batch.seq_id[i][0] = 0;
-            bg.batch.logits[i] = 1;
-        }
-
-        using Clock = std::chrono::steady_clock;
-        auto t0 = ls_internal::engine_profile_enabled(eng) ? Clock::now() : Clock::time_point{};
-        ls_internal::engine_prepare_decode_pass(eng);
-        if (ls_internal::engine_eval_failed(eng)) {
-            bg.free_now();
-            return ls_internal::report_eval_failure(eng, -2, "layer prefetch failed before grammar verify llama_decode", err_buf, err_cap);
-        }
-
-        const int rc = llama_decode(ls_internal::engine_ctx(eng), bg.batch);
-        bg.free_now();
-        if (ls_internal::engine_profile_enabled(eng)) {
-            ls_internal::engine_record_decode_pass_us(eng, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()));
-        }
-
-        if (rc != 0 || ls_internal::engine_eval_failed(eng)) {
-            return ls_internal::report_eval_failure(eng, rc, "grammar verify llama_decode failed", err_buf, err_cap);
+        if (const int rc = run_decode_batch(
+                eng,
+                tokens,
+                n_tokens,
+                pos_start,
+                true,
+                "layer prefetch failed before grammar verify llama_process",
+                "grammar verify llama_process failed",
+                err_buf,
+                err_cap
+            );
+            rc != 0) {
+            return rc;
         }
 
         const int32_t n_vocab = llama_vocab_n_tokens(ls_internal::engine_vocab(eng));
