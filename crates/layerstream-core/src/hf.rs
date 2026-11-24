@@ -147,7 +147,18 @@ impl HfSpec {
                 }
             })
             .collect();
-        let mut p = cache_root.join(format!("{repo_dir}@{rev_dir}"));
+        // Append an 8-hex digest of the exact `(repo_id, revision)` pair so repos whose
+        // sanitized names match (e.g. `org/a--b` vs `org--a/b`) never share a cache directory.
+        let mut hasher = Sha256::new();
+        hasher.update(self.repo_id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(self.revision.as_bytes());
+        let digest = hasher.finalize();
+        let disambiguator = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            digest[0], digest[1], digest[2], digest[3]
+        );
+        let mut p = cache_root.join(format!("{repo_dir}@{rev_dir}-{disambiguator}"));
         for seg in self.filename.split('/') {
             if !seg.is_empty() {
                 p.push(seg);
@@ -241,6 +252,126 @@ pub fn is_model_spec_cached(spec: &str, cache_root: &Path) -> bool {
     is_path_or_hf_cached(target, cache_root)
 }
 
+/// Returns candidate Hugging Face Hub cache directories (`.../hub`) in priority order.
+fn hf_hub_cache_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    };
+    if let Ok(dir) = std::env::var("HF_HUB_CACHE")
+        && !dir.trim().is_empty()
+    {
+        push_unique(PathBuf::from(dir.trim()));
+    }
+    if let Ok(dir) = std::env::var("HF_HOME")
+        && !dir.trim().is_empty()
+    {
+        push_unique(PathBuf::from(dir.trim()).join("hub"));
+    }
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
+        && !xdg.trim().is_empty()
+    {
+        push_unique(PathBuf::from(xdg.trim()).join("huggingface").join("hub"));
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        push_unique(
+            PathBuf::from(home.trim())
+                .join(".cache")
+                .join("huggingface")
+                .join("hub"),
+        );
+    }
+    #[cfg(windows)]
+    if let Ok(profile) = std::env::var("USERPROFILE")
+        && !profile.trim().is_empty()
+    {
+        push_unique(
+            PathBuf::from(profile.trim())
+                .join(".cache")
+                .join("huggingface")
+                .join("hub"),
+        );
+    }
+    roots
+}
+
+fn is_hex_commit_sha(rev: &str) -> bool {
+    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Resolves all shards of `spec` in a single standard Hugging Face Hub cache root (`.../hub`),
+/// returning the ordered local paths only when every shard exists and is a complete GGUF file.
+fn find_shards_in_hf_hub_root(
+    spec: &HfSpec,
+    shards: &[HfSpec],
+    hub_root: &Path,
+) -> Option<Vec<PathBuf>> {
+    let model_dir = hub_root.join(format!("models--{}", spec.repo_id.replace('/', "--")));
+    if !model_dir.is_dir() {
+        return None;
+    }
+    let commit = if is_hex_commit_sha(&spec.revision) {
+        spec.revision.clone()
+    } else {
+        let mut ref_path = model_dir.join("refs");
+        for seg in spec.revision.split('/') {
+            if seg.is_empty() || seg == "." || seg == ".." {
+                return None;
+            }
+            ref_path.push(seg);
+        }
+        let raw = fs::read_to_string(&ref_path).ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed == "."
+            || trimmed == ".."
+        {
+            return None;
+        }
+        trimmed.to_string()
+    };
+
+    let snap_dir = model_dir.join("snapshots").join(commit);
+    if !snap_dir.is_dir() {
+        return None;
+    }
+
+    let mut resolved = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let mut p = snap_dir.clone();
+        for seg in shard.filename.split('/') {
+            if !seg.is_empty() {
+                p.push(seg);
+            }
+        }
+        if !is_complete_cached_file(&p) {
+            return None;
+        }
+        resolved.push(p);
+    }
+    if resolved.is_empty() {
+        None
+    } else {
+        Some(resolved)
+    }
+}
+
+/// Looks up `spec` (and all its shards) in the user's standard Hugging Face Hub cache.
+fn find_shards_in_hf_hub_cache(spec: &HfSpec, shards: &[HfSpec]) -> Option<Vec<PathBuf>> {
+    for root in hf_hub_cache_roots() {
+        if let Some(paths) = find_shards_in_hf_hub_root(spec, shards, &root) {
+            return Some(paths);
+        }
+    }
+    None
+}
+
 /// Returns `true` if `spec` is a local path OR an `hf://` URI whose shards are all cached.
 pub fn is_path_or_hf_cached(spec: &str, cache_root: &Path) -> bool {
     if !spec.starts_with(HF_PREFIX) {
@@ -249,8 +380,11 @@ pub fn is_path_or_hf_cached(spec: &str, cache_root: &Path) -> bool {
     let Ok(parsed) = HfSpec::parse(spec) else {
         return false;
     };
-    parsed
-        .expand_shards()
+    let shards = parsed.expand_shards();
+    if find_shards_in_hf_hub_cache(&parsed, &shards).is_some() {
+        return true;
+    }
+    shards
         .iter()
         .all(|shard| is_complete_cached_file(&shard.cache_path(cache_root)))
 }
@@ -297,6 +431,36 @@ pub fn ensure_hf_downloaded_with_progress(
     let spec = HfSpec::parse(uri)?;
     let shards = spec.expand_shards();
     let shard_count = shards.len().max(1) as u32;
+
+    if let Some(hub_paths) = find_shards_in_hf_hub_cache(&spec, &shards) {
+        for (idx, (shard, hub_path)) in shards.iter().zip(hub_paths.iter()).enumerate() {
+            let shard_index = (idx + 1) as u32;
+            tracing::info!(
+                uri = %format!("hf://{}:{}@{}", shard.repo_id, shard.filename, shard.revision),
+                path = %hub_path.display(),
+                "reusing Hugging Face Hub cache snapshot"
+            );
+            if let Some(cb) = on_progress {
+                let sz = fs::metadata(hub_path).map(|m| m.len()).unwrap_or(0);
+                cb(&DownloadProgress {
+                    repo_id: shard.repo_id.clone(),
+                    filename: shard.filename.clone(),
+                    shard_index,
+                    shard_count,
+                    downloaded_bytes: sz,
+                    total_bytes: Some(sz),
+                    mib_per_s: 0.0,
+                    cached: true,
+                    done: true,
+                })?;
+            }
+        }
+        return hub_paths
+            .into_iter()
+            .next()
+            .context("empty shard expansion");
+    }
+
     let token = load_hf_token();
     let mut primary_path = None;
 
@@ -2508,5 +2672,62 @@ mod tests {
 
         unsafe { std::env::remove_var("HF_ENDPOINT") };
         server.join().unwrap();
+    }
+
+    #[test]
+    fn cache_path_prevents_repo_and_revision_collisions() {
+        let tmp = Path::new("/tmp/ls-cache");
+        let a = HfSpec::parse("hf://org/a--b:model.gguf@main").unwrap();
+        let b = HfSpec::parse("hf://org--a/b:model.gguf@main").unwrap();
+        assert_ne!(a.cache_path(tmp), b.cache_path(tmp));
+
+        let r1 = HfSpec::parse("hf://org/repo:model.gguf@feat/a").unwrap();
+        let r2 = HfSpec::parse("hf://org/repo:model.gguf@feat_a").unwrap();
+        assert_ne!(r1.cache_path(tmp), r2.cache_path(tmp));
+    }
+
+    #[test]
+    fn find_shards_in_hf_hub_root_resolves_ref_sha_and_rejects_partial_shards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path();
+        let sha = "50968a4468ef4233ed78cd7c3de230dd1d61a56b";
+        let model_dir = hub.join("models--unsloth--Qwen3-0.6B-GGUF");
+        let refs_dir = model_dir.join("refs");
+        let snap_dir = model_dir.join("snapshots").join(sha);
+        fs::create_dir_all(&refs_dir).unwrap();
+        fs::create_dir_all(&snap_dir).unwrap();
+        fs::write(refs_dir.join("main"), format!("{sha}\n")).unwrap();
+        let gguf = snap_dir.join("Qwen3-0.6B-Q4_K_M.gguf");
+        fs::write(&gguf, b"GGUF\x03\x00\x00\x00dummy").unwrap();
+
+        // 1) Branch ref resolution (`main` -> `refs/main` -> `snapshots/<sha>/...`)
+        let spec_ref =
+            HfSpec::parse("hf://unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q4_K_M.gguf").unwrap();
+        let found = find_shards_in_hf_hub_root(&spec_ref, &spec_ref.expand_shards(), hub).unwrap();
+        assert_eq!(found, vec![gguf.clone()]);
+
+        // 2) Direct 40-hex commit SHA resolution
+        let spec_sha = HfSpec::parse(&format!(
+            "hf://unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q4_K_M.gguf@{sha}"
+        ))
+        .unwrap();
+        let found_sha =
+            find_shards_in_hf_hub_root(&spec_sha, &spec_sha.expand_shards(), hub).unwrap();
+        assert_eq!(found_sha, vec![gguf]);
+
+        // 3) Multi-shard checkpoint must require all shards to be present
+        let s1 = snap_dir.join("big-00001-of-00002.gguf");
+        fs::write(&s1, b"GGUF\x03\x00\x00\x00shard1").unwrap();
+        let spec_multi =
+            HfSpec::parse("hf://unsloth/Qwen3-0.6B-GGUF:big-00001-of-00002.gguf").unwrap();
+        assert!(
+            find_shards_in_hf_hub_root(&spec_multi, &spec_multi.expand_shards(), hub).is_none()
+        );
+
+        let s2 = snap_dir.join("big-00002-of-00002.gguf");
+        fs::write(&s2, b"GGUF\x03\x00\x00\x00shard2").unwrap();
+        let found_multi =
+            find_shards_in_hf_hub_root(&spec_multi, &spec_multi.expand_shards(), hub).unwrap();
+        assert_eq!(found_multi, vec![s1, s2]);
     }
 }
