@@ -197,8 +197,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_COMPILER");
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_HOST_COMPILER");
-    println!("cargo:rerun-if-changed=cpp/stream_engine.h");
-    println!("cargo:rerun-if-changed=cpp/stream_engine.cpp");
+    for cpp_file in [
+        "cpp/stream_engine.h",
+        "cpp/llama_compat.hpp",
+        "cpp/cuda_shim.hpp",
+        "cpp/engine_internal.hpp",
+        "cpp/backend_loader.cpp",
+        "cpp/stream_engine.cpp",
+        "cpp/sampler_eval.cpp",
+    ] {
+        println!("cargo:rerun-if-changed={cpp_file}");
+    }
 
     let llama_dir = resolve_llama_cpp_dir();
     let use_vulkan = env::var("CARGO_FEATURE_VULKAN").is_ok();
@@ -308,7 +317,9 @@ fn main() {
     cc_build
         .cpp(true)
         .std("c++20")
+        .file("cpp/backend_loader.cpp")
         .file("cpp/stream_engine.cpp")
+        .file("cpp/sampler_eval.cpp")
         .include("cpp")
         .include(llama_dir.join("include"))
         .include(llama_dir.join("src"))

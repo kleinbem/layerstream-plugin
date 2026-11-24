@@ -1,8 +1,10 @@
+#include "cuda_shim.hpp"
+#include "engine_internal.hpp"
+#include "llama_compat.hpp"
 #include "stream_engine.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
-#include "llama-model.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -16,7 +18,6 @@
 #include <filesystem>
 #include <mutex>
 #include <optional>
-#include <random>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -28,518 +29,7 @@
 #include <malloc.h>
 #endif
 
-#if defined(LAYERSTREAM_USE_CUDA)
-#define LAYERSTREAM_HAS_CUDA_RT 1
-#include <cuda_runtime.h>
-#elif defined(LAYERSTREAM_USE_CUDA_DYNAMIC) && !defined(_WIN32)
-#define LAYERSTREAM_HAS_CUDA_RT 1
-#include <dlfcn.h>
-#endif
-
-#ifdef LAYERSTREAM_HAS_CUDA_RT
-namespace ls_cuda {
-#if defined(LAYERSTREAM_USE_CUDA)
-using Stream = cudaStream_t;
-using Event = cudaEvent_t;
-static constexpr int kSuccess = static_cast<int>(cudaSuccess);
-static constexpr int kMemcpyHostToDevice = static_cast<int>(cudaMemcpyHostToDevice);
-static constexpr unsigned int kStreamNonBlocking = cudaStreamNonBlocking;
-static constexpr unsigned int kEventDisableTiming = cudaEventDisableTiming;
-static constexpr unsigned int kHostAllocDefault = cudaHostAllocDefault;
-static constexpr int kDevAttrIntegrated = static_cast<int>(cudaDevAttrIntegrated);
-
-static bool ensure_loaded() { return true; }
-static int device_get_attribute(int * value, int attr, int device) {
-    return static_cast<int>(cudaDeviceGetAttribute(value, static_cast<cudaDeviceAttr>(attr), device));
-}
-static int stream_create_with_flags(Stream * s, unsigned int flags) {
-    return static_cast<int>(cudaStreamCreateWithFlags(s, flags));
-}
-static int stream_destroy(Stream s) { return static_cast<int>(cudaStreamDestroy(s)); }
-static int stream_synchronize(Stream s) { return static_cast<int>(cudaStreamSynchronize(s)); }
-static int event_create_with_flags(Event * e, unsigned int flags) {
-    return static_cast<int>(cudaEventCreateWithFlags(e, flags));
-}
-static int event_destroy(Event e) { return static_cast<int>(cudaEventDestroy(e)); }
-static int event_record(Event e, Stream s) { return static_cast<int>(cudaEventRecord(e, s)); }
-static int event_synchronize(Event e) { return static_cast<int>(cudaEventSynchronize(e)); }
-static int host_alloc(void ** ptr, size_t bytes, unsigned int flags) {
-    return static_cast<int>(cudaHostAlloc(ptr, bytes, flags));
-}
-static int free_host(void * ptr) { return static_cast<int>(cudaFreeHost(ptr)); }
-static int memcpy_async(void * dst, const void * src, size_t count, int kind, Stream s) {
-    return static_cast<int>(cudaMemcpyAsync(dst, src, count, static_cast<cudaMemcpyKind>(kind), s));
-}
-static int memset_async(void * dst, int value, size_t count, Stream s) {
-    return static_cast<int>(cudaMemsetAsync(dst, value, count, s));
-}
-#else
-using Stream = void *;
-using Event = void *;
-static constexpr int kSuccess = 0;
-static constexpr int kMemcpyHostToDevice = 1;
-static constexpr unsigned int kStreamNonBlocking = 0x01;
-static constexpr unsigned int kEventDisableTiming = 0x02;
-static constexpr unsigned int kHostAllocDefault = 0x00;
-static constexpr int kDevAttrIntegrated = 18;
-
-struct Api {
-    int (*device_get_attribute)(int *, int, int) = nullptr;
-    int (*stream_create_with_flags)(Stream *, unsigned int) = nullptr;
-    int (*stream_destroy)(Stream) = nullptr;
-    int (*stream_synchronize)(Stream) = nullptr;
-    int (*event_create_with_flags)(Event *, unsigned int) = nullptr;
-    int (*event_destroy)(Event) = nullptr;
-    int (*event_record)(Event, Stream) = nullptr;
-    int (*event_synchronize)(Event) = nullptr;
-    int (*host_alloc)(void **, size_t, unsigned int) = nullptr;
-    int (*free_host)(void *) = nullptr;
-    int (*memcpy_async)(void *, const void *, size_t, int, Stream) = nullptr;
-    int (*memset_async)(void *, int, size_t, Stream) = nullptr;
-    bool ready = false;
-};
-
-static const Api & get_api() {
-    static Api api = []() {
-        Api out;
-        static constexpr const char * kCandidates[] = {
-            "libcudart.so.13",
-            "libcudart.so",
-        };
-        void * handle = nullptr;
-        for (const char * name : kCandidates) {
-            handle = dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
-            if (handle) {
-                break;
-            }
-        }
-        if (!handle) {
-            for (const char * name : kCandidates) {
-                handle = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
-                if (handle) {
-                    break;
-                }
-            }
-        }
-        if (!handle) {
-            return out;
-        }
-        auto load_sym = [&](auto & fn, const char * sym) -> bool {
-            void * p = dlsym(handle, sym);
-            if (!p) {
-                return false;
-            }
-            fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(p);
-            return true;
-        };
-        out.ready = load_sym(out.device_get_attribute, "cudaDeviceGetAttribute") &&
-                    load_sym(out.stream_create_with_flags, "cudaStreamCreateWithFlags") &&
-                    load_sym(out.stream_destroy, "cudaStreamDestroy") &&
-                    load_sym(out.stream_synchronize, "cudaStreamSynchronize") &&
-                    load_sym(out.event_create_with_flags, "cudaEventCreateWithFlags") &&
-                    load_sym(out.event_destroy, "cudaEventDestroy") &&
-                    load_sym(out.event_record, "cudaEventRecord") &&
-                    load_sym(out.event_synchronize, "cudaEventSynchronize") &&
-                    load_sym(out.host_alloc, "cudaHostAlloc") &&
-                    load_sym(out.free_host, "cudaFreeHost") &&
-                    load_sym(out.memcpy_async, "cudaMemcpyAsync") &&
-                    load_sym(out.memset_async, "cudaMemsetAsync");
-        return out;
-    }();
-    return api;
-}
-
-static bool ensure_loaded() { return get_api().ready; }
-static int device_get_attribute(int * value, int attr, int device) {
-    const auto & a = get_api();
-    return a.ready ? a.device_get_attribute(value, attr, device) : -1;
-}
-static int stream_create_with_flags(Stream * s, unsigned int flags) {
-    const auto & a = get_api();
-    return a.ready ? a.stream_create_with_flags(s, flags) : -1;
-}
-static int stream_destroy(Stream s) {
-    const auto & a = get_api();
-    return a.ready ? a.stream_destroy(s) : -1;
-}
-static int stream_synchronize(Stream s) {
-    const auto & a = get_api();
-    return a.ready ? a.stream_synchronize(s) : -1;
-}
-static int event_create_with_flags(Event * e, unsigned int flags) {
-    const auto & a = get_api();
-    return a.ready ? a.event_create_with_flags(e, flags) : -1;
-}
-static int event_destroy(Event e) {
-    const auto & a = get_api();
-    return a.ready ? a.event_destroy(e) : -1;
-}
-static int event_record(Event e, Stream s) {
-    const auto & a = get_api();
-    return a.ready ? a.event_record(e, s) : -1;
-}
-static int event_synchronize(Event e) {
-    const auto & a = get_api();
-    return a.ready ? a.event_synchronize(e) : -1;
-}
-static int host_alloc(void ** ptr, size_t bytes, unsigned int flags) {
-    const auto & a = get_api();
-    return a.ready ? a.host_alloc(ptr, bytes, flags) : -1;
-}
-static int free_host(void * ptr) {
-    const auto & a = get_api();
-    return a.ready ? a.free_host(ptr) : -1;
-}
-static int memcpy_async(void * dst, const void * src, size_t count, int kind, Stream s) {
-    const auto & a = get_api();
-    return a.ready ? a.memcpy_async(dst, src, count, kind, s) : -1;
-}
-static int memset_async(void * dst, int value, size_t count, Stream s) {
-    const auto & a = get_api();
-    return a.ready ? a.memset_async(dst, value, count, s) : -1;
-}
-#endif
-} // namespace ls_cuda
-#endif
-
-#ifdef _WIN32
-#include <malloc.h>
-#ifdef LAYERSTREAM_DYNAMIC_BACKENDS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
-#else
-#ifdef LAYERSTREAM_DYNAMIC_BACKENDS
-#include <dlfcn.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#endif
-#endif
-#endif
-
 namespace {
-
-static std::once_flag g_llama_init_once;
-
-#ifdef LAYERSTREAM_DYNAMIC_BACKENDS
-static std::string parent_dir_of(const std::string & path) {
-#ifdef _WIN32
-    const size_t sep = path.find_last_of("\\/");
-#else
-    const size_t sep = path.find_last_of('/');
-#endif
-    if (sep == std::string::npos) {
-        return {};
-    }
-    return path.substr(0, sep);
-}
-
-static std::string current_executable_dir() {
-    std::string path;
-#ifdef _WIN32
-    char buf[4096];
-    DWORD len = GetModuleFileNameA(nullptr, buf, sizeof(buf));
-    if (len > 0 && len < sizeof(buf)) {
-        path.assign(buf, len);
-    }
-#elif defined(__APPLE__)
-    uint32_t size = 0;
-    _NSGetExecutablePath(nullptr, &size);
-    if (size > 0) {
-        std::vector<char> buf(size);
-        if (_NSGetExecutablePath(buf.data(), &size) == 0) {
-            path.assign(buf.data());
-        }
-    }
-#else
-    char buf[4096];
-    const ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (len > 0) {
-        buf[len] = '\0';
-        path.assign(buf, static_cast<size_t>(len));
-    }
-#endif
-    return parent_dir_of(path);
-}
-
-static std::string current_library_dir() {
-    std::string path;
-#ifdef _WIN32
-    HMODULE hm = nullptr;
-    if (GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(&current_library_dir),
-            &hm
-        )) {
-        char buf[4096];
-        DWORD len = GetModuleFileNameA(hm, buf, sizeof(buf));
-        if (len > 0 && len < sizeof(buf)) {
-            path.assign(buf, len);
-        }
-    }
-#else
-    Dl_info info{};
-    if (dladdr(reinterpret_cast<const void *>(&current_library_dir), &info) != 0 && info.dli_fname) {
-        path.assign(info.dli_fname);
-    }
-#endif
-    return parent_dir_of(path);
-}
-
-static bool dir_exists(const std::string & path) {
-    if (path.empty()) {
-        return false;
-    }
-#ifdef _WIN32
-    DWORD attr = GetFileAttributesA(path.c_str());
-    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-#else
-    struct stat st{};
-    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-#endif
-}
-
-static bool file_exists(const std::string & path) {
-    if (path.empty()) {
-        return false;
-    }
-#ifdef _WIN32
-    DWORD attr = GetFileAttributesA(path.c_str());
-    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
-#else
-    struct stat st{};
-    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
-#endif
-}
-
-static bool has_registered_gpu_device() {
-    const size_t n_dev = ggml_backend_dev_count();
-    for (size_t i = 0; i < n_dev; ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        const auto kind = ggml_backend_dev_type(dev);
-        if (kind == GGML_BACKEND_DEVICE_TYPE_GPU || kind == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool has_registered_cpu_device() {
-    return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) != nullptr;
-}
-
-static bool load_best_cpu_backend_in_dir(const std::string & dir) {
-    namespace fs = std::filesystem;
-#ifdef _WIN32
-    constexpr std::string_view kVariantPrefix = "ggml-cpu-";
-    constexpr std::string_view kPlainName = "ggml-cpu.dll";
-    constexpr std::string_view kExt = ".dll";
-#elif defined(__APPLE__)
-    constexpr std::string_view kVariantPrefix = "libggml-cpu-";
-    constexpr std::string_view kPlainName = "libggml-cpu.dylib";
-    constexpr std::string_view kExt = ".dylib";
-#else
-    constexpr std::string_view kVariantPrefix = "libggml-cpu-";
-    constexpr std::string_view kPlainName = "libggml-cpu.so";
-    constexpr std::string_view kExt = ".so";
-#endif
-    std::error_code ec;
-    int best_score = 0;
-    std::string best_path;
-    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-        if (!it->is_regular_file(ec)) {
-            continue;
-        }
-        const std::string fname = it->path().filename().string();
-        if (!fname.starts_with(kVariantPrefix) || !fname.ends_with(kExt)) {
-            continue;
-        }
-        const std::string full = it->path().string();
-#ifdef _WIN32
-        HMODULE handle = LoadLibraryA(full.c_str());
-        if (!handle) {
-            continue;
-        }
-        auto score_fn = reinterpret_cast<int (*)()>(GetProcAddress(handle, "ggml_backend_score"));
-        if (score_fn) {
-            const int s = score_fn();
-            if (s > best_score) {
-                best_score = s;
-                best_path = full;
-            }
-        }
-        FreeLibrary(handle);
-#else
-        void * handle = dlopen(full.c_str(), RTLD_LAZY | RTLD_LOCAL);
-        if (!handle) {
-            continue;
-        }
-        auto score_fn = reinterpret_cast<int (*)()>(dlsym(handle, "ggml_backend_score"));
-        if (score_fn) {
-            const int s = score_fn();
-            if (s > best_score) {
-                best_score = s;
-                best_path = full;
-            }
-        }
-        dlclose(handle);
-#endif
-    }
-    if (best_score > 0 && !best_path.empty()) {
-        return ggml_backend_load(best_path.c_str()) != nullptr;
-    }
-    const fs::path plain = fs::path(dir) / kPlainName;
-    if (fs::is_regular_file(plain, ec)) {
-        return ggml_backend_load(plain.string().c_str()) != nullptr;
-    }
-    return false;
-}
-
-static void append_unique_dir(std::vector<std::string> & dirs, const std::string & candidate) {
-    if (candidate.empty() || !dir_exists(candidate)) {
-        return;
-    }
-    for (const auto & existing : dirs) {
-        if (existing == candidate) {
-            return;
-        }
-    }
-    dirs.push_back(candidate);
-}
-
-static void append_env_path_list(std::vector<std::string> & dirs, const char * env_name) {
-    const char * raw = std::getenv(env_name);
-    if (!raw || raw[0] == '\0') {
-        return;
-    }
-#ifdef _WIN32
-    constexpr char kSep = ';';
-#else
-    constexpr char kSep = ':';
-#endif
-    std::string s(raw);
-    size_t start = 0;
-    while (start <= s.size()) {
-        const size_t end = s.find(kSep, start);
-        const std::string token = (end == std::string::npos) ? s.substr(start) : s.substr(start, end - start);
-        if (!token.empty()) {
-            append_unique_dir(dirs, token);
-        }
-        if (end == std::string::npos) {
-            break;
-        }
-        start = end + 1;
-    }
-}
-#endif
-
-static std::atomic<bool> g_log_verbose{true};
-
-static void ls_log_callback(ggml_log_level level, const char * text, void * /*user_data*/) {
-    if (!text) {
-        return;
-    }
-    if (!g_log_verbose.load(std::memory_order_relaxed)) {
-        if (level != GGML_LOG_LEVEL_ERROR && level != GGML_LOG_LEVEL_WARN) {
-            return;
-        }
-    }
-    std::fputs(text, stderr);
-}
-
-static void ensure_llama_initialized() {
-    std::call_once(g_llama_init_once, []() {
-        // Workaround: CUDA graphs hang sm_120 channels under sustained load and churn on sparse MoE
-        // pointer updates (tracking: kleinbem/layerstream-plugin#5, upstream: ggml-org/llama.cpp#27330).
-#ifdef _WIN32
-        _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
-#else
-        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
-#endif
-#ifdef LAYERSTREAM_DYNAMIC_BACKENDS
-        std::vector<std::string> search_dirs;
-        append_env_path_list(search_dirs, "LAYERSTREAM_BACKEND_DIRS");
-        if (const char * custom_dir = std::getenv("LAYERSTREAM_BACKEND_DIR");
-            custom_dir && custom_dir[0] != '\0') {
-            append_unique_dir(search_dirs, custom_dir);
-        }
-        if (const char * mesh_dir = std::getenv("MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR");
-            mesh_dir && mesh_dir[0] != '\0') {
-            append_unique_dir(search_dirs, mesh_dir);
-        }
-        const std::string lib_dir = current_library_dir();
-        if (!lib_dir.empty()) {
-#ifdef _WIN32
-            append_unique_dir(search_dirs, lib_dir + "\\_backends");
-#else
-            append_unique_dir(search_dirs, lib_dir + "/_backends");
-#endif
-            append_unique_dir(search_dirs, lib_dir);
-        }
-        const std::string exe_dir = current_executable_dir();
-        if (!exe_dir.empty()) {
-            append_unique_dir(search_dirs, exe_dir);
-        }
-
-        // 1. Probe highest-priority CUDA / Metal plugins across all candidate directories first
-        //    so CUDA always wins over Vulkan regardless of directory order, without initializing
-        //    a redundant Vulkan context on the same GPU.
-        for (const auto & dir : search_dirs) {
-#ifdef _WIN32
-            const char * hi_plugins[] = {"\\ggml-cuda.dll"};
-#elif defined(__APPLE__)
-            const char * hi_plugins[] = {"/libggml-metal.dylib", "/libggml-metal.so"};
-#else
-            const char * hi_plugins[] = {"/libggml-cuda.so"};
-#endif
-            for (const char * suffix : hi_plugins) {
-                const std::string plugin = dir + suffix;
-                if (file_exists(plugin)) {
-                    ggml_backend_load(plugin.c_str());
-                }
-            }
-            if (has_registered_gpu_device()) {
-                break;
-            }
-        }
-        // 2. Fall back to Vulkan / remaining GPU plugins only if no CUDA/Metal device registered.
-        if (!has_registered_gpu_device()) {
-            for (const auto & dir : search_dirs) {
-                ggml_backend_load_all_from_path(dir.c_str());
-                if (has_registered_gpu_device()) {
-                    break;
-                }
-            }
-        }
-        // 3. Ensure the highest-scoring SIMD CPU backend variant is registered for embeddings / host fallbacks.
-        if (!has_registered_cpu_device()) {
-            for (const auto & dir : search_dirs) {
-                load_best_cpu_backend_in_dir(dir);
-                if (has_registered_cpu_device()) {
-                    break;
-                }
-            }
-        }
-        if (ggml_backend_dev_count() == 0) {
-            ggml_backend_load_all();
-        }
-#endif
-        llama_backend_init();
-    });
-}
-
-static void set_error(char * buf, size_t cap, const std::string & msg) {
-    if (!buf || cap == 0) {
-        return;
-    }
-    const size_t n = std::min(cap - 1, msg.size());
-    std::memcpy(buf, msg.data(), n);
-    buf[n] = '\0';
-}
 
 static size_t align_up(size_t value, size_t alignment) {
     if (alignment <= 1) {
@@ -602,6 +92,8 @@ static bool is_streamable_moe_expert_tensor(const std::string & name, const ggml
     return static_cast<uint64_t>(t->ne[2]) * static_cast<uint64_t>(t->nb[2]) == ggml_nbytes(t);
 }
 
+}  // namespace
+
 struct TensorBinding {
     std::string name;
     ggml_tensor * tensor = nullptr;
@@ -652,8 +144,6 @@ struct MoeWorkRequest {
     int n_direct = 0;
     int rc = 0;
 };
-
-} // namespace
 
 struct ls_engine {
     llama_model * model = nullptr;
@@ -1810,108 +1300,6 @@ struct ls_engine {
     }
 };
 
-static int gpu_device_priority(ggml_backend_dev_t dev) {
-    if (!dev) {
-        return 0;
-    }
-    const char * name = ggml_backend_dev_name(dev);
-    if (!name) {
-        return 1;
-    }
-    if (std::strstr(name, "CUDA") != nullptr ||
-        std::strstr(name, "MTL") != nullptr ||
-        std::strstr(name, "Metal") != nullptr ||
-        std::strstr(name, "ROCm") != nullptr ||
-        std::strstr(name, "HIP") != nullptr) {
-        return 3;
-    }
-    if (std::strstr(name, "Vulkan") != nullptr) {
-        return 2;
-    }
-    return 1;
-}
-
-static ggml_backend_dev_t select_primary_gpu_dev() {
-    const size_t n_dev = ggml_backend_dev_count();
-    ggml_backend_dev_t chosen = nullptr;
-    int best_prio = 0;
-    for (size_t i = 0; i < n_dev; ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        const auto kind = ggml_backend_dev_type(dev);
-        if (kind == GGML_BACKEND_DEVICE_TYPE_GPU || kind == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            const int prio = gpu_device_priority(dev);
-            if (prio > best_prio) {
-                chosen = dev;
-                best_prio = prio;
-            }
-        }
-    }
-    return chosen;
-}
-
-static bool select_target_buft(
-    bool use_gpu,
-    ggml_backend_dev_t & out_gpu_dev,
-    ggml_backend_buffer_type_t & out_buft,
-    bool & out_using_gpu,
-    bool & out_is_uma_zero_copy,
-    bool & out_is_unified_memory,
-    bool & out_is_cuda_backend,
-    std::string & out_backend_name,
-    std::string & out_err
-) {
-    out_gpu_dev = nullptr;
-    out_using_gpu = false;
-    out_is_uma_zero_copy = true;
-    out_is_unified_memory = true;
-    out_is_cuda_backend = false;
-    out_backend_name = "CPU";
-    out_err.clear();
-
-    if (use_gpu) {
-        ggml_backend_dev_t chosen = select_primary_gpu_dev();
-        if (chosen == nullptr) {
-            out_err =
-                "no usable GPU device found (CUDA/Vulkan/Metal); verify GPU drivers "
-                "(on NixOS CUDA ensure /run/opengl-driver/lib is reachable) or build with the matching GPU feature";
-            return false;
-        }
-
-        out_gpu_dev = chosen;
-        out_using_gpu = true;
-        out_buft = ggml_backend_dev_buffer_type(chosen);
-        out_is_uma_zero_copy = ggml_backend_buft_is_host(out_buft);
-        out_is_unified_memory = (ggml_backend_dev_type(chosen) == GGML_BACKEND_DEVICE_TYPE_IGPU);
-        const char * dev_name = ggml_backend_dev_name(chosen);
-        out_backend_name = (dev_name != nullptr && dev_name[0] != '\0') ? dev_name : "GPU";
-        out_is_cuda_backend = (dev_name != nullptr && std::strstr(dev_name, "CUDA") != nullptr);
-
-#ifdef LAYERSTREAM_HAS_CUDA_RT
-        if (out_is_cuda_backend && ls_cuda::ensure_loaded()) {
-            int integrated = 0;
-            if (ls_cuda::device_get_attribute(&integrated, ls_cuda::kDevAttrIntegrated, 0) == ls_cuda::kSuccess &&
-                integrated != 0) {
-                out_is_unified_memory = true;
-                ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(chosen);
-                if (host_buft != nullptr && ggml_backend_dev_supports_buft(chosen, host_buft)) {
-                    out_buft = host_buft;
-                    out_is_uma_zero_copy = true;
-                }
-            }
-        }
-#endif
-        return out_buft != nullptr;
-    }
-
-    out_buft = ggml_backend_cpu_buffer_type();
-    out_using_gpu = false;
-    out_is_uma_zero_copy = true;
-    out_is_unified_memory = true;
-    out_is_cuda_backend = false;
-    out_backend_name = "CPU";
-    return out_buft != nullptr;
-}
-
 static uint8_t * alloc_aligned_4k(size_t size) {
     const size_t aligned = align_up(std::max<size_t>(size, 4096), 4096);
 #ifdef _WIN32
@@ -1938,11 +1326,11 @@ static void free_aligned_4k(uint8_t * ptr) {
 
 ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_t err_cap) {
     if (!cfg || !cfg->model_path) {
-        set_error(err_buf, err_cap, "invalid ls_engine_config: model_path is null");
+        ls_internal::set_error(err_buf, err_cap, "invalid ls_engine_config: model_path is null");
         return nullptr;
     }
 
-    ensure_llama_initialized();
+    ls_internal::ensure_llama_initialized();
 
     auto * eng = new ls_engine();
     eng->full_resident_reference = cfg->full_resident_reference;
@@ -1971,7 +1359,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             ggml_backend_buffer_type_t dummy_buft = nullptr;
             bool dummy_gpu = false, dummy_uma = false, dummy_unified = false, dummy_cuda = false;
             std::string gpu_err;
-            if (!select_target_buft(
+            if (!ls_internal::select_target_buft(
                     true,
                     ref_gpu_dev,
                     dummy_buft,
@@ -1982,7 +1370,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                     eng->backend_name,
                     gpu_err
                 )) {
-                set_error(err_buf, err_cap, gpu_err);
+                ls_internal::set_error(err_buf, err_cap, gpu_err);
                 ls_engine_free(eng);
                 return nullptr;
             }
@@ -2003,7 +1391,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
 
         eng->model = llama_model_load_from_file(cfg->model_path, mparams);
         if (!eng->model) {
-            set_error(err_buf, err_cap, "llama_model_load_from_file failed (reference mode)");
+            ls_internal::set_error(err_buf, err_cap, "llama_model_load_from_file failed (reference mode)");
             ls_engine_free(eng);
             return nullptr;
         }
@@ -2039,7 +1427,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
 
         eng->ctx = llama_init_from_model(eng->model, cparams);
         if (!eng->ctx) {
-            set_error(err_buf, err_cap, "llama_init_from_model failed (reference mode)");
+            ls_internal::set_error(err_buf, err_cap, "llama_init_from_model failed (reference mode)");
             ls_engine_free(eng);
             return nullptr;
         }
@@ -2053,7 +1441,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     }
 
     if (!cfg->load_tensors_cb) {
-        set_error(err_buf, err_cap, "load_tensors_cb must be set in streaming mode");
+        ls_internal::set_error(err_buf, err_cap, "load_tensors_cb must be set in streaming mode");
         ls_engine_free(eng);
         return nullptr;
     }
@@ -2061,7 +1449,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     ggml_backend_dev_t chosen_gpu_dev = nullptr;
     ggml_backend_buffer_type_t target_buft = nullptr;
     std::string gpu_err;
-    if (!select_target_buft(
+    if (!ls_internal::select_target_buft(
             cfg->use_gpu,
             chosen_gpu_dev,
             target_buft,
@@ -2072,7 +1460,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             eng->backend_name,
             gpu_err
         )) {
-        set_error(
+        ls_internal::set_error(
             err_buf,
             err_cap,
             gpu_err.empty() ? "failed to select target ggml backend buffer type" : gpu_err
@@ -2098,7 +1486,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
 
     eng->model = llama_model_load_from_file(cfg->model_path, mparams);
     if (!eng->model) {
-        set_error(err_buf, err_cap, "llama_model_load_from_file(no_alloc=true) failed");
+        ls_internal::set_error(err_buf, err_cap, "llama_model_load_from_file(no_alloc=true) failed");
         ls_engine_free(eng);
         return nullptr;
     }
@@ -2131,7 +1519,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     std::vector<TensorBinding> cpu_non_layer_tensors;
     std::optional<TensorBinding> stream_head_candidate;
 
-    for (const auto & kv : eng->model->tensors_by_name) {
+    for (const auto & kv : ls_llama::tensors_by_name(eng->model)) {
         const std::string & name = kv.first;
         ggml_tensor * t = kv.second;
         if (!t || !seen_ptrs.insert(t).second) {
@@ -2145,8 +1533,8 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         if (layer_idx >= 0 && static_cast<uint32_t>(layer_idx) < eng->n_layers) {
             eng->layer_plans[layer_idx].tensors.push_back(std::move(tb));
         } else {
-            const bool is_tok_embd = (t == eng->model->tok_embd || name == "token_embd.weight");
-            const bool is_output_head = (t == eng->model->output || name == "output.weight");
+            const bool is_tok_embd = ls_llama::is_tok_embd_tensor(eng->model, t, name);
+            const bool is_output_head = ls_llama::is_output_head_tensor(eng->model, t, name);
 
             if (is_tok_embd && is_output_head) {
                 // Tied embeddings: used at both start and end of every pass, so never alias
@@ -2314,20 +1702,9 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         }
     }
 
-    uint64_t kv_bytes = 0;
-    const double bytes_per_elem = (cfg->kv_cache_type == 1) ? 1.0625
-                                : (cfg->kv_cache_type == 2) ? 0.5625
-                                                            : 2.0;
-    for (uint32_t il = 0; il < eng->n_layers; ++il) {
-        const uint64_t n_head_kv = (il < eng->model->hparams.n_head_kv_arr.size())
-            ? eng->model->hparams.n_head_kv_arr[il]
-            : eng->model->hparams.n_head_kv_arr[0];
-        const uint64_t k_dim = static_cast<uint64_t>(eng->model->hparams.n_embd_head_k_full) * n_head_kv;
-        const uint64_t v_dim = static_cast<uint64_t>(eng->model->hparams.n_embd_head_v_full) * n_head_kv;
-        kv_bytes += static_cast<uint64_t>(
-            static_cast<double>((k_dim + v_dim) * static_cast<uint64_t>(n_ctx)) * bytes_per_elem
-        );
-    }
+    const uint64_t kv_bytes = ls_llama::estimate_kv_cache_bytes(
+        eng->model, eng->n_layers, n_ctx, cfg->kv_cache_type
+    );
     const uint64_t compute_scratch = std::max<uint64_t>(
         128ULL * 1024 * 1024,
         (static_cast<uint64_t>(n_batch) * 384ULL * 1024 * 1024) / 512ULL
@@ -2502,7 +1879,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     // 5. Allocate real backend buffers: GPU Resident (+ optional CPU Resident).
     eng->resident_buf = ggml_backend_buft_alloc_buffer(target_buft, eng->resident_bytes);
     if (!eng->resident_buf) {
-        set_error(err_buf, err_cap, "failed to allocate resident backend buffer");
+        ls_internal::set_error(err_buf, err_cap, "failed to allocate resident backend buffer");
         ls_engine_free(eng);
         return nullptr;
     }
@@ -2518,7 +1895,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     if (!eng->cpu_resident_plan.tensors.empty()) {
         eng->cpu_resident_buf = ggml_backend_buft_alloc_buffer(cpu_buft, eng->cpu_resident_bytes);
         if (!eng->cpu_resident_buf) {
-            set_error(err_buf, err_cap, "failed to allocate CPU resident backend buffer");
+            ls_internal::set_error(err_buf, err_cap, "failed to allocate CPU resident backend buffer");
             ls_engine_free(eng);
             return nullptr;
         }
@@ -2540,7 +1917,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             eng->cpu_resident_bytes
         );
         if (rc != 0) {
-            set_error(err_buf, err_cap, "failed to load CPU resident tensors");
+            ls_internal::set_error(err_buf, err_cap, "failed to load CPU resident tensors");
             ls_engine_free(eng);
             return nullptr;
         }
@@ -2560,7 +1937,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                 eng->resident_bytes
             );
             if (rc != 0) {
-                set_error(err_buf, err_cap, "failed to load resident tensors (UMA/host)");
+                ls_internal::set_error(err_buf, err_cap, "failed to load resident tensors (UMA/host)");
                 ls_engine_free(eng);
                 return nullptr;
             }
@@ -2577,7 +1954,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             );
             uint8_t * staging = alloc_aligned_4k(chunk_cap);
             if (!staging) {
-                set_error(err_buf, err_cap, "failed to allocate resident staging buffer");
+                ls_internal::set_error(err_buf, err_cap, "failed to allocate resident staging buffer");
                 ls_engine_free(eng);
                 return nullptr;
             }
@@ -2624,7 +2001,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             }
             free_aligned_4k(staging);
             if (rc != 0) {
-                set_error(err_buf, err_cap, "failed to load resident tensors (discrete)");
+                ls_internal::set_error(err_buf, err_cap, "failed to load resident tensors (discrete)");
                 ls_engine_free(eng);
                 return nullptr;
             }
@@ -2639,7 +2016,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         for (int s = 0; s < 2; ++s) {
             eng->slot_buf[s] = ggml_backend_buft_alloc_buffer(target_buft, eng->slot_bytes);
             if (!eng->slot_buf[s]) {
-                set_error(err_buf, err_cap, "failed to allocate ping-pong GPU slot buffer");
+                ls_internal::set_error(err_buf, err_cap, "failed to allocate ping-pong GPU slot buffer");
                 ls_engine_free(eng);
                 return nullptr;
             }
@@ -2680,7 +2057,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         eng->expert_slot_bytes = align_up(std::max<uint64_t>(streamed_moe_max, 4096), 4096);
         eng->expert_slot_buf = ggml_backend_buft_alloc_buffer(target_buft, eng->expert_slot_bytes);
         if (!eng->expert_slot_buf) {
-            set_error(err_buf, err_cap, "failed to allocate MoE expert GPU slot buffer");
+            ls_internal::set_error(err_buf, err_cap, "failed to allocate MoE expert GPU slot buffer");
             ls_engine_free(eng);
             return nullptr;
         }
@@ -2711,7 +2088,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             ls_cuda::stream_create_with_flags(&eng->copy_stream, ls_cuda::kStreamNonBlocking) == ls_cuda::kSuccess) {
             eng->pin_is_cuda_host = true;
             if (ls_cuda::host_alloc(reinterpret_cast<void **>(&eng->pin_buf), pin_bytes, ls_cuda::kHostAllocDefault) != ls_cuda::kSuccess) {
-                set_error(err_buf, err_cap, "failed to allocate CUDA pinned staging buffer");
+                ls_internal::set_error(err_buf, err_cap, "failed to allocate CUDA pinned staging buffer");
                 ls_engine_free(eng);
                 return nullptr;
             }
@@ -2719,7 +2096,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             eng->pin_cap = pin_bytes;
             for (int s = 0; s < 2; ++s) {
                 if (ls_cuda::event_create_with_flags(&eng->slot_event[s], ls_cuda::kEventDisableTiming) != ls_cuda::kSuccess) {
-                    set_error(err_buf, err_cap, "failed to create CUDA slot event");
+                    ls_internal::set_error(err_buf, err_cap, "failed to create CUDA slot event");
                     ls_engine_free(eng);
                     return nullptr;
                 }
@@ -2730,7 +2107,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             eng->pin_buf = alloc_aligned_4k(pin_bytes);
             eng->pin_cap = pin_bytes;
             if (!eng->pin_buf) {
-                set_error(err_buf, err_cap, "failed to allocate 4K-aligned host staging buffer");
+                ls_internal::set_error(err_buf, err_cap, "failed to allocate 4K-aligned host staging buffer");
                 ls_engine_free(eng);
                 return nullptr;
             }
@@ -2742,17 +2119,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         eng->worker_thread = std::thread([eng]() { eng->worker_loop(); });
     }
 
-    // Workaround: `llama_model_params.no_alloc = true` skips weight allocation, and `llama_context`
-    // inherits `model.no_alloc()` (`params.no_alloc`) to skip KV/compute allocation unless cleared
-    // before `llama_init_from_model` (tracking: kleinbem/layerstream-plugin#8,
-    // upstream: ggml-org/llama.cpp#32893).
-    struct LsModelNoAllocReset : llama_model {
-        static void clear(llama_model * m) {
-            constexpr auto member = &LsModelNoAllocReset::params;
-            (m->*member).no_alloc = false;
-        }
-    };
-    LsModelNoAllocReset::clear(eng->model);
+    ls_llama::clear_model_no_alloc(eng->model);
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = n_ctx;
@@ -2781,7 +2148,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
 
     eng->ctx = llama_init_from_model(eng->model, cparams);
     if (!eng->ctx) {
-        set_error(err_buf, err_cap, "llama_init_from_model failed");
+        ls_internal::set_error(err_buf, err_cap, "llama_init_from_model failed");
         ls_engine_free(eng);
         return nullptr;
     }
@@ -2939,62 +2306,6 @@ void ls_engine_set_cancel_cb(ls_engine * eng, ls_cancel_check_cb cb, const void 
     eng->cancel_cb_user_data = user_data;
 }
 
-void ls_set_log_verbose(bool verbose) {
-    g_log_verbose.store(verbose, std::memory_order_relaxed);
-    llama_log_set(ls_log_callback, nullptr);
-    ggml_log_set(ls_log_callback, nullptr);
-}
-
-bool ls_probe_gpu_device(
-    bool use_gpu,
-    uint64_t * out_free_bytes,
-    uint64_t * out_total_bytes,
-    char * out_backend_name,
-    size_t backend_name_cap
-) {
-    if (out_free_bytes) {
-        *out_free_bytes = 0;
-    }
-    if (out_total_bytes) {
-        *out_total_bytes = 0;
-    }
-    if (out_backend_name && backend_name_cap > 0) {
-        out_backend_name[0] = '\0';
-    }
-    if (!use_gpu) {
-        return false;
-    }
-    ensure_llama_initialized();
-    ggml_backend_dev_t dev = select_primary_gpu_dev();
-    if (!dev) {
-        return false;
-    }
-    size_t free_b = 0;
-    size_t total_b = 0;
-    ggml_backend_dev_memory(dev, &free_b, &total_b);
-    if (total_b == 0) {
-        return false;
-    }
-    if (out_free_bytes) {
-        *out_free_bytes = static_cast<uint64_t>(free_b);
-    }
-    if (out_total_bytes) {
-        *out_total_bytes = static_cast<uint64_t>(total_b);
-    }
-    if (out_backend_name && backend_name_cap > 0) {
-        const char * name = ggml_backend_dev_name(dev);
-        const char * eff = (name && name[0] != '\0') ? name : "GPU";
-        const size_t n = std::min(backend_name_cap - 1, std::strlen(eff));
-        std::memcpy(out_backend_name, eff, n);
-        out_backend_name[n] = '\0';
-    }
-    return true;
-}
-
-bool ls_probe_gpu_memory(bool use_gpu, uint64_t * out_free_bytes, uint64_t * out_total_bytes) {
-    return ls_probe_gpu_device(use_gpu, out_free_bytes, out_total_bytes, nullptr, 0);
-}
-
 int32_t ls_engine_apply_chat_template(
     const ls_engine * eng,
     const ls_chat_message * messages,
@@ -3143,11 +2454,11 @@ int ls_engine_save_state(
     size_t err_cap
 ) {
     if (!eng || !eng->ctx || !path || path[0] == '\0' || (n_tokens > 0 && !tokens)) {
-        set_error(err_buf, err_cap, "invalid arguments to ls_engine_save_state");
+        ls_internal::set_error(err_buf, err_cap, "invalid arguments to ls_engine_save_state");
         return -1;
     }
     if (!llama_state_save_file(eng->ctx, path, tokens, n_tokens)) {
-        set_error(
+        ls_internal::set_error(
             err_buf,
             err_cap,
             std::string("llama_state_save_file failed for '") + path + "'"
@@ -3167,7 +2478,7 @@ int ls_engine_load_state(
     size_t err_cap
 ) {
     if (!eng || !eng->ctx || !path || path[0] == '\0' || (!out_tokens && cap_tokens > 0) || !out_n_tokens) {
-        set_error(err_buf, err_cap, "invalid arguments to ls_engine_load_state");
+        ls_internal::set_error(err_buf, err_cap, "invalid arguments to ls_engine_load_state");
         return -1;
     }
     *out_n_tokens = 0;
@@ -3175,7 +2486,7 @@ int ls_engine_load_state(
     size_t loaded_n = 0;
     if (!llama_state_load_file(eng->ctx, path, out_tokens, cap_tokens, &loaded_n)) {
         llama_memory_clear(llama_get_memory(eng->ctx), true);
-        set_error(
+        ls_internal::set_error(
             err_buf,
             err_cap,
             std::string("llama_state_load_file failed for '") + path +
@@ -3187,1038 +2498,41 @@ int ls_engine_load_state(
     return 0;
 }
 
-static int32_t argmax_logits(const float * logits, int32_t n_vocab) {
-    int32_t best_id = 0;
-    float best_val = logits[0];
-    for (int32_t i = 1; i < n_vocab; ++i) {
-        if (logits[i] > best_val) {
-            best_val = logits[i];
-            best_id = i;
-        }
-    }
-    return best_id;
+
+namespace ls_internal {
+
+llama_context * engine_ctx(const ls_engine * eng) {
+    return eng ? eng->ctx : nullptr;
 }
 
-namespace {
-
-struct ProbEntry {
-    int32_t id;
-    float val;
-};
-
-struct SamplerHandle {
-    llama_sampler * smpl = nullptr;
-    SamplerHandle() = default;
-    explicit SamplerHandle(llama_sampler * s) : smpl(s) {}
-    SamplerHandle(const SamplerHandle &) = delete;
-    SamplerHandle & operator=(const SamplerHandle &) = delete;
-    SamplerHandle(SamplerHandle && other) noexcept : smpl(other.smpl) { other.smpl = nullptr; }
-    SamplerHandle & operator=(SamplerHandle && other) noexcept {
-        if (this != &other) {
-            if (smpl) {
-                llama_sampler_free(smpl);
-            }
-            smpl = other.smpl;
-            other.smpl = nullptr;
-        }
-        return *this;
-    }
-    ~SamplerHandle() {
-        if (smpl) {
-            llama_sampler_free(smpl);
-        }
-    }
-};
-
-static bool has_sample_penalties(const ls_sample_params * sp) {
-    if (!sp || sp->penalty_last_n == 0) {
-        return false;
-    }
-    const bool has_rep = std::isfinite(sp->repeat_penalty) && sp->repeat_penalty > 0.0f &&
-        std::fabs(sp->repeat_penalty - 1.0f) > 1e-6f;
-    const bool has_freq = std::isfinite(sp->frequency_penalty) &&
-        std::fabs(sp->frequency_penalty) > 1e-6f;
-    const bool has_pres = std::isfinite(sp->presence_penalty) &&
-        std::fabs(sp->presence_penalty) > 1e-6f;
-    return has_rep || has_freq || has_pres;
+const llama_vocab * engine_vocab(const ls_engine * eng) {
+    return eng ? eng->vocab : nullptr;
 }
 
-// Reuses upstream llama.cpp `llama_sampler_init_penalties` for repeat / frequency / presence
-// penalties across single-step and speculative verification passes.
-static SamplerHandle make_penalties_sampler(
-    int32_t n_vocab,
-    const ls_sample_params * sp,
-    const int32_t * base_tokens,
-    int32_t n_base,
-    int32_t max_extra
-) {
-    if (!has_sample_penalties(sp) || n_vocab <= 0) {
-        return SamplerHandle{};
-    }
-    const int32_t b_len = (base_tokens && n_base > 0) ? n_base : 0;
-    const int32_t max_total = std::max<int32_t>(b_len + std::max<int32_t>(max_extra, 0), 1);
-    const int32_t eff_last_n = (sp->penalty_last_n < 0)
-        ? max_total
-        : std::min<int32_t>(sp->penalty_last_n, max_total);
-    if (eff_last_n <= 0) {
-        return SamplerHandle{};
-    }
-    const float rp = (std::isfinite(sp->repeat_penalty) && sp->repeat_penalty > 0.0f)
-        ? sp->repeat_penalty
-        : 1.0f;
-    const float fp = std::isfinite(sp->frequency_penalty) ? sp->frequency_penalty : 0.0f;
-    const float pp = std::isfinite(sp->presence_penalty) ? sp->presence_penalty : 0.0f;
-
-    SamplerHandle h{llama_sampler_init_penalties(n_vocab, eff_last_n, rp, fp, pp)};
-    if (h.smpl && b_len > 0) {
-        const int32_t start = std::max<int32_t>(0, b_len - eff_last_n);
-        for (int32_t i = start; i < b_len; ++i) {
-            const int32_t tok = base_tokens[i];
-            if (tok >= 0 && tok < n_vocab) {
-                llama_sampler_accept(h.smpl, tok);
-            }
-        }
-    }
-    return h;
-}
-
-// Reuses upstream llama.cpp `llama_sampler_chain` (`top_k` -> `temp` -> `min_p` -> `top_p`)
-// so single-step sampling, speculative verification, and GBNF grammar sampling share one codepath.
-static SamplerHandle make_filter_chain(const ls_sample_params * sp) {
-    if (!sp || !std::isfinite(sp->temperature) || sp->temperature <= 0.0f) {
-        return SamplerHandle{llama_sampler_init_greedy()};
-    }
-    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    if (!chain) {
-        return SamplerHandle{};
-    }
-    if (sp->top_k > 0) {
-        llama_sampler_chain_add(chain, llama_sampler_init_top_k(sp->top_k));
-    }
-    llama_sampler_chain_add(chain, llama_sampler_init_temp(std::max(sp->temperature, 1e-5f)));
-    if (std::isfinite(sp->min_p) && sp->min_p > 0.0f) {
-        llama_sampler_chain_add(chain, llama_sampler_init_min_p(sp->min_p, 1));
-    }
-    if (std::isfinite(sp->top_p) && sp->top_p > 0.0f && sp->top_p < 1.0f) {
-        llama_sampler_chain_add(chain, llama_sampler_init_top_p(sp->top_p, 1));
-    }
-    return SamplerHandle{chain};
-}
-
-static bool run_sampler_step(
-    const float * raw_logits,
-    int32_t n_vocab,
-    llama_sampler * pen_smpl,
-    llama_sampler * grammar_smpl,
-    llama_sampler * filter_smpl,
-    bool is_greedy,
-    std::vector<llama_token_data> & cand_buf,
-    std::vector<ProbEntry> & out_dist,
-    int32_t & out_greedy_token
-) {
-    if (!raw_logits || n_vocab <= 0) {
-        return false;
-    }
-    cand_buf.resize(static_cast<size_t>(n_vocab));
-    for (int32_t i = 0; i < n_vocab; ++i) {
-        const float v = std::isfinite(raw_logits[i]) ? raw_logits[i] : -INFINITY;
-        cand_buf[static_cast<size_t>(i)] = llama_token_data{i, v, 0.0f};
-    }
-    llama_token_data_array cur_p{cand_buf.data(), cand_buf.size(), -1, false};
-
-    if (pen_smpl) {
-        llama_sampler_apply(pen_smpl, &cur_p);
-    }
-    if (grammar_smpl) {
-        llama_sampler_apply(grammar_smpl, &cur_p);
-        if (cur_p.size == 0) {
-            return false;
-        }
-    }
-
-    if (is_greedy) {
-        bool found = false;
-        int32_t best_id = 0;
-        float best_val = -INFINITY;
-        for (size_t i = 0; i < cur_p.size; ++i) {
-            const auto & td = cur_p.data[i];
-            if (std::isfinite(td.logit) && td.logit > -1e29f && (!found || td.logit > best_val)) {
-                best_val = td.logit;
-                best_id = td.id;
-                found = true;
-            }
-        }
-        if (!found) {
-            if (grammar_smpl) {
-                return false;
-            }
-            out_greedy_token = 0;
-            return true;
-        }
-        out_greedy_token = best_id;
-        return true;
-    }
-
-    if (filter_smpl) {
-        llama_sampler_apply(filter_smpl, &cur_p);
-    }
-
-    out_dist.clear();
-    out_dist.reserve(std::min<size_t>(cur_p.size, 256));
-    float max_l = -INFINITY;
-    for (size_t i = 0; i < cur_p.size; ++i) {
-        const auto & td = cur_p.data[i];
-        if (std::isfinite(td.logit) && td.logit > -1e29f) {
-            if (td.logit > max_l) {
-                max_l = td.logit;
-            }
-            out_dist.push_back(ProbEntry{td.id, td.logit});
-        }
-    }
-    if (out_dist.empty()) {
-        if (grammar_smpl) {
-            return false;
-        }
-        out_dist.push_back(ProbEntry{0, 1.0f});
-        return true;
-    }
-
-    double sum = 0.0;
-    for (auto & e : out_dist) {
-        const double p = std::exp(static_cast<double>(e.val - max_l));
-        e.val = static_cast<float>(p);
-        sum += p;
-    }
-    if (!std::isfinite(sum) || sum <= 0.0) {
-        out_dist.resize(1);
-        out_dist[0].val = 1.0f;
-        return true;
-    }
-    for (auto & e : out_dist) {
-        e.val = static_cast<float>(static_cast<double>(e.val) / sum);
-    }
-    return true;
-}
-
-static int32_t sample_from_dist(const std::vector<ProbEntry> & dist, std::mt19937 & rng) {
-    if (dist.empty()) {
-        return 0;
-    }
-    std::uniform_real_distribution<double> uni(0.0, 1.0);
-    const double r = uni(rng);
-    double cum = 0.0;
-    for (const auto & e : dist) {
-        cum += static_cast<double>(e.val);
-        if (r < cum) {
-            return e.id;
-        }
-    }
-    return dist.back().id;
-}
-
-static int report_eval_failure(
-    const ls_engine * eng,
-    int rc,
-    const char * fallback_msg,
-    char * err_buf,
-    size_t err_cap
-) {
-    if (eng->is_cancelled()) {
-        set_error(err_buf, err_cap, "request cancelled");
-        return -100;
-    }
-    if (!eng->eval_error_msg.empty()) {
-        set_error(err_buf, err_cap, eng->eval_error_msg);
-    } else {
-        set_error(err_buf, err_cap, fallback_msg);
-    }
-    return rc != 0 ? rc : -3;
-}
-
-} // namespace
-
-int32_t ls_sample_from_logits_with_history(
-    const float * logits,
-    int32_t n_vocab,
-    const ls_sample_params * sample_params,
-    const int32_t * penalty_tokens,
-    int32_t n_penalty_tokens
-) {
-    if (!logits || n_vocab <= 0) {
-        return 0;
-    }
-    const bool is_greedy = (!sample_params || sample_params->temperature <= 0.0f);
-    if (is_greedy && !has_sample_penalties(sample_params)) {
-        return argmax_logits(logits, n_vocab);
-    }
-    SamplerHandle pen = make_penalties_sampler(n_vocab, sample_params, penalty_tokens, n_penalty_tokens, 0);
-    SamplerHandle flt = make_filter_chain(sample_params);
-    std::vector<llama_token_data> cand_buf;
-    std::vector<ProbEntry> dist;
-    int32_t greedy_id = 0;
-    if (!run_sampler_step(logits, n_vocab, pen.smpl, nullptr, flt.smpl, is_greedy, cand_buf, dist, greedy_id)) {
-        return 0;
-    }
-    if (is_greedy) {
-        return greedy_id;
-    }
-    std::mt19937 rng(sample_params->seed);
-    return sample_from_dist(dist, rng);
-}
-
-int32_t ls_sample_from_logits(
-    const float * logits,
-    int32_t n_vocab,
-    const ls_sample_params * sample_params
-) {
-    return ls_sample_from_logits_with_history(logits, n_vocab, sample_params, nullptr, 0);
-}
-
-void ls_verify_sample_from_logits_with_history(
-    const float * const * logits_per_pos,
-    int32_t n_vocab,
-    const int32_t * draft_tokens,
-    int32_t k,
-    const ls_sample_params * sample_params,
-    const int32_t * penalty_tokens,
-    int32_t n_penalty_tokens,
-    int32_t * out_accepted_count,
-    int32_t * out_next_token
-) {
-    if (!logits_per_pos || !sample_params || !out_accepted_count || !out_next_token || n_vocab <= 0 || k < 0) {
-        if (out_accepted_count) {
-            *out_accepted_count = 0;
-        }
-        if (out_next_token) {
-            *out_next_token = 0;
-        }
-        return;
-    }
-    for (int32_t i = 0; i <= k; ++i) {
-        if (!logits_per_pos[i]) {
-            *out_accepted_count = 0;
-            *out_next_token = 0;
-            return;
-        }
-    }
-    const bool is_greedy = (sample_params->temperature <= 0.0f);
-    SamplerHandle pen = make_penalties_sampler(n_vocab, sample_params, penalty_tokens, n_penalty_tokens, k);
-    SamplerHandle flt = make_filter_chain(sample_params);
-    std::vector<llama_token_data> cand_buf;
-    std::vector<ProbEntry> dist;
-
-    if (is_greedy) {
-        int32_t best = 0;
-        for (int32_t i = 0; i < k; ++i) {
-            run_sampler_step(logits_per_pos[i], n_vocab, pen.smpl, nullptr, flt.smpl, true, cand_buf, dist, best);
-            if (best != draft_tokens[i]) {
-                *out_accepted_count = i;
-                *out_next_token = best;
-                return;
-            }
-            if (pen.smpl && draft_tokens[i] >= 0 && draft_tokens[i] < n_vocab) {
-                llama_sampler_accept(pen.smpl, draft_tokens[i]);
-            }
-        }
-        run_sampler_step(logits_per_pos[k], n_vocab, pen.smpl, nullptr, flt.smpl, true, cand_buf, dist, best);
-        *out_accepted_count = k;
-        *out_next_token = best;
-        return;
-    }
-
-    std::mt19937 rng(sample_params->seed);
-    std::uniform_real_distribution<double> uni(0.0, 1.0);
-    int32_t dummy_greedy = 0;
-
-    int32_t accepted = 0;
-    for (int32_t i = 0; i < k; ++i) {
-        run_sampler_step(logits_per_pos[i], n_vocab, pen.smpl, nullptr, flt.smpl, false, cand_buf, dist, dummy_greedy);
-        const int32_t draft_tok = draft_tokens[i];
-
-        double p_draft = 0.0;
-        size_t draft_pos = dist.size();
-        for (size_t j = 0; j < dist.size(); ++j) {
-            if (dist[j].id == draft_tok) {
-                p_draft = static_cast<double>(dist[j].val);
-                draft_pos = j;
-                break;
-            }
-        }
-
-        // Lossless Leviathan rejection step for deterministic draft (q(d)=1):
-        // accept d with prob p(d); otherwise sample from p'(v) = p(v)/(1 - p(d)) for v != d.
-        if (p_draft >= 1.0 - 1e-7 || uni(rng) < p_draft) {
-            ++accepted;
-            if (pen.smpl && draft_tok >= 0 && draft_tok < n_vocab) {
-                llama_sampler_accept(pen.smpl, draft_tok);
-            }
-            continue;
-        }
-
-        if (draft_pos < dist.size()) {
-            dist[draft_pos].val = 0.0f;
-            const double rem = std::max(1e-12, 1.0 - p_draft);
-            for (auto & e : dist) {
-                e.val = static_cast<float>(static_cast<double>(e.val) / rem);
-            }
-        }
-        *out_accepted_count = accepted;
-        *out_next_token = sample_from_dist(dist, rng);
-        return;
-    }
-
-    run_sampler_step(logits_per_pos[k], n_vocab, pen.smpl, nullptr, flt.smpl, false, cand_buf, dist, dummy_greedy);
-    *out_accepted_count = k;
-    *out_next_token = sample_from_dist(dist, rng);
-}
-
-void ls_verify_sample_from_logits(
-    const float * const * logits_per_pos,
-    int32_t n_vocab,
-    const int32_t * draft_tokens,
-    int32_t k,
-    const ls_sample_params * sample_params,
-    int32_t * out_accepted_count,
-    int32_t * out_next_token
-) {
-    ls_verify_sample_from_logits_with_history(
-        logits_per_pos,
-        n_vocab,
-        draft_tokens,
-        k,
-        sample_params,
-        nullptr,
-        0,
-        out_accepted_count,
-        out_next_token
-    );
-}
-
-int ls_engine_eval_greedy(
-    ls_engine * eng,
-    const int32_t * tokens,
-    int32_t n_tokens,
-    int32_t pos_start,
-    int32_t * out_next_token,
-    char * err_buf,
-    size_t err_cap
-) {
-    if (!eng || !eng->ctx || !tokens || n_tokens <= 0 || !out_next_token) {
-        set_error(err_buf, err_cap, "invalid arguments to ls_engine_eval_greedy");
-        return -1;
-    }
-
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = pos_start + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
-    }
-
-    using Clock = std::chrono::steady_clock;
-    auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
+void engine_prepare_decode_pass(ls_engine * eng) {
     eng->prepare_decode_pass();
-    if (eng->eval_failed) {
-        llama_batch_free(batch);
-        return report_eval_failure(eng, -2, "layer prefetch failed before llama_decode", err_buf, err_cap);
-    }
-
-    const int rc = llama_decode(eng->ctx, batch);
-    llama_batch_free(batch);
-    if (eng->profile_enabled) {
-        eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
-        eng->prof_decode_total_us.fetch_add(
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
-            std::memory_order_relaxed
-        );
-    }
-
-    if (rc != 0 || eng->eval_failed) {
-        return report_eval_failure(eng, rc, "llama_decode failed", err_buf, err_cap);
-    }
-
-    const float * logits = llama_get_logits_ith(eng->ctx, n_tokens - 1);
-    if (!logits) {
-        set_error(err_buf, err_cap, "llama_get_logits_ith returned null");
-        return -4;
-    }
-
-    const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
-    *out_next_token = argmax_logits(logits, n_vocab);
-    return 0;
 }
 
-int ls_engine_eval_sample(
-    ls_engine * eng,
-    const int32_t * tokens,
-    int32_t n_tokens,
-    int32_t pos_start,
-    const ls_sample_params * sample_params,
-    const int32_t * penalty_tokens,
-    int32_t n_penalty_tokens,
-    int32_t * out_next_token,
-    char * err_buf,
-    size_t err_cap
-) {
-    if ((!sample_params || sample_params->temperature <= 0.0f) && !has_sample_penalties(sample_params)) {
-        return ls_engine_eval_greedy(eng, tokens, n_tokens, pos_start, out_next_token, err_buf, err_cap);
-    }
-    if (!eng || !eng->ctx || !tokens || n_tokens <= 0 || !out_next_token) {
-        set_error(err_buf, err_cap, "invalid arguments to ls_engine_eval_sample");
-        return -1;
-    }
-
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = pos_start + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
-    }
-
-    using Clock = std::chrono::steady_clock;
-    auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
-    eng->prepare_decode_pass();
-    if (eng->eval_failed) {
-        llama_batch_free(batch);
-        return report_eval_failure(eng, -2, "layer prefetch failed before sampled llama_decode", err_buf, err_cap);
-    }
-
-    const int rc = llama_decode(eng->ctx, batch);
-    llama_batch_free(batch);
-    if (eng->profile_enabled) {
-        eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
-        eng->prof_decode_total_us.fetch_add(
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
-            std::memory_order_relaxed
-        );
-    }
-
-    if (rc != 0 || eng->eval_failed) {
-        return report_eval_failure(eng, rc, "sampled llama_decode failed", err_buf, err_cap);
-    }
-
-    const float * logits = llama_get_logits_ith(eng->ctx, n_tokens - 1);
-    if (!logits) {
-        set_error(err_buf, err_cap, "llama_get_logits_ith returned null");
-        return -4;
-    }
-
-    const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
-    *out_next_token = ls_sample_from_logits_with_history(
-        logits,
-        n_vocab,
-        sample_params,
-        penalty_tokens,
-        n_penalty_tokens
-    );
-    return 0;
+bool engine_is_cancelled(const ls_engine * eng) {
+    return eng->is_cancelled();
 }
 
-int ls_engine_eval_verify_greedy(
-    ls_engine * eng,
-    const int32_t * tokens,
-    int32_t n_tokens,
-    int32_t pos_start,
-    int32_t * out_argmax_tokens,
-    char * err_buf,
-    size_t err_cap
-) {
-    if (!eng || !eng->ctx || !tokens || n_tokens <= 0 || !out_argmax_tokens) {
-        set_error(err_buf, err_cap, "invalid arguments to ls_engine_eval_verify_greedy");
-        return -1;
-    }
-
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = pos_start + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = 1; // request logits for every verified position
-    }
-
-    using Clock = std::chrono::steady_clock;
-    auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
-    eng->prepare_decode_pass();
-    if (eng->eval_failed) {
-        llama_batch_free(batch);
-        return report_eval_failure(eng, -2, "layer prefetch failed before verify llama_decode", err_buf, err_cap);
-    }
-
-    const int rc = llama_decode(eng->ctx, batch);
-    llama_batch_free(batch);
-    if (eng->profile_enabled) {
-        eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
-        eng->prof_decode_total_us.fetch_add(
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
-            std::memory_order_relaxed
-        );
-    }
-
-    if (rc != 0 || eng->eval_failed) {
-        return report_eval_failure(eng, rc, "verify llama_decode failed", err_buf, err_cap);
-    }
-
-    const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        const float * logits = llama_get_logits_ith(eng->ctx, i);
-        if (!logits) {
-            set_error(err_buf, err_cap, "llama_get_logits_ith returned null during verify");
-            return -4;
-        }
-        out_argmax_tokens[i] = argmax_logits(logits, n_vocab);
-    }
-    return 0;
+bool engine_eval_failed(const ls_engine * eng) {
+    return eng->eval_failed;
 }
 
-int ls_engine_eval_verify_sample(
-    ls_engine * eng,
-    const int32_t * tokens,
-    int32_t n_tokens,
-    int32_t pos_start,
-    const ls_sample_params * sample_params,
-    const int32_t * penalty_tokens,
-    int32_t n_penalty_tokens,
-    int32_t * out_accepted_count,
-    int32_t * out_next_token,
-    char * err_buf,
-    size_t err_cap
-) {
-    if (!eng || !eng->ctx || !tokens || n_tokens <= 1 || !sample_params || !out_accepted_count || !out_next_token) {
-        set_error(err_buf, err_cap, "invalid arguments to ls_engine_eval_verify_sample");
-        return -1;
-    }
-
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = pos_start + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = 1;
-    }
-
-    using Clock = std::chrono::steady_clock;
-    auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
-    eng->prepare_decode_pass();
-    if (eng->eval_failed) {
-        llama_batch_free(batch);
-        return report_eval_failure(eng, -2, "layer prefetch failed before sampled verify llama_decode", err_buf, err_cap);
-    }
-
-    const int rc = llama_decode(eng->ctx, batch);
-    llama_batch_free(batch);
-    if (eng->profile_enabled) {
-        eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
-        eng->prof_decode_total_us.fetch_add(
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
-            std::memory_order_relaxed
-        );
-    }
-
-    if (rc != 0 || eng->eval_failed) {
-        return report_eval_failure(eng, rc, "sampled verify llama_decode failed", err_buf, err_cap);
-    }
-
-    const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
-    const int32_t k = n_tokens - 1;
-    std::vector<const float *> logits_ptrs(static_cast<size_t>(n_tokens));
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        logits_ptrs[static_cast<size_t>(i)] = llama_get_logits_ith(eng->ctx, i);
-        if (!logits_ptrs[static_cast<size_t>(i)]) {
-            set_error(err_buf, err_cap, "llama_get_logits_ith returned null during sampled verify");
-            return -4;
-        }
-    }
-    ls_verify_sample_from_logits_with_history(
-        logits_ptrs.data(),
-        n_vocab,
-        tokens + 1,
-        k,
-        sample_params,
-        penalty_tokens,
-        n_penalty_tokens,
-        out_accepted_count,
-        out_next_token
-    );
-    return 0;
+std::string engine_eval_error_msg(const ls_engine * eng) {
+    return eng->eval_error_msg;
 }
 
-struct ls_grammar {
-    llama_sampler * smpl = nullptr;
-    const llama_vocab * vocab = nullptr;
-};
-
-namespace {
-
-struct BatchGuard {
-    llama_batch batch{};
-    bool active = false;
-    explicit BatchGuard(int32_t n_tokens)
-        : batch(llama_batch_init(n_tokens, 0, 1)), active(true) {}
-    BatchGuard(const BatchGuard &) = delete;
-    BatchGuard & operator=(const BatchGuard &) = delete;
-    void free_now() {
-        if (active) {
-            llama_batch_free(batch);
-            active = false;
-        }
-    }
-    ~BatchGuard() {
-        free_now();
-    }
-};
-
-} // namespace
-
-ls_grammar * ls_grammar_create(
-    const ls_engine * eng,
-    const char * grammar_str,
-    const char * root_rule,
-    char * err_buf,
-    size_t err_cap
-) {
-    if (!eng || !eng->vocab || !grammar_str || grammar_str[0] == '\0') {
-        set_error(err_buf, err_cap, "grammar string must not be empty");
-        return nullptr;
-    }
-    const char * root = (root_rule && root_rule[0] != '\0') ? root_rule : "root";
-    try {
-        llama_sampler * smpl = llama_sampler_init_grammar(eng->vocab, grammar_str, root);
-        if (!smpl) {
-            set_error(err_buf, err_cap, "failed to parse GBNF grammar");
-            return nullptr;
-        }
-        auto * g = new (std::nothrow) ls_grammar();
-        if (!g) {
-            llama_sampler_free(smpl);
-            set_error(err_buf, err_cap, "out of memory allocating ls_grammar");
-            return nullptr;
-        }
-        g->smpl = smpl;
-        g->vocab = eng->vocab;
-        return g;
-    } catch (const std::exception & e) {
-        set_error(err_buf, err_cap, std::string("GBNF grammar init exception: ") + e.what());
-        return nullptr;
-    } catch (...) {
-        set_error(err_buf, err_cap, "unknown GBNF grammar init exception");
-        return nullptr;
-    }
+bool engine_profile_enabled(const ls_engine * eng) {
+    return eng->profile_enabled;
 }
 
-void ls_grammar_free(ls_grammar * grammar) {
-    if (!grammar) {
-        return;
-    }
-    if (grammar->smpl) {
-        llama_sampler_free(grammar->smpl);
-        grammar->smpl = nullptr;
-    }
-    delete grammar;
+void engine_record_decode_pass_us(ls_engine * eng, uint64_t elapsed_us) {
+    eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
+    eng->prof_decode_total_us.fetch_add(elapsed_us, std::memory_order_relaxed);
 }
 
-int ls_grammar_accept(
-    ls_grammar * grammar,
-    int32_t token,
-    char * err_buf,
-    size_t err_cap
-) {
-    if (!grammar || !grammar->smpl) {
-        return 0;
-    }
-    try {
-        llama_sampler_accept(grammar->smpl, token);
-        return 0;
-    } catch (const std::exception & e) {
-        set_error(err_buf, err_cap, std::string("grammar accept failed: ") + e.what());
-        return -1;
-    } catch (...) {
-        set_error(err_buf, err_cap, "unknown grammar accept exception");
-        return -1;
-    }
-}
+}  // namespace ls_internal
 
-int ls_engine_eval_with_grammar(
-    ls_engine * eng,
-    const int32_t * tokens,
-    int32_t n_tokens,
-    int32_t pos_start,
-    const ls_sample_params * sample_params,
-    const int32_t * penalty_tokens,
-    int32_t n_penalty_tokens,
-    ls_grammar * grammar,
-    int32_t * out_next_token,
-    char * err_buf,
-    size_t err_cap
-) {
-    if (!grammar || !grammar->smpl) {
-        if ((!sample_params || sample_params->temperature <= 0.0f) && !has_sample_penalties(sample_params)) {
-            return ls_engine_eval_greedy(eng, tokens, n_tokens, pos_start, out_next_token, err_buf, err_cap);
-        }
-        return ls_engine_eval_sample(
-            eng,
-            tokens,
-            n_tokens,
-            pos_start,
-            sample_params,
-            penalty_tokens,
-            n_penalty_tokens,
-            out_next_token,
-            err_buf,
-            err_cap
-        );
-    }
-    if (!eng || !eng->ctx || !tokens || n_tokens <= 0 || !out_next_token) {
-        set_error(err_buf, err_cap, "invalid arguments to ls_engine_eval_with_grammar");
-        return -1;
-    }
-
-    try {
-        BatchGuard bg(n_tokens);
-        bg.batch.n_tokens = n_tokens;
-        for (int32_t i = 0; i < n_tokens; ++i) {
-            bg.batch.token[i] = tokens[i];
-            bg.batch.pos[i] = pos_start + i;
-            bg.batch.n_seq_id[i] = 1;
-            bg.batch.seq_id[i][0] = 0;
-            bg.batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
-        }
-
-        using Clock = std::chrono::steady_clock;
-        auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
-        eng->prepare_decode_pass();
-        if (eng->eval_failed) {
-            bg.free_now();
-            return report_eval_failure(eng, -2, "layer prefetch failed before grammar llama_decode", err_buf, err_cap);
-        }
-
-        const int rc = llama_decode(eng->ctx, bg.batch);
-        bg.free_now();
-        if (eng->profile_enabled) {
-            eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
-            eng->prof_decode_total_us.fetch_add(
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
-                std::memory_order_relaxed
-            );
-        }
-
-        if (rc != 0 || eng->eval_failed) {
-            return report_eval_failure(eng, rc, "grammar llama_decode failed", err_buf, err_cap);
-        }
-
-        const float * raw_logits = llama_get_logits_ith(eng->ctx, n_tokens - 1);
-        if (!raw_logits) {
-            set_error(err_buf, err_cap, "llama_get_logits_ith returned null");
-            return -4;
-        }
-
-        const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
-        const bool is_greedy = (!sample_params || sample_params->temperature <= 0.0f);
-        SamplerHandle pen = make_penalties_sampler(n_vocab, sample_params, penalty_tokens, n_penalty_tokens, 0);
-        SamplerHandle flt = make_filter_chain(sample_params);
-        std::vector<llama_token_data> cand_buf;
-        std::vector<ProbEntry> dist;
-        int32_t greedy_id = 0;
-        if (!run_sampler_step(
-                raw_logits,
-                n_vocab,
-                pen.smpl,
-                grammar->smpl,
-                flt.smpl,
-                is_greedy,
-                cand_buf,
-                dist,
-                greedy_id
-            )) {
-            set_error(err_buf, err_cap, "grammar rejected all candidate tokens");
-            return -5;
-        }
-        if (is_greedy) {
-            *out_next_token = greedy_id;
-        } else {
-            std::mt19937 rng(sample_params->seed);
-            *out_next_token = sample_from_dist(dist, rng);
-        }
-        return 0;
-    } catch (const std::exception & e) {
-        set_error(err_buf, err_cap, std::string("grammar eval failed: ") + e.what());
-        return -6;
-    } catch (...) {
-        set_error(err_buf, err_cap, "unknown grammar eval exception");
-        return -6;
-    }
-}
-
-int ls_engine_eval_verify_with_grammar(
-    ls_engine * eng,
-    const int32_t * tokens,
-    int32_t n_tokens,
-    int32_t pos_start,
-    const ls_sample_params * sample_params,
-    const int32_t * penalty_tokens,
-    int32_t n_penalty_tokens,
-    ls_grammar * grammar,
-    int32_t * out_accepted_count,
-    int32_t * out_next_token,
-    char * err_buf,
-    size_t err_cap
-) {
-    if (!eng || !eng->ctx || !tokens || n_tokens <= 1 || !grammar || !grammar->smpl || !out_accepted_count || !out_next_token) {
-        set_error(err_buf, err_cap, "invalid arguments to ls_engine_eval_verify_with_grammar");
-        return -1;
-    }
-
-    try {
-        BatchGuard bg(n_tokens);
-        bg.batch.n_tokens = n_tokens;
-        for (int32_t i = 0; i < n_tokens; ++i) {
-            bg.batch.token[i] = tokens[i];
-            bg.batch.pos[i] = pos_start + i;
-            bg.batch.n_seq_id[i] = 1;
-            bg.batch.seq_id[i][0] = 0;
-            bg.batch.logits[i] = 1;
-        }
-
-        using Clock = std::chrono::steady_clock;
-        auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
-        eng->prepare_decode_pass();
-        if (eng->eval_failed) {
-            bg.free_now();
-            return report_eval_failure(eng, -2, "layer prefetch failed before grammar verify llama_decode", err_buf, err_cap);
-        }
-
-        const int rc = llama_decode(eng->ctx, bg.batch);
-        bg.free_now();
-        if (eng->profile_enabled) {
-            eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
-            eng->prof_decode_total_us.fetch_add(
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()),
-                std::memory_order_relaxed
-            );
-        }
-
-        if (rc != 0 || eng->eval_failed) {
-            return report_eval_failure(eng, rc, "grammar verify llama_decode failed", err_buf, err_cap);
-        }
-
-        const int32_t n_vocab = llama_vocab_n_tokens(eng->vocab);
-        const int32_t k = n_tokens - 1;
-        const int32_t * draft_tokens = tokens + 1;
-        const bool is_greedy = (!sample_params || sample_params->temperature <= 0.0f);
-
-        SamplerHandle step_guard{llama_sampler_clone(grammar->smpl)};
-        if (!step_guard.smpl) {
-            set_error(err_buf, err_cap, "failed to clone grammar sampler for speculative verification");
-            return -5;
-        }
-        SamplerHandle pen = make_penalties_sampler(n_vocab, sample_params, penalty_tokens, n_penalty_tokens, k);
-        SamplerHandle flt = make_filter_chain(sample_params);
-
-        std::vector<llama_token_data> cand_buf;
-        std::vector<ProbEntry> dist;
-        std::mt19937 rng(sample_params ? sample_params->seed : 42u);
-        std::uniform_real_distribution<double> uni(0.0, 1.0);
-        int32_t best_id = 0;
-
-        for (int32_t i = 0; i < k; ++i) {
-            const float * raw_logits = llama_get_logits_ith(eng->ctx, i);
-            if (!raw_logits) {
-                set_error(err_buf, err_cap, "llama_get_logits_ith returned null during grammar verify");
-                return -4;
-            }
-            if (!run_sampler_step(
-                    raw_logits,
-                    n_vocab,
-                    pen.smpl,
-                    step_guard.smpl,
-                    flt.smpl,
-                    is_greedy,
-                    cand_buf,
-                    dist,
-                    best_id
-                )) {
-                set_error(err_buf, err_cap, "grammar rejected all candidate tokens");
-                return -5;
-            }
-            const int32_t d_tok = draft_tokens[i];
-
-            if (is_greedy) {
-                if (best_id != d_tok) {
-                    *out_accepted_count = i;
-                    *out_next_token = best_id;
-                    return 0;
-                }
-            } else {
-                double p_draft = 0.0;
-                size_t draft_pos = dist.size();
-                for (size_t j = 0; j < dist.size(); ++j) {
-                    if (dist[j].id == d_tok) {
-                        p_draft = static_cast<double>(dist[j].val);
-                        draft_pos = j;
-                        break;
-                    }
-                }
-                if (!(p_draft >= 1.0 - 1e-7 || uni(rng) < p_draft)) {
-                    if (draft_pos < dist.size()) {
-                        dist[draft_pos].val = 0.0f;
-                        const double rem = std::max(1e-12, 1.0 - p_draft);
-                        for (auto & e : dist) {
-                            e.val = static_cast<float>(static_cast<double>(e.val) / rem);
-                        }
-                    }
-                    *out_accepted_count = i;
-                    *out_next_token = sample_from_dist(dist, rng);
-                    return 0;
-                }
-            }
-
-            if (llama_vocab_is_eog(eng->vocab, d_tok)) {
-                *out_accepted_count = i + 1;
-                *out_next_token = d_tok;
-                return 0;
-            }
-            llama_sampler_accept(step_guard.smpl, d_tok);
-            if (pen.smpl && d_tok >= 0 && d_tok < n_vocab) {
-                llama_sampler_accept(pen.smpl, d_tok);
-            }
-        }
-
-        const float * raw_bonus = llama_get_logits_ith(eng->ctx, k);
-        if (!raw_bonus) {
-            set_error(err_buf, err_cap, "llama_get_logits_ith returned null at bonus position");
-            return -4;
-        }
-        if (!run_sampler_step(
-                raw_bonus,
-                n_vocab,
-                pen.smpl,
-                step_guard.smpl,
-                flt.smpl,
-                is_greedy,
-                cand_buf,
-                dist,
-                best_id
-            )) {
-            set_error(err_buf, err_cap, "grammar rejected all candidate tokens at bonus position");
-            return -5;
-        }
-        *out_next_token = is_greedy ? best_id : sample_from_dist(dist, rng);
-        *out_accepted_count = k;
-        return 0;
-    } catch (const std::exception & e) {
-        set_error(err_buf, err_cap, std::string("grammar verify failed: ") + e.what());
-        return -6;
-    } catch (...) {
-        set_error(err_buf, err_cap, "unknown grammar verify exception");
-        return -6;
-    }
-}
