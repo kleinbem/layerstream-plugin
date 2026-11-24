@@ -53,6 +53,15 @@ jobs:
           test "$cargo_ver" = "$node_cargo_ver"
           test "$cargo_ver" = "$node_pkg_ver"
 
+      - name: Enforce max 2,000 LoC per source file
+        run: |
+          bad=$(git ls-files '*.rs' '*.cpp' '*.hpp' '*.py' '*.js' '*.ts' | xargs wc -l | awk '$1 > 2000 && $2 != "total"')
+          if [ -n "$bad" ]; then
+            echo "::error::Source files exceeding 2,000 LoC limit:"
+            echo "$bad"
+            exit 1
+          fi
+
       - name: Format check
         run: cargo fmt --all -- --check
 
