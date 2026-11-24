@@ -1105,6 +1105,18 @@ struct ls_engine {
         }
     }
 
+    static bool abort_cb(void * user_data) {
+        auto * self = static_cast<ls_engine *>(user_data);
+        if (self->is_cancelled()) {
+            self->eval_failed = true;
+            if (self->eval_error_msg.empty()) {
+                self->eval_error_msg = "request cancelled";
+            }
+            return true;
+        }
+        return self->eval_failed;
+    }
+
     static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
         auto * self = static_cast<ls_engine *>(user_data);
         if (self->is_cancelled()) {
@@ -1422,8 +1434,10 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         } else {
             cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         }
-        cparams.cb_eval = &ls_engine::cb_eval;
-        cparams.cb_eval_user_data = eng;
+        // Reference mode is 100% resident: use llama.cpp's lightweight abort_callback for
+        // cancellation instead of cb_eval so ggml_backend_sched stays on the zero-callback fast path.
+        cparams.abort_callback = &ls_engine::abort_cb;
+        cparams.abort_callback_data = eng;
 
         eng->ctx = llama_init_from_model(eng->model, cparams);
         if (!eng->ctx) {
@@ -2152,9 +2166,14 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     } else {
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     }
-    // Always install cb_eval so cooperative cancellation aborts mid-pass even when 100% resident.
-    cparams.cb_eval = &ls_engine::cb_eval;
-    cparams.cb_eval_user_data = eng;
+    // Use abort_callback for cooperative cancellation on every model, and only install cb_eval
+    // when layers are actually streamed so 100% resident models stay on llama.cpp's fast path.
+    cparams.abort_callback = &ls_engine::abort_cb;
+    cparams.abort_callback_data = eng;
+    if (eng->streamed_dense_layers > 0 || eng->streamed_moe_layers > 0) {
+        cparams.cb_eval = &ls_engine::cb_eval;
+        cparams.cb_eval_user_data = eng;
+    }
 
     eng->ctx = llama_init_from_model(eng->model, cparams);
     if (!eng->ctx) {
