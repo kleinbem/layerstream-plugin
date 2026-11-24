@@ -424,3 +424,93 @@ unsafe extern "C" {
         err_cap: usize,
     ) -> c_int;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_params_validate_rejects_invalid_boundaries() {
+        assert!(LsSampleParams::default().validate().is_ok());
+        assert!(!LsSampleParams::default().has_penalties());
+
+        let bad_cases = [
+            LsSampleParams {
+                temperature: -0.1,
+                ..Default::default()
+            },
+            LsSampleParams {
+                temperature: f32::NAN,
+                ..Default::default()
+            },
+            LsSampleParams {
+                top_p: 0.0,
+                ..Default::default()
+            },
+            LsSampleParams {
+                top_p: 1.01,
+                ..Default::default()
+            },
+            LsSampleParams {
+                min_p: -0.01,
+                ..Default::default()
+            },
+            LsSampleParams {
+                min_p: 1.5,
+                ..Default::default()
+            },
+            LsSampleParams {
+                repeat_penalty: 0.0,
+                ..Default::default()
+            },
+            LsSampleParams {
+                frequency_penalty: f32::INFINITY,
+                ..Default::default()
+            },
+            LsSampleParams {
+                presence_penalty: f32::NEG_INFINITY,
+                ..Default::default()
+            },
+            LsSampleParams {
+                penalty_last_n: -2,
+                ..Default::default()
+            },
+        ];
+        for p in bad_cases {
+            assert!(
+                p.validate().is_err(),
+                "expected validation failure for {p:?}"
+            );
+        }
+
+        let with_pen = LsSampleParams {
+            repeat_penalty: 1.15,
+            ..Default::default()
+        };
+        assert!(with_pen.validate().is_ok());
+        assert!(with_pen.has_penalties());
+
+        let disabled_pen = LsSampleParams {
+            repeat_penalty: 1.15,
+            penalty_last_n: 0,
+            ..Default::default()
+        };
+        assert!(!disabled_pen.has_penalties());
+    }
+
+    #[test]
+    fn backend_name_str_handles_empty_nul_and_full_buffers() {
+        let mut stats = LsEngineStats::default();
+        assert_eq!(stats.backend_name_str(), "CPU");
+        stats.using_gpu = true;
+        assert_eq!(stats.backend_name_str(), "GPU");
+
+        for (i, b) in b"CUDA0\0".iter().enumerate() {
+            stats.backend_name[i] = *b as c_char;
+        }
+        assert_eq!(stats.backend_name_str(), "CUDA0");
+
+        stats.backend_name = [b'X' as c_char; 32];
+        assert_eq!(stats.backend_name_str(), "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+    }
+}

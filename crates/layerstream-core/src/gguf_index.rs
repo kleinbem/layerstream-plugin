@@ -621,3 +621,115 @@ pub const fn align_down(v: u64, align: u64) -> u64 {
 pub const fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn gguf_header(version: u32, n_tensors: u64, n_kv: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(GGUF_MAGIC);
+        buf.extend_from_slice(&version.to_le_bytes());
+        buf.extend_from_slice(&n_tensors.to_le_bytes());
+        buf.extend_from_slice(&n_kv.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn rejects_invalid_magic_version_and_truncated_headers() {
+        let mut bad_magic = Cursor::new(
+            b"NOTG\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+                .to_vec(),
+        );
+        assert!(parse_single_header(&mut bad_magic, 0, 24, false).is_err());
+
+        let mut old_ver = Cursor::new(gguf_header(1, 0, 0));
+        assert!(parse_single_header(&mut old_ver, 0, 24, false).is_err());
+
+        let mut future_ver = Cursor::new(gguf_header(99, 0, 0));
+        assert!(parse_single_header(&mut future_ver, 0, 24, false).is_err());
+
+        let mut truncated = Cursor::new(b"GGUF\x03\x00".to_vec());
+        assert!(parse_single_header(&mut truncated, 0, 6, false).is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_tensor_kv_and_string_counts() {
+        let mut huge_tensors = Cursor::new(gguf_header(3, (MAX_GGUF_TENSORS as u64) + 1, 0));
+        assert!(parse_single_header(&mut huge_tensors, 0, 24, false).is_err());
+
+        let mut huge_kv = Cursor::new(gguf_header(3, 0, (MAX_GGUF_KV_COUNT as u64) + 1));
+        assert!(parse_single_header(&mut huge_kv, 0, 24, false).is_err());
+
+        // Header claiming 1 KV entry whose key string length exceeds remaining file bytes.
+        let mut bad_str = gguf_header(3, 0, 1);
+        bad_str.extend_from_slice(&1024u64.to_le_bytes());
+        let len = bad_str.len() as u64;
+        let mut cur = Cursor::new(bad_str);
+        assert!(parse_single_header(&mut cur, 0, len, false).is_err());
+    }
+
+    #[test]
+    fn align_helpers_and_span_coalescing_merge_nearby_and_split_distant() {
+        assert_eq!(align_down(0, DIRECT_IO_ALIGN), 0);
+        assert_eq!(align_down(4095, DIRECT_IO_ALIGN), 0);
+        assert_eq!(align_down(4096, DIRECT_IO_ALIGN), 4096);
+        assert_eq!(align_up(1, DIRECT_IO_ALIGN), 4096);
+        assert_eq!(align_up(4096, DIRECT_IO_ALIGN), 4096);
+        assert_eq!(align_up(4097, DIRECT_IO_ALIGN), 8192);
+
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "t0".to_string(),
+            TensorLocation {
+                name: "t0".to_string(),
+                shard_idx: 0,
+                abs_offset: 100,
+                ggml_type: 0,
+                dims: vec![64],
+            },
+        );
+        tensors.insert(
+            "t1".to_string(),
+            TensorLocation {
+                name: "t1".to_string(),
+                shard_idx: 0,
+                abs_offset: 8_192,
+                ggml_type: 0,
+                dims: vec![64],
+            },
+        );
+        tensors.insert(
+            "t2".to_string(),
+            TensorLocation {
+                name: "t2".to_string(),
+                shard_idx: 0,
+                abs_offset: 1_000_000,
+                ggml_type: 0,
+                dims: vec![64],
+            },
+        );
+        let idx = GgufIndex {
+            shards: vec![PathBuf::from("dummy.gguf")],
+            shard_sizes: vec![2_000_000],
+            meta: ModelMeta {
+                architecture: "llama".to_string(),
+                name: None,
+                n_layers: 1,
+                context_length: Some(128),
+                total_file_bytes: 2_000_000,
+            },
+            tensors,
+        };
+
+        let spans = idx
+            .plan_coalesced_spans(&[("t0", 0, 256), ("t1", 256, 256), ("t2", 512, 256)])
+            .expect("plan spans");
+        assert_eq!(spans.len(), 2, "t0+t1 should coalesce, t2 should split");
+        assert_eq!(spans[0].aligned_offset % DIRECT_IO_ALIGN, 0);
+        assert_eq!(spans[0].slices.len(), 2);
+        assert_eq!(spans[1].aligned_offset % DIRECT_IO_ALIGN, 0);
+        assert_eq!(spans[1].slices.len(), 1);
+    }
+}
