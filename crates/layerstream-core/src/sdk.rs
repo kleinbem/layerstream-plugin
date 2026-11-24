@@ -325,6 +325,7 @@ pub fn pull_model(
             )
         };
         hf::ensure_hf_downloaded_with_progress(&uri, &root, on_progress.as_ref())
+            .map_err(Into::into)
     } else if !trimmed.starts_with("hf://") && trimmed.contains('/') {
         let opts = PretrainedResolveOptions {
             revision,
@@ -338,6 +339,7 @@ pub fn pull_model(
         Ok(resolve_pretrained_model(trimmed, &opts)?.local_path)
     } else {
         hf::ensure_hf_downloaded_with_progress(trimmed, &root, on_progress.as_ref())
+            .map_err(Into::into)
     }
 }
 

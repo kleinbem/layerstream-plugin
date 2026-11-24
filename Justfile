@@ -57,6 +57,10 @@ test-rust:
     CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/layerstream-target}" \
       chrt --idle 0 ionice -c3 cargo test --locked --workspace -j 4 -- --test-threads 1
 
+# Measure LLVM line/region coverage for the 3 pure-Rust workspace crates (requires cargo-llvm-cov + llvm-tools)
+coverage:
+    cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --html -- --test-threads 1
+
 # Run Python unit tests (fast pure-Python tests without rebuilding native wheel)
 test-python-fast:
     nix develop .#python -c bash -c 'cd bindings/python && pytest -v tests/test_audit_wheel_elf.py tests/test_cuda13_plugin.py'

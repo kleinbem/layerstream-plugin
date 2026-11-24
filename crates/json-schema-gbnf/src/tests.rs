@@ -155,3 +155,192 @@ fn handles_false_branches_sibling_constraints_allof_oneof_and_bounds() {
     .unwrap();
     assert!(g8.contains("\"[\" ws \"]\" ws"));
 }
+
+/// Verifies every rule referenced on any RHS of a GBNF grammar is defined on some LHS.
+fn assert_all_gbnf_rules_defined(gbnf: &str) {
+    use std::collections::HashSet;
+
+    let mut defined = HashSet::new();
+    let mut rhs_list = Vec::new();
+    for line in gbnf.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (lhs, rhs) = trimmed
+            .split_once("::=")
+            .unwrap_or_else(|| panic!("malformed GBNF line: {trimmed}"));
+        defined.insert(lhs.trim().to_string());
+        rhs_list.push(rhs.to_string());
+    }
+    assert!(defined.contains("root"), "grammar must define `root`");
+
+    for rhs in rhs_list {
+        let bytes = rhs.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                        } else if bytes[i] == b'"' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                b'[' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                        } else if bytes[i] == b']' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                b'a'..=b'z' | b'A'..=b'Z' => {
+                    let start = i;
+                    while i < bytes.len()
+                        && (bytes[i].is_ascii_alphanumeric()
+                            || bytes[i] == b'-'
+                            || bytes[i] == b'_')
+                    {
+                        i += 1;
+                    }
+                    let ident = &rhs[start..i];
+                    assert!(
+                        defined.contains(ident),
+                        "GBNF references undefined rule `{ident}` in:\n{gbnf}"
+                    );
+                }
+                _ => i += 1,
+            }
+        }
+    }
+}
+
+#[test]
+fn json_object_gbnf_is_self_contained_and_well_formed() {
+    let gbnf = json_object_gbnf();
+    assert!(gbnf.starts_with("root ::= ws json-object\n"));
+    assert_all_gbnf_rules_defined(&gbnf);
+}
+
+#[test]
+fn compiles_primitives_const_and_nullable_type_arrays() {
+    for (ty, expected) in [
+        ("null", "json-null"),
+        ("boolean", "json-bool"),
+        ("integer", "json-int"),
+        ("number", "json-number"),
+        ("string", "json-string"),
+    ] {
+        let g = json_schema_to_gbnf(&json!({"type": ty})).unwrap();
+        assert!(g.contains(expected), "type={ty} missing {expected}");
+        assert_all_gbnf_rules_defined(&g);
+    }
+
+    let nullable = json_schema_to_gbnf(&json!({"type": ["integer", "null"]})).unwrap();
+    assert!(nullable.contains("json-int"));
+    assert!(nullable.contains("json-null"));
+    assert_all_gbnf_rules_defined(&nullable);
+
+    let const_obj = json_schema_to_gbnf(&json!({
+        "const": {"ok": true, "count": 3, "tags": ["a", null]}
+    }))
+    .unwrap();
+    assert!(const_obj.contains("\\\"ok\\\""));
+    assert!(const_obj.contains("true"));
+    assert!(const_obj.contains("3"));
+    assert_all_gbnf_rules_defined(&const_obj);
+}
+
+#[test]
+fn compiles_typed_additional_properties_and_excluded_key_rules() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "label": {"type": "string"}
+        },
+        "required": ["id"],
+        "additionalProperties": {"type": "boolean"}
+    });
+    let gbnf = json_schema_to_gbnf(&schema).unwrap();
+    assert!(gbnf.contains("\\\"id\\\""));
+    assert!(gbnf.contains("json-bool"));
+    assert_all_gbnf_rules_defined(&gbnf);
+
+    // Pure map object (`additionalProperties` without `properties`).
+    let map_schema = json!({
+        "type": "object",
+        "additionalProperties": {"type": "number"}
+    });
+    let map_gbnf = json_schema_to_gbnf(&map_schema).unwrap();
+    assert!(map_gbnf.contains("json-number"));
+    assert_all_gbnf_rules_defined(&map_gbnf);
+}
+
+#[test]
+fn compiles_string_and_array_bounds_and_prefix_items_tuples() {
+    let exact_str = json_schema_to_gbnf(&json!({
+        "type": "string",
+        "minLength": 3,
+        "maxLength": 3
+    }))
+    .unwrap();
+    assert!(exact_str.contains("json-char{3}"));
+    assert_all_gbnf_rules_defined(&exact_str);
+
+    // minLength > maxLength is unsatisfiable.
+    assert!(
+        json_schema_to_gbnf(&json!({"type": "string", "minLength": 5, "maxLength": 2})).is_err()
+    );
+
+    let tuple = json_schema_to_gbnf(&json!({
+        "type": "array",
+        "prefixItems": [{"type": "string"}, {"type": "integer"}],
+        "items": {"type": "boolean"},
+        "minItems": 2,
+        "maxItems": 4
+    }))
+    .unwrap();
+    assert!(tuple.contains("json-string"));
+    assert!(tuple.contains("json-int"));
+    assert!(tuple.contains("json-bool"));
+    assert_all_gbnf_rules_defined(&tuple);
+
+    // minItems > maxItems fails closed.
+    assert!(json_schema_to_gbnf(&json!({"type": "array", "minItems": 3, "maxItems": 1})).is_err());
+}
+
+#[test]
+fn handles_json_pointer_escaping_and_rejects_invalid_refs_and_unsupported_keywords() {
+    // RFC 6901 JSON Pointer escaping: `~1` -> `/`, `~0` -> `~`.
+    let escaped = json!({
+        "$defs": {
+            "a/b~c": {"type": "integer"}
+        },
+        "$ref": "#/$defs/a~1b~0c"
+    });
+    let g = json_schema_to_gbnf(&escaped).unwrap();
+    assert!(g.contains("json-int"));
+    assert_all_gbnf_rules_defined(&g);
+
+    // Missing local ref, external ref, and unsupported keywords (`format`, `pattern`) fail closed.
+    let err_missing = json_schema_to_gbnf(&json!({"$ref": "#/$defs/Nope"})).unwrap_err();
+    assert!(err_missing.to_string().contains("unresolved"));
+
+    assert!(json_schema_to_gbnf(&json!({"$ref": "https://example.com/s.json"})).is_err());
+    assert!(json_schema_to_gbnf(&json!({"type": "string", "format": "uuid"})).is_err());
+    assert!(json_schema_to_gbnf(&json!({"type": "string", "pattern": "^[a-z]+$"})).is_err());
+    assert!(json_schema_to_gbnf(&json!(false)).is_err());
+}

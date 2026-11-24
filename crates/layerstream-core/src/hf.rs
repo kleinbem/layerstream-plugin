@@ -2,8 +2,6 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
-
 pub use hf_gguf::*;
 
 /// Resolves a model specification into a local `.gguf` file path, using `StreamEngine`
@@ -11,7 +9,7 @@ pub use hf_gguf::*;
 pub fn resolve_pretrained_model(
     spec: &str,
     opts: &PretrainedResolveOptions,
-) -> Result<ResolvedModel> {
+) -> hf_gguf::Result<ResolvedModel> {
     hf_gguf::resolve_pretrained_model_with_probe(spec, opts, || {
         crate::StreamEngine::probe_gpu_memory(true).map(|(free, _)| free)
     })
@@ -25,7 +23,7 @@ pub fn resolve_auto_draft_model(
     vram_budget_bytes: Option<u64>,
     use_gpu: bool,
     on_progress: Option<ProgressCallback>,
-) -> Result<Option<ResolvedModel>> {
+) -> hf_gguf::Result<Option<ResolvedModel>> {
     hf_gguf::resolve_auto_draft_model_with_probe(
         target,
         cache_dir,

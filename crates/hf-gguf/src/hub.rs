@@ -23,7 +23,9 @@ pub fn parse_repo_and_revision(
     let org = parts.next().unwrap_or("");
     let repo = parts.next().unwrap_or("");
     if org.is_empty() || repo.is_empty() || org.contains("..") || repo.contains("..") {
-        bail!("invalid Hugging Face repo '{input}' (expected org/repo)");
+        return Err(HfError::InvalidSpec(format!(
+            "invalid Hugging Face repo '{input}' (expected org/repo)"
+        )));
     }
     let rev = rev_override
         .filter(|s| !s.trim().is_empty())
@@ -319,18 +321,23 @@ pub fn list_hf_gguf_candidates(repo_id: &str, revision: &str) -> Result<Vec<HfGg
 
         let resp = req
             .call()
-            .with_context(|| format!("query Hugging Face API {url}"))?;
+            .map_err(|e| HfError::Http(format!("query Hugging Face API {url}: {e}")))?;
         let status = resp.status().as_u16();
         if status != 200 {
-            bail!("Hugging Face API returned HTTP {status} for {repo_id}@{revision} ({url})");
+            return Err(HfError::Http(format!(
+                "Hugging Face API returned HTTP {status} for {repo_id}@{revision} ({url})"
+            )));
         }
         let candidate_next = parse_next_link_url(resp.headers(), &url);
         let body = resp
             .into_body()
             .read_to_string()
-            .context("read Hugging Face tree JSON")?;
+            .map_err(|e| HfError::Http(format!("read Hugging Face tree JSON: {e}")))?;
         let page_entries: Vec<HfTreeEntry> =
-            serde_json::from_str(&body).context("parse Hugging Face tree JSON")?;
+            serde_json::from_str(&body).map_err(|source| HfError::Json {
+                context: "parse Hugging Face tree JSON".to_string(),
+                source,
+            })?;
         all_entries.extend(page_entries);
 
         if let Some(nu) = candidate_next
@@ -512,15 +519,15 @@ fn select_candidate_for_repo<'a>(
             return Ok(found);
         }
         let available: Vec<&str> = recs.iter().map(|r| r.candidate.quant.as_str()).collect();
-        bail!(
+        return Err(HfError::NotFound(format!(
             "quant '{wanted}' not found in '{repo_id}' (available: {})",
             available.join(", ")
-        );
+        )));
     }
     recs.iter()
         .find(|r| r.recommended)
         .or_else(|| recs.first())
-        .with_context(|| format!("no GGUF candidates available in '{repo_id}'"))
+        .ok_or_else(|| HfError::NotFound(format!("no GGUF candidates available in '{repo_id}'")))
 }
 
 /// Resolves a model specification into a local `.gguf` file path, downloading if needed.
@@ -551,7 +558,9 @@ where
 {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
-        bail!("model specification must not be empty");
+        return Err(HfError::InvalidSpec(
+            "model specification must not be empty".into(),
+        ));
     }
 
     // 1. Local file path.
@@ -565,7 +574,10 @@ where
         });
     }
     if looks_like_local_path(trimmed) {
-        bail!("local GGUF model not found: '{}'", expanded.display());
+        return Err(HfError::NotFound(format!(
+            "local GGUF model not found: '{}'",
+            expanded.display()
+        )));
     }
 
     let cache_root = opts.cache_dir.clone().unwrap_or_else(default_cache_dir);
@@ -619,17 +631,19 @@ where
                     candidates = sib_cands;
                 }
                 _ => {
-                    bail!(
+                    return Err(HfError::NotFound(format!(
                         "repository '{repo_id}@{revision}' contains no .gguf files, and official \
                          sibling '{sibling}@{revision}' has no GGUF checkpoints. Pass an explicit \
                          GGUF repository (e.g. 'bartowski/{model_name}-GGUF' or \
                          'unsloth/{model_name}-GGUF'), an 'hf://org/repo:file.gguf' URI, or a \
                          local .gguf path"
-                    );
+                    )));
                 }
             }
         } else {
-            bail!("no .gguf files found in Hugging Face repository '{repo_id}@{revision}'");
+            return Err(HfError::NotFound(format!(
+                "no .gguf files found in Hugging Face repository '{repo_id}@{revision}'"
+            )));
         }
     }
 

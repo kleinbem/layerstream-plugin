@@ -4,11 +4,12 @@
 //! share one active GPU lease so peak VRAM stays strictly bounded and drops back
 //! to 0 MB whenever idle.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 struct LoadedSlot<E> {
@@ -28,9 +29,7 @@ struct RequestLease {
 
 impl Drop for RequestLease {
     fn drop(&mut self) {
-        if let Ok(mut ts) = self.activity.last_finished.lock() {
-            *ts = Instant::now();
-        }
+        *self.activity.last_finished.lock() = Instant::now();
         self.activity.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -151,12 +150,11 @@ impl<E: Send + 'static> Residency<E> {
         if guard.is_none() || self.activity.in_flight.load(Ordering::SeqCst) != 0 {
             return false;
         }
-        let Ok(last_finished) = self.activity.last_finished.lock() else {
-            return false;
-        };
+        let last_finished = self.activity.last_finished.lock();
         if now.saturating_duration_since(*last_finished) < self.idle_timeout {
             return false;
         }
+        drop(last_finished);
         if let Some(evicted) = guard.take() {
             let loaded = self.loaded.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -208,10 +206,7 @@ mod tests {
 
     impl Drop for DropTracker {
         fn drop(&mut self) {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("drop:{}", self.id));
+            self.events.lock().push(format!("drop:{}", self.id));
         }
     }
 
@@ -225,7 +220,7 @@ mod tests {
             let ev = events.clone();
             lease
                 .get_or_load("m1", move || {
-                    ev.lock().unwrap().push("load:m1".to_string());
+                    ev.lock().push("load:m1".to_string());
                     Ok(DropTracker {
                         id: "m1",
                         events: ev,
@@ -241,7 +236,7 @@ mod tests {
             let ev = events.clone();
             lease
                 .get_or_load("m2", move || {
-                    ev.lock().unwrap().push("load:m2".to_string());
+                    ev.lock().push("load:m2".to_string());
                     Ok(DropTracker {
                         id: "m2",
                         events: ev,
@@ -251,10 +246,7 @@ mod tests {
             assert_eq!(lease.model_id(), Some("m2"));
         }
 
-        assert_eq!(
-            *events.lock().unwrap(),
-            vec!["load:m1", "drop:m1", "load:m2"]
-        );
+        assert_eq!(*events.lock(), vec!["load:m1", "drop:m1", "load:m2"]);
         assert!(res.evict_now().await);
         assert!(!res.is_loaded());
         assert!(!res.evict_now().await);

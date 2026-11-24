@@ -20,7 +20,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use anyhow::{Context, Result, bail};
+use crate::{GgufIoError, Result};
 use parking_lot::{Condvar, Mutex};
 use quick_cache::{Weighter, unsync::Cache as QuickCache};
 
@@ -80,14 +80,20 @@ impl AlignedBuf {
         let rounded = base
             .checked_add(DIRECT_IO_ALIGN - 1)
             .map(|v| v & !(DIRECT_IO_ALIGN - 1))
-            .context("AlignedBuf size overflow during 4K alignment")?;
-        let len = usize::try_from(rounded).context("AlignedBuf size exceeds usize")?;
-        let layout = Layout::from_size_align(len, DIRECT_IO_ALIGN as usize)
-            .context("invalid AlignedBuf layout")?;
+            .ok_or_else(|| {
+                GgufIoError::AllocationFailed("AlignedBuf size overflow during 4K alignment".into())
+            })?;
+        let len = usize::try_from(rounded)
+            .map_err(|_| GgufIoError::AllocationFailed("AlignedBuf size exceeds usize".into()))?;
+        let layout = Layout::from_size_align(len, DIRECT_IO_ALIGN as usize).map_err(|e| {
+            GgufIoError::AllocationFailed(format!("invalid AlignedBuf layout: {e}"))
+        })?;
         // SAFETY: `layout` has non-zero size (`len >= DIRECT_IO_ALIGN`) and power-of-two alignment.
         let raw = unsafe { alloc_zeroed(layout) };
         let Some(ptr) = NonNull::new(raw) else {
-            bail!("failed to allocate {len}-byte 4K-aligned IO buffer");
+            return Err(GgufIoError::AllocationFailed(format!(
+                "failed to allocate {len}-byte 4K-aligned IO buffer"
+            )));
         };
         Ok(Self { ptr, len, layout })
     }
@@ -433,11 +439,13 @@ impl LayerIoPool {
         let mut all_direct = prefer_direct_io;
 
         for path in &index.shards {
-            let buffered = File::open(path)
-                .with_context(|| format!("failed to open shard {}", path.display()))?;
+            let buffered = File::open(path).map_err(|e| {
+                GgufIoError::io(format!("failed to open shard {}", path.display()), e)
+            })?;
             #[cfg(target_os = "linux")]
-            let sparse_buffered = open_sparse_buffered(path)
-                .with_context(|| format!("failed to open sparse shard {}", path.display()))?;
+            let sparse_buffered = open_sparse_buffered(path).map_err(|e| {
+                GgufIoError::io(format!("failed to open sparse shard {}", path.display()), e)
+            })?;
             let direct = if prefer_direct_io {
                 open_direct(path)
             } else {
@@ -736,25 +744,22 @@ impl LayerIoPool {
         for &(_, _, dst_off, len, _) in requests {
             let end = dst_off
                 .checked_add(len)
-                .context("slice dst_offset overflow")?;
+                .ok_or_else(|| GgufIoError::OutOfBounds("slice dst_offset overflow".into()))?;
             if end > dst.len() {
-                bail!(
+                return Err(GgufIoError::OutOfBounds(format!(
                     "slice dst range [{dst_off}..{end}) exceeds dst_cap {}",
                     dst.len()
-                );
+                )));
             }
             req_ranges.push((dst_off, end));
         }
         req_ranges.sort_unstable_by_key(|r| r.0);
         for w in req_ranges.windows(2) {
             if w[0].1 > w[1].0 {
-                bail!(
+                return Err(GgufIoError::OutOfBounds(format!(
                     "overlapping slice destination ranges [{}..{}) and [{}..{})",
-                    w[0].0,
-                    w[0].1,
-                    w[1].0,
-                    w[1].1
-                );
+                    w[0].0, w[0].1, w[1].0, w[1].1
+                )));
             }
         }
 
@@ -767,7 +772,7 @@ impl LayerIoPool {
                 .index
                 .tensors
                 .get(name)
-                .with_context(|| format!("tensor '{name}' missing from GGUF index"))?
+                .ok_or_else(|| GgufIoError::MissingTensor(name.to_string()))?
                 .resolved();
             resolved_reqs.push((loc, src_off, dst_off, len, tidx));
         }
@@ -880,7 +885,7 @@ impl LayerIoPool {
             let scratches_base = SendScratchPtr(scratches.as_mut_ptr());
             let chunk_len = spans.len().div_ceil(n_workers);
             let actual_workers = spans.len().div_ceil(chunk_len);
-            let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+            let first_err: Mutex<Option<GgufIoError>> = Mutex::new(None);
             let batch_bytes = AtomicU64::new(0);
             let t_wall = std::time::Instant::now();
             self.workers.run(actual_workers, |w| {
@@ -944,15 +949,14 @@ impl LayerIoPool {
             // Single-slice fast path: pread straight into `dst` (zero scratch copy)
             // using `POSIX_FADV_RANDOM` + immediate `POSIX_FADV_DONTNEED`.
             if let [slice] = span.slices.as_slice() {
-                let dst_end = slice
-                    .dst_offset
-                    .checked_add(slice.len)
-                    .context("sparse slice dst_offset overflow")?;
+                let dst_end = slice.dst_offset.checked_add(slice.len).ok_or_else(|| {
+                    GgufIoError::OutOfBounds("sparse slice dst_offset overflow".into())
+                })?;
                 if dst_end > dst_len {
-                    bail!(
+                    return Err(GgufIoError::OutOfBounds(format!(
                         "sparse slice dst range [{}..{dst_end}) exceeds dst_cap {dst_len}",
                         slice.dst_offset
-                    );
+                    )));
                 }
                 let file_off = span.aligned_offset + slice.span_offset as u64;
                 // SAFETY: `dst_end <= dst_len` was checked above and each span writes disjoint destination ranges in `dst_base`.
@@ -1076,14 +1080,14 @@ impl LayerIoPool {
                     let len = ov_end - ov_start;
                     let src_off = ov_start - chunk_rel;
                     let dst_off = slice.dst_offset + (ov_start - slice.span_offset);
-                    let dst_end = dst_off
-                        .checked_add(len)
-                        .context("serial span destination offset overflow")?;
+                    let dst_end = dst_off.checked_add(len).ok_or_else(|| {
+                        GgufIoError::OutOfBounds("serial span destination offset overflow".into())
+                    })?;
                     if dst_end > dst.len() {
-                        bail!(
+                        return Err(GgufIoError::OutOfBounds(format!(
                             "serial span slice [{dst_off}..{dst_end}) exceeds destination buffer ({} bytes)",
                             dst.len()
-                        );
+                        )));
                     }
                     dst[dst_off..dst_end].copy_from_slice(&read_buf[src_off..src_off + len]);
                 }
@@ -1291,7 +1295,15 @@ fn pread_exact_or_eof(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::
 fn pread_all(file: &File, mut buf: &mut [u8], mut offset: u64) -> Result<()> {
     while !buf.is_empty() {
         match file_read_at(file, buf, offset) {
-            Ok(0) => bail!("unexpected EOF during pread at offset {offset}"),
+            Ok(0) => {
+                return Err(GgufIoError::io(
+                    format!("unexpected EOF during pread at offset {offset}"),
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("unexpected EOF during pread at offset {offset}"),
+                    ),
+                ));
+            }
             Ok(n) => {
                 offset += n as u64;
                 buf = &mut buf[n..];
@@ -1309,8 +1321,12 @@ pub fn probe_storage_mib_per_s(
     path: &std::path::Path,
     prefer_direct_io: bool,
 ) -> Result<(f64, bool)> {
-    let buffered = File::open(path)
-        .with_context(|| format!("failed to open {} for storage probe", path.display()))?;
+    let buffered = File::open(path).map_err(|e| {
+        GgufIoError::io(
+            format!("failed to open {} for storage probe", path.display()),
+            e,
+        )
+    })?;
     let file_len = buffered.metadata()?.len();
     if file_len < 4096 {
         return Ok((0.0, false));
@@ -1627,5 +1643,96 @@ mod tests {
                 assert_eq!(h.load(Ordering::Relaxed), 1);
             }
         }
+    }
+
+    #[test]
+    fn load_layer_into_cached_layer_and_storage_probe_work() {
+        use crate::gguf_index::{ModelMeta, TensorLocation};
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shard_path = dir.path().join("layer_test.gguf");
+        let mut payload = vec![0u8; 64 * 1024];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i * 13) ^ (i >> 5)) as u8;
+        }
+        std::fs::File::create(&shard_path)
+            .unwrap()
+            .write_all(&payload)
+            .unwrap();
+
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "blk.0.w0".to_string(),
+            TensorLocation {
+                name: "blk.0.w0".to_string(),
+                shard_idx: 0,
+                abs_offset: 4096,
+                ggml_type: 0,
+                dims: vec![1024], // 4096 bytes
+            },
+        );
+        tensors.insert(
+            "blk.0.w1".to_string(),
+            TensorLocation {
+                name: "blk.0.w1".to_string(),
+                shard_idx: 0,
+                abs_offset: 12288,
+                ggml_type: 0,
+                dims: vec![1024], // 4096 bytes
+            },
+        );
+
+        let index = GgufIndex {
+            meta: ModelMeta {
+                architecture: "llama".to_string(),
+                name: Some("test".to_string()),
+                n_layers: 1,
+                context_length: Some(512),
+                total_file_bytes: payload.len() as u64,
+            },
+            shards: vec![shard_path.clone()],
+            shard_sizes: vec![payload.len() as u64],
+            tensors,
+        };
+        let pool = LayerIoPool::new(index, false).unwrap();
+
+        // First call plans & caches layer 0 spans.
+        let mut dst = vec![0u8; 8192];
+        assert!(!pool.load_cached_layer_into(0, &mut dst).unwrap());
+        pool.load_layer_tensors_into(
+            0,
+            &[("blk.0.w0", 0, 4096), ("blk.0.w1", 4096, 4096)],
+            &mut dst,
+        )
+        .unwrap();
+        assert_eq!(&dst[..4096], &payload[4096..8192]);
+        assert_eq!(&dst[4096..8192], &payload[12288..16384]);
+
+        // Uncached one-shot load (`layer_idx = -1`) also matches.
+        let mut dst_oneshot = vec![0u8; 8192];
+        pool.load_tensors_into(
+            &[("blk.0.w0", 0, 4096), ("blk.0.w1", 4096, 4096)],
+            &mut dst_oneshot,
+        )
+        .unwrap();
+        assert_eq!(dst_oneshot, dst);
+
+        // Second call hits cached layer spans directly.
+        let mut dst2 = vec![0u8; 8192];
+        assert!(pool.load_cached_layer_into(0, &mut dst2).unwrap());
+        assert_eq!(dst2, dst);
+        assert!(pool.stats().bytes_read > 0);
+        assert!(pool.stats().span_reads >= 2);
+
+        // Undersized destination buffer fails with typed OutOfBounds.
+        let mut too_small = vec![0u8; 4096];
+        let err = pool.load_cached_layer_into(0, &mut too_small).unwrap_err();
+        assert!(matches!(err, GgufIoError::OutOfBounds(_)));
+
+        // Storage probes succeed on real files/directories.
+        let (mib_s, _direct) = probe_storage_mib_per_s(&shard_path, false).unwrap();
+        assert!(mib_s >= 0.0);
+        assert!(probe_dir_storage_mib_per_s(dir.path()).is_some());
     }
 }
