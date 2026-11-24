@@ -4,11 +4,11 @@ import asyncio
 import atexit
 import contextlib
 import ctypes
-import glob
 import os
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
+from pathlib import Path
 from types import TracebackType
 from typing import Any, override
 
@@ -18,47 +18,49 @@ _DLL_DIR_HANDLES: list[Any] = []
 def _configure_native_backends() -> list[str]:
     """Preload companion CUDA 13 runtimes (if installed) and configure dynamic ggml backend paths."""
     rtld_global = getattr(os, "RTLD_GLOBAL", ctypes.RTLD_GLOBAL)
-    pkg_dir = os.path.dirname(os.path.abspath(__file__))
-    local_backends = os.path.join(pkg_dir, "_backends")
+    pkg_dir = Path(__file__).resolve().parent
+    local_backends = pkg_dir / "_backends"
 
     # On Windows, register `_backends` with the DLL loader so `llama.dll` / `ggml*.dll` resolve.
-    if os.name == "nt" and os.path.isdir(local_backends) and hasattr(os, "add_dll_directory"):
+    if os.name == "nt" and local_backends.is_dir() and hasattr(os, "add_dll_directory"):
         with contextlib.suppress(OSError):
-            _DLL_DIR_HANDLES.append(os.add_dll_directory(local_backends))
+            _DLL_DIR_HANDLES.append(os.add_dll_directory(str(local_backends)))
 
     # On NixOS, store-built `python3` ignores `NIX_LD_LIBRARY_PATH` and `/run/opengl-driver/lib`
     # when `dlopen`ing portable manylinux wheels; preload host C++/Vulkan/CUDA driver libraries if present.
-    nix_host_dirs: list[str] = []
-    for raw_dir in os.environ.get("NIX_LD_LIBRARY_PATH", "").split(os.pathsep):
-        if raw_dir.strip() and os.path.isdir(raw_dir.strip()):
-            nix_host_dirs.append(raw_dir.strip())
-    if os.path.isdir("/run/opengl-driver/lib"):
-        nix_host_dirs.append("/run/opengl-driver/lib")
+    nix_host_dirs = [
+        p
+        for raw_dir in os.environ.get("NIX_LD_LIBRARY_PATH", "").split(os.pathsep)
+        if (stripped := raw_dir.strip()) and (p := Path(stripped)).is_dir()
+    ]
+    opengl_dir = Path("/run/opengl-driver/lib")
+    if opengl_dir.is_dir():
+        nix_host_dirs.append(opengl_dir)
     for lib_name in ("libstdc++.so.6", "libvulkan.so.1", "libcuda.so.1"):
         for host_dir in nix_host_dirs:
-            candidate = os.path.join(host_dir, lib_name)
-            if os.path.isfile(candidate):
+            candidate = host_dir / lib_name
+            if candidate.is_file():
                 with contextlib.suppress(OSError):
-                    ctypes.CDLL(candidate, mode=rtld_global)
+                    ctypes.CDLL(str(candidate), mode=rtld_global)
                 break
 
     # Preload bundled `libggml-base` with RTLD_GLOBAL so companion `layerstream-cuda13`
     # resolves `libggml-base.so.0` even when installed in a separate site-packages tree.
-    if os.path.isdir(local_backends):
+    if local_backends.is_dir():
         for pattern in ("libggml-base.so*", "libggml.so*"):
-            for match in sorted(glob.glob(os.path.join(local_backends, pattern))):
-                if os.path.isfile(match):
+            for match in sorted(local_backends.glob(pattern)):
+                if match.is_file():
                     try:
-                        ctypes.CDLL(match, mode=rtld_global)
+                        ctypes.CDLL(str(match), mode=rtld_global)
                         break
                     except OSError:
                         continue
 
     dirs: list[str] = []
 
-    def _add(p: str | None) -> None:
-        if p and os.path.isdir(p) and p not in dirs:
-            dirs.append(p)
+    def _add(p: str | Path | None) -> None:
+        if p and Path(p).is_dir() and (s := str(p)) not in dirs:
+            dirs.append(s)
 
     existing_list = os.environ.get("LAYERSTREAM_BACKEND_DIRS", "").strip()
     if existing_list:
@@ -551,7 +553,7 @@ class AutoModel:
 
     def save_state(self, path: str | PathLike[str]) -> int:
         """Persist KV cache memory and committed token sequence to `path` on disk."""
-        raw_path = os.path.abspath(str(os.fspath(path)))
+        raw_path = str(Path(path).resolve())
         if isinstance(self._backend, _NativeAutoModel):
             return int(self._backend.save_state(raw_path))
         res = self._backend.rpc("save_state", {"path": raw_path})
@@ -559,8 +561,9 @@ class AutoModel:
 
     def load_state(self, path: str | PathLike[str]) -> int:
         """Restore a KV cache snapshot and committed token sequence from `path`."""
-        raw_path = os.path.abspath(str(os.fspath(path)))
-        if not os.path.isfile(raw_path):
+        resolved = Path(path).resolve()
+        raw_path = str(resolved)
+        if not resolved.is_file():
             raise FileNotFoundError(f"KV state file not found: '{raw_path}'")
         if isinstance(self._backend, _NativeAutoModel):
             return int(self._backend.load_state(raw_path))
