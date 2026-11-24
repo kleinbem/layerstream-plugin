@@ -670,10 +670,22 @@ def test_isolated_worker_parity_and_process_reap(synthetic_gguf: Path) -> None:
     # Worker process must be completely terminated and reaped after context exit!
     assert not iso.is_loaded
     assert iso.worker_pid is None
-    with pytest.raises(OSError) as exc_info:
-        os.kill(pid, 0)
-    assert isinstance(exc_info.value, ProcessLookupError) or (
-        os.name == "nt" and getattr(exc_info.value, "winerror", None) == 87
+    # On Windows, process teardown after handle close can take a few milliseconds
+    # before `os.kill(pid, 0)` observes the exited PID.
+    deadline = time.monotonic() + (3.0 if os.name == "nt" else 0.5)
+    last_err: OSError | None = None
+    while True:
+        try:
+            os.kill(pid, 0)
+        except OSError as exc:
+            last_err = exc
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    assert last_err is not None, f"worker pid {pid} still alive after context exit"
+    assert isinstance(last_err, ProcessLookupError) or (
+        os.name == "nt" and getattr(last_err, "winerror", None) == 87
     )
 
 
