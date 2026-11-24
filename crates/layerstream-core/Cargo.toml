@@ -11,7 +11,7 @@ workspace = true
 
 [features]
 default = []
-hf = ["dep:sha2", "dep:ureq"]
+hf = ["dep:hf-gguf"]
 vulkan = []
 cuda = []
 metal = []
@@ -22,14 +22,13 @@ python-stage-backends = []
 anyhow.workspace = true
 getrandom.workspace = true
 gguf-direct-io = { path = "../gguf-direct-io" }
+hf-gguf = { path = "../hf-gguf", optional = true }
 json-schema-gbnf = { path = "../json-schema-gbnf" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
-ureq = { workspace = true, optional = true }
 
 [build-dependencies]
 cc = "1"

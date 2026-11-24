@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/gguf-direct-io",
+    "crates/hf-gguf",
     "crates/json-schema-gbnf",
     "crates/layerstream-core",
     "crates/layerstream-server",
