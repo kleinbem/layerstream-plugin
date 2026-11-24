@@ -145,8 +145,14 @@ jobs:
           CXXFLAGS: "-fsanitize=thread -fno-omit-frame-pointer"
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: g++-14
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-Wl,--no-as-needed -C link-arg=-ltsan"
-          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1:suppressions=/tmp/tsan.supp"
         run: |
+          cat > /tmp/tsan.supp <<'EOF'
+          # Rust's prebuilt stdlib (libtest mpmc channel) is not compiled with
+          # -Zsanitizer=thread, so TSan sees its memcpy without its atomics.
+          race:std::sync::mpmc
+          race:core::profiling::compiler_copy
+          EOF
           TSAN_SO="$(g++-14 -print-file-name=libtsan.so)"
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="setarch x86_64 -R env LD_PRELOAD=${TSAN_SO}" \
             cargo test --locked --target x86_64-unknown-linux-gnu -p layerstream-core --test parity_test -- --test-threads 1
