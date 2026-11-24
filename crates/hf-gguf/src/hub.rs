@@ -536,6 +536,19 @@ pub fn resolve_pretrained_model(
     spec: &str,
     opts: &PretrainedResolveOptions,
 ) -> Result<ResolvedModel> {
+    resolve_pretrained_model_with_probe(spec, opts, || None)
+}
+
+/// Same as [`resolve_pretrained_model`], accepting a caller-supplied GPU free-VRAM probe
+/// (returning free bytes) when `opts.use_gpu` is true and `opts.vram_budget_bytes` is unset.
+pub fn resolve_pretrained_model_with_probe<F>(
+    spec: &str,
+    opts: &PretrainedResolveOptions,
+    probe_free_vram: F,
+) -> Result<ResolvedModel>
+where
+    F: FnOnce() -> Option<u64>,
+{
     let trimmed = spec.trim();
     if trimmed.is_empty() {
         bail!("model specification must not be empty");
@@ -625,7 +638,7 @@ pub fn resolve_pretrained_model(
         .filter(|&b| b > 0)
         .or_else(|| {
             if opts.use_gpu {
-                crate::StreamEngine::probe_gpu_memory(true).map(|(free, _)| free)
+                probe_free_vram()
             } else {
                 None
             }
@@ -633,7 +646,7 @@ pub fn resolve_pretrained_model(
         .unwrap_or(4 * 1024 * 1024 * 1024);
 
     let _ = fs::create_dir_all(&cache_root);
-    let storage_bw = crate::probe_dir_storage_mib_per_s(&cache_root).unwrap_or(1500.0);
+    let storage_bw = gguf_direct_io::probe_dir_storage_mib_per_s(&cache_root).unwrap_or(1500.0);
 
     let recs = recommend_candidates(
         &effective_repo,
@@ -706,10 +719,33 @@ pub fn resolve_auto_draft_model(
     use_gpu: bool,
     on_progress: Option<ProgressCallback>,
 ) -> Result<Option<ResolvedModel>> {
+    resolve_auto_draft_model_with_probe(
+        target,
+        cache_dir,
+        vram_budget_bytes,
+        use_gpu,
+        on_progress,
+        || None,
+    )
+}
+
+/// Same as [`resolve_auto_draft_model`], accepting a caller-supplied GPU free-VRAM probe
+/// (returning free bytes) when `use_gpu` is true and `vram_budget_bytes` is unset.
+pub fn resolve_auto_draft_model_with_probe<F>(
+    target: &ResolvedModel,
+    cache_dir: Option<PathBuf>,
+    vram_budget_bytes: Option<u64>,
+    use_gpu: bool,
+    on_progress: Option<ProgressCallback>,
+    probe_free_vram: F,
+) -> Result<Option<ResolvedModel>>
+where
+    F: FnOnce() -> Option<u64>,
+{
     const MIN_AUTO_DRAFT_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
     const MIN_AUTO_DRAFT_FREE_VRAM_BYTES: u64 = 1536 * 1024 * 1024;
 
-    let Ok(idx) = crate::GgufIndex::open(&target.local_path) else {
+    let Ok(idx) = gguf_direct_io::GgufIndex::open(&target.local_path) else {
         return Ok(None);
     };
     if idx.meta.total_file_bytes < MIN_AUTO_DRAFT_TARGET_BYTES {
@@ -719,7 +755,7 @@ pub fn resolve_auto_draft_model(
     if use_gpu {
         let avail = vram_budget_bytes
             .filter(|&b| b > 0)
-            .or_else(|| crate::StreamEngine::probe_gpu_memory(true).map(|(f, _)| f));
+            .or_else(probe_free_vram);
         if let Some(free_b) = avail {
             if free_b < MIN_AUTO_DRAFT_FREE_VRAM_BYTES {
                 return Ok(None);
@@ -795,7 +831,7 @@ pub fn resolve_auto_draft_model(
     };
 
     if let Err(reason) =
-        crate::check_gguf_draft_compatible(&target.local_path, &resolved.local_path)
+        gguf_direct_io::check_gguf_draft_compatible(&target.local_path, &resolved.local_path)
     {
         tracing::warn!(
             draft_repo,
