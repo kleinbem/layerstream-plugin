@@ -799,7 +799,43 @@ pub struct WorkerStream {
     summary: Option<GenerateSummary>,
 }
 
+/// Thread-safe handle that cancels an active `WorkerStream` even while another thread
+/// holds the stream inside `next_chunk()`.
+#[derive(Clone)]
+pub struct WorkerCancelHandle {
+    state: Arc<Mutex<WorkerState>>,
+    send_lock: Arc<Mutex<()>>,
+    req_id: u64,
+}
+
+impl WorkerCancelHandle {
+    /// Sends a non-blocking cancel RPC to the isolated worker for this stream's request ID.
+    pub fn cancel(&self) -> bool {
+        let _send_guard = self.send_lock.lock().expect("worker send lock poisoned");
+        let mut st = self.state.lock().expect("worker state lock poisoned");
+        let cancel_id = st.alloc_id();
+        if let Some(sock) = st.sock_writer.as_mut() {
+            send_json_line(
+                sock,
+                &json!({"id": cancel_id, "op": "cancel", "params": {"target_id": self.req_id}}),
+            )
+            .is_ok()
+        } else {
+            false
+        }
+    }
+}
+
 impl WorkerStream {
+    /// Returns a lock-free-of-stream handle that can cancel this stream during a pending read.
+    pub fn cancel_handle(&self) -> WorkerCancelHandle {
+        WorkerCancelHandle {
+            state: Arc::clone(&self.state),
+            send_lock: Arc::clone(&self.send_lock),
+            req_id: self.req_id,
+        }
+    }
+
     pub fn summary(&self) -> Option<GenerateSummary> {
         self.summary.clone()
     }

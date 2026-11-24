@@ -1832,6 +1832,8 @@ fn map_worker_err(err: anyhow::Error) -> PyErr {
 #[pyclass(name = "NativeWorkerStream")]
 struct PyWorkerStream {
     inner: Mutex<Option<WorkerStream>>,
+    cancel_handle: layerstream_core::worker_ipc::WorkerCancelHandle,
+    closed: AtomicBool,
 }
 
 #[pymethods]
@@ -1841,6 +1843,9 @@ impl PyWorkerStream {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         let mut guard = self
             .inner
             .lock()
@@ -1854,14 +1859,29 @@ impl PyWorkerStream {
             let next = stream.next_chunk();
             (stream, next)
         });
-        let (stream, next) = res;
+        let (mut stream, next) = res;
+        let was_closed = self.closed.load(Ordering::SeqCst);
+        if was_closed {
+            stream = py.detach(move || {
+                stream.close();
+                stream
+            });
+        }
         if let Ok(mut guard) = self.inner.lock() {
             *guard = Some(stream);
+        }
+        if was_closed {
+            return Ok(None);
         }
         next.map_err(map_worker_err)
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        let cancel_handle = self.cancel_handle.clone();
+        py.detach(move || {
+            let _ = cancel_handle.cancel();
+        });
         let mut guard = self
             .inner
             .lock()
@@ -2102,8 +2122,11 @@ impl PyWorkerClient {
         let stream = py
             .detach(move || client.generate_stream(&prompt, &params))
             .map_err(map_worker_err)?;
+        let cancel_handle = stream.cancel_handle();
         Ok(PyWorkerStream {
             inner: Mutex::new(Some(stream)),
+            cancel_handle,
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -2121,8 +2144,11 @@ impl PyWorkerClient {
         let stream = py
             .detach(move || client.chat_stream(&msgs, &params))
             .map_err(map_worker_err)?;
+        let cancel_handle = stream.cancel_handle();
         Ok(PyWorkerStream {
             inner: Mutex::new(Some(stream)),
+            cancel_handle,
+            closed: AtomicBool::new(false),
         })
     }
 
