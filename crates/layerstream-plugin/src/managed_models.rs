@@ -350,6 +350,12 @@ pub async fn prepare_managed_models(
 
     let total = plans.len();
     for (idx, plan) in plans.iter().enumerate() {
+        if registry.get(&plan.advertised_id).is_some() {
+            bail!(
+                "managed model ID '{}' collides with an already registered CLI model; set a distinct [models.options].alias or remove the duplicate --model",
+                plan.advertised_id
+            );
+        }
         if !plan.lifecycle.prefetch {
             tracing::info!(
                 model = %plan.configured_model,
@@ -382,6 +388,39 @@ pub async fn prepare_managed_models(
                     plan.configured_model, plan.primary_file
                 )
             })?;
+
+        let primary_parent = primary_path.parent();
+        for req_file in &plan.asset_plan.files {
+            let shard_path = assets.files.get(req_file).with_context(|| {
+                format!(
+                    "host asset response for '{}' omitted requested file '{req_file}'",
+                    plan.configured_model
+                )
+            })?;
+            if !shard_path.is_file() {
+                bail!(
+                    "host asset file '{req_file}' for '{}' does not exist at {}",
+                    plan.configured_model,
+                    shard_path.display()
+                );
+            }
+            let is_draft =
+                matches!(&plan.draft_source, ManagedDraftSource::AssetFile(df) if df == req_file);
+            if !is_draft
+                && req_file != &plan.primary_file
+                && shard_path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+                && shard_path.parent() != primary_parent
+            {
+                bail!(
+                    "host asset shard '{req_file}' ({}) for '{}' is not colocated with primary GGUF {}",
+                    shard_path.display(),
+                    plan.configured_model,
+                    primary_path.display()
+                );
+            }
+        }
 
         let draft_path = match &plan.draft_source {
             ManagedDraftSource::AssetFile(file) => {
