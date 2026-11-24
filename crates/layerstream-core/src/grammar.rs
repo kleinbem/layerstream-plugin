@@ -352,13 +352,12 @@ impl<'a> SchemaCompiler<'a> {
 
     /// Compiles `node`, returning `Ok(None)` when the schema branch is unsatisfiable (`false`).
     fn compile_value(&mut self, node: &Value, hint: &str) -> Result<Option<String>> {
-        match node {
+        let obj = match node {
             Value::Bool(true) => return Ok(Some("json-value".to_string())),
             Value::Bool(false) => return Ok(None),
-            Value::Object(_) => {}
+            Value::Object(obj) => obj,
             _ => bail!("invalid JSON Schema node at '{hint}': expected object or boolean"),
-        }
-        let obj = node.as_object().unwrap();
+        };
         validate_supported_keywords(obj, hint)?;
 
         if let Some(ref_val) = obj.get("$ref") {
@@ -679,15 +678,13 @@ impl<'a> SchemaCompiler<'a> {
     ) -> Result<Option<Value>> {
         let da = self.deref_shallow_with_seen(a, seen)?;
         let db = self.deref_shallow_with_seen(b, seen)?;
-        match (&da, &db) {
+        let (oa, ob) = match (&da, &db) {
             (Value::Bool(false), _) | (_, Value::Bool(false)) => return Ok(None),
             (Value::Bool(true), other) => return Ok(Some(other.clone())),
             (other, Value::Bool(true)) => return Ok(Some(other.clone())),
-            (Value::Object(_), Value::Object(_)) => {}
+            (Value::Object(oa), Value::Object(ob)) => (oa, ob),
             _ => bail!("invalid JSON Schema node during intersection at '{hint}'"),
-        }
-        let oa = da.as_object().unwrap();
-        let ob = db.as_object().unwrap();
+        };
         validate_supported_keywords(oa, hint)?;
         validate_supported_keywords(ob, hint)?;
 
@@ -1365,9 +1362,9 @@ impl<'a> SchemaCompiler<'a> {
         // or when `properties` is absent (`additionalProperties` defaults to `true` in JSON Schema!).
         // Wait: when `additionalProperties` is `None` (unspecified), JSON Schema allows extra keys, EXCEPT
         // extra keys must NEVER match any declared key in `all_known_keys` (including `\uXXXX` spellings)!
-        let allow_extra_keys = !matches!(addl, Some(Value::Bool(false))) && addl_val_expr.is_some();
-        let addl_kv_rule = if allow_extra_keys {
-            let aval = addl_val_expr.as_ref().unwrap();
+        let addl_kv_rule = if !matches!(addl, Some(Value::Bool(false)))
+            && let Some(aval) = addl_val_expr.as_ref()
+        {
             let key_rule =
                 self.compile_string_excluding_keys(&all_known_keys, &format!("{hint}-addl-key"));
             let kv = format!("{key_rule} \":\" ws {aval}");
@@ -2337,7 +2334,9 @@ fn parse_gbnf_expr(expr: &str) -> Vec<Vec<GbnfItem>> {
             } else {
                 item
             };
-            alts.last_mut().unwrap().push(wrapped);
+            if let Some(last) = alts.last_mut() {
+                last.push(wrapped);
+            }
         }
         alts
     }

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! End-to-end Mesh-LLM plugin IPC protocol tests against the real `layerstream-plugin` binary
 //! (modeled on official Mesh-LLM plugin protocol/lifecycle suites).
 

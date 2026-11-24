@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! Real-binary integration tests for `layerstream-plugin _worker` and isolated coordinator mode.
 
 #![cfg(unix)]
