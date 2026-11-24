@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! Lifecycle, cancellation, queue-admission, and non-blocking `hf://` pull integration tests
 //! against the real `layerstream-plugin` binary with a mock Mesh-LLM host.
 //!

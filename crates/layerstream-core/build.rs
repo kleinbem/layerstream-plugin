@@ -9,7 +9,9 @@ fn resolve_llama_cpp_dir() -> PathBuf {
         }
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let manifest_dir = PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo"),
+    );
     let local_vendor = manifest_dir.join("../../third_party/llama.cpp");
     if local_vendor.join("CMakeLists.txt").is_file() {
         return local_vendor;
@@ -433,7 +435,9 @@ fn main() {
             stage_shared_libs(&shared_libs, Path::new(&custom_stage));
         }
         if env::var("CARGO_FEATURE_PYTHON_STAGE_BACKENDS").is_ok() {
-            let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+            let manifest_dir = PathBuf::from(
+                env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo"),
+            );
             let py_stage = manifest_dir.join("../../bindings/python/python/layerstream/_backends");
             stage_python_wheel_backends(&shared_libs, &py_stage, &target_os);
         }

@@ -2,8 +2,12 @@
 name = "layerstream-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Zero-patch llama.cpp ping-pong GPU layer streaming core with O_DIRECT GGUF reader"
+
+[lints]
+workspace = true
 
 [features]
 default = []

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! Pure unit tests covering review findings:
 //! - P1-2: padded-vocab draft compatibility (`152,064` vs `151,936`)
 //! - P1-3: unbiased speculative rejection sampling (`eval_sample` vs `eval_verify_sample`, TV < 0.005)

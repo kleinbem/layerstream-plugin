@@ -387,9 +387,9 @@ impl StreamEngine {
         let c_strings: Vec<(CString, CString)> = messages
             .iter()
             .map(|m| {
-                let role = CString::new(m.role.as_bytes())
-                    .unwrap_or_else(|_| CString::new("user").unwrap());
-                let content = CString::new(m.content.replace('\0', "")).unwrap();
+                let role = CString::new(m.role.as_bytes()).unwrap_or_else(|_| c"user".to_owned());
+                let content = CString::new(m.content.replace('\0', ""))
+                    .expect("NUL bytes already stripped from chat content");
                 (role, content)
             })
             .collect();
@@ -1415,13 +1415,12 @@ impl GrammarHandle {
     fn create(eng: NonNull<LsEngine>, grammar_str: &str) -> Result<Self> {
         let c_grammar =
             CString::new(grammar_str).context("GBNF grammar contains interior NUL byte")?;
-        let c_root = CString::new("root").unwrap();
         let mut err_buf = [0 as c_char; 512];
         let ptr = unsafe {
             ls_grammar_create(
                 eng.as_ptr(),
                 c_grammar.as_ptr(),
-                c_root.as_ptr(),
+                c"root".as_ptr(),
                 err_buf.as_mut_ptr(),
                 err_buf.len(),
             )
