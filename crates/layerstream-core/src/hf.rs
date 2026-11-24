@@ -649,8 +649,10 @@ fn download_with_resume(
 
     let lock_path = lock_path_for(dest);
     let lock_key = lock_path
-        .canonicalize()
-        .unwrap_or_else(|_| lock_path.clone());
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .and_then(|p| lock_path.file_name().map(|name| p.join(name)))
+        .unwrap_or_else(|| lock_path.clone());
     let inserted = ACTIVE_THREAD_PART_LOCKS.with(|set| set.borrow_mut().insert(lock_key.clone()));
     if !inserted {
         bail!(
@@ -685,9 +687,15 @@ fn download_with_resume(
     let mut existing_len = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
     let saved_meta = read_part_meta(&meta_path);
 
-    // Never resume a partial file without a matching saved ETag: if the upstream file changed
-    // between runs, resuming blindly would silently splice two incompatible GGUF versions.
-    let mut resume_etag = if existing_len > 0 && saved_meta.etag.is_some() {
+    // Never resume a partial file without a strong ETag or a trusted SHA-256 digest: weak ETags
+    // (`W/"..."`) are omitted from `If-Range`, so resuming on a weak ETag alone without a digest
+    // could silently splice bytes from two incompatible GGUF representations.
+    let has_strong_etag = saved_meta
+        .etag
+        .as_deref()
+        .is_some_and(|e| !e.trim_start().starts_with("W/"));
+    let can_resume = existing_len > 0 && (has_strong_etag || saved_meta.sha256.is_some());
+    let mut resume_etag = if can_resume {
         saved_meta.etag.clone()
     } else {
         if existing_len > 0 {
@@ -791,7 +799,8 @@ fn download_with_resume(
         status = resp.status().as_u16();
     }
 
-    if status != 200 && status != 206 {
+    if (existing_len == 0 && status != 200) || (existing_len > 0 && status != 200 && status != 206)
+    {
         bail!(
             "Hugging Face download failed for hf://{}:{} (HTTP {status} from {url})",
             spec.repo_id,

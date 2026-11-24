@@ -195,25 +195,27 @@ impl Default for WorkerGenParams {
 }
 
 impl WorkerGenParams {
-    fn to_generate_options(&self, default_max_draft: usize) -> GenerateOptions {
-        GenerateOptions {
+    fn to_generate_options(&self, default_max_draft: usize) -> Result<GenerateOptions> {
+        let sample = LsSampleParams {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            top_k: self.top_k,
+            repeat_penalty: self.repeat_penalty,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            penalty_last_n: self.penalty_last_n,
+            seed: self.seed,
+        };
+        sample.validate().map_err(|msg| anyhow!("{msg}"))?;
+        Ok(GenerateOptions {
             max_tokens: self.max_tokens,
-            sample: LsSampleParams {
-                temperature: self.temperature,
-                top_p: self.top_p,
-                min_p: self.min_p,
-                top_k: self.top_k,
-                repeat_penalty: self.repeat_penalty,
-                frequency_penalty: self.frequency_penalty,
-                presence_penalty: self.presence_penalty,
-                penalty_last_n: self.penalty_last_n,
-                seed: self.seed,
-            },
+            sample,
             stop: self.stop.clone(),
             enable_ngram_speculation: self.ngram_speculation,
             max_draft_tokens: self.max_draft_tokens.unwrap_or(default_max_draft).max(1),
             grammar: self.grammar.clone(),
-        }
+        })
     }
 }
 
@@ -736,7 +738,7 @@ impl WorkerClient {
 
     /// Gracefully shut down, kill if necessary, and reap the isolated worker process.
     pub fn unload(&self) {
-        let (child_opt, reader_opt) = {
+        let (child_opt, stdin_opt, reader_opt) = {
             let _send_guard = self.send_lock.lock().expect("worker send lock poisoned");
             let mut st = self.state.lock().expect("worker state lock poisoned");
             st.loaded = false;
@@ -745,11 +747,16 @@ impl WorkerClient {
                     send_json_line(&mut sock, &json!({"id": 0, "op": "shutdown", "params": {}}));
                 let _ = sock.shutdown(std::net::Shutdown::Both);
             }
-            // Drop stdin pipe so child's stdin-EOF watchdog fires immediately.
-            st.child_stdin.take();
             st.pending_rpc.clear();
             st.active_streams.clear();
-            (st.child.take(), st.reader_thread.take())
+            // Keep `child_stdin` open while waiting for graceful exit so the child's
+            // parent-death watchdog does not race `std::process::exit(0)` against
+            // native GPU/Vulkan teardown on the engine thread.
+            (
+                st.child.take(),
+                st.child_stdin.take(),
+                st.reader_thread.take(),
+            )
         };
 
         if let Some(mut child) = child_opt {
@@ -768,6 +775,7 @@ impl WorkerClient {
                 }
             }
         }
+        drop(stdin_opt);
 
         if let Some(handle) = reader_opt {
             let _ = handle.join();
@@ -941,7 +949,10 @@ fn reader_loop(mut reader: BufReader<TcpStream>, state: Arc<Mutex<WorkerState>>)
         }));
     }
     for (_, tx) in st.active_streams.drain() {
-        let _ = tx.send(WorkerStreamEvent::Done(None));
+        let _ = tx.send(WorkerStreamEvent::Error(WorkerError::new(
+            "RuntimeError",
+            "isolated worker process terminated unexpectedly",
+        )));
     }
 }
 
@@ -964,15 +975,30 @@ pub fn run_worker_server(port: u16) -> Result<()> {
         bail!("missing worker auth token on stdin");
     }
 
-    // Exit immediately if parent dies and closes stdin pipe.
+    // Exit if parent dies unexpectedly and closes stdin pipe, without racing
+    // `std::process::exit(0)` against normal engine/GPU teardown on clean shutdown.
+    let clean_shutdown = Arc::new(AtomicBool::new(false));
+    let watchdog_shutdown = Arc::clone(&clean_shutdown);
     thread::Builder::new()
         .name("layerstream-parent-watchdog".to_string())
-        .spawn(|| {
+        .spawn(move || {
             let mut buf = [0u8; 64];
             let mut stdin = std::io::stdin();
             loop {
                 match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => std::process::exit(0),
+                    Ok(0) | Err(_) => {
+                        // Brief grace window in case stdin closed right before TCP shutdown/EOF.
+                        for _ in 0..10 {
+                            if watchdog_shutdown.load(Ordering::Acquire) {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        if watchdog_shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::process::exit(0);
+                    }
                     Ok(_) => {}
                 }
             }
@@ -1033,6 +1059,7 @@ pub fn run_worker_server(port: u16) -> Result<()> {
         }
     }
 
+    clean_shutdown.store(true, Ordering::Release);
     {
         let cs = cancel_state.lock().expect("cancel state lock poisoned");
         for flag in cs.1.values() {
@@ -1235,7 +1262,7 @@ fn worker_engine_loop(
                                 cs.1.insert(req_id, Arc::clone(&cancel_flag));
                             }
 
-                            let gen_opts = gp.to_generate_options(sess.default_max_draft_tokens);
+                            let gen_opts = gp.to_generate_options(sess.default_max_draft_tokens)?;
                             let mut collected = String::new();
                             let gen_res = sess.engine.generate_stream_with_cancel(
                                 &prompt,

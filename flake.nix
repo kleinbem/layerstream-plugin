@@ -103,7 +103,7 @@
             packages =
               commonPackages
               ++ (with pkgs; [
-                (python3.withPackages (
+                (python314.withPackages (
                   ps: with ps; [
                     pytest
                     pytest-asyncio

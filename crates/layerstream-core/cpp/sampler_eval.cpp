@@ -566,13 +566,21 @@ int ls_engine_eval_sample(
     }
 
     const int32_t n_vocab = llama_vocab_n_tokens(ls_internal::engine_vocab(eng));
-    *out_next_token = ls_sample_from_logits_with_history(
-        logits,
-        n_vocab,
-        sample_params,
-        penalty_tokens,
-        n_penalty_tokens
-    );
+    try {
+        *out_next_token = ls_sample_from_logits_with_history(
+            logits,
+            n_vocab,
+            sample_params,
+            penalty_tokens,
+            n_penalty_tokens
+        );
+    } catch (const std::exception & e) {
+        ls_internal::set_error(err_buf, err_cap, std::string("sampling failed: ") + e.what());
+        return -5;
+    } catch (...) {
+        ls_internal::set_error(err_buf, err_cap, "sampling failed with unknown exception");
+        return -5;
+    }
     return 0;
 }
 

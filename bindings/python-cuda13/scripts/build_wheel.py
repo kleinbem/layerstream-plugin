@@ -27,8 +27,8 @@ def resolve_llama_dir(pkg_root: Path) -> Path:
 def default_cuda_archs() -> str:
     arch = platform.machine().lower()
     if arch in ("aarch64", "arm64"):
-        # Ampere+ only: native Jetson Orin (sm_87) and DGX Spark GB10 (sm_121a) SASS plus Hopper PTX.
-        return "87-real;90-virtual;121a-real"
+        # Ampere+ only: native Jetson Orin (sm_87) and DGX Spark GB10 (sm_121a) SASS plus Ampere/Hopper PTX.
+        return "80-virtual;87-real;90-virtual;121a-real"
     # Ampere+ only: native Ada (sm_89) and Blackwell FP4/MMA (sm_120a) SASS plus Ampere/Hopper PTX.
     return "80-virtual;89-real;90-virtual;120a-real"
 

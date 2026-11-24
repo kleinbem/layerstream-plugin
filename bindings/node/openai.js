@@ -707,3 +707,4 @@ class OpenAI {
 }
 
 export { ChatCompletionStream, CompletionStream, OpenAI };
+export default OpenAI;

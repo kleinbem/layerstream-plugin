@@ -1375,7 +1375,7 @@ pub fn probe_dir_storage_mib_per_s(dir: &std::path::Path) -> Option<f64> {
     probe_storage_mib_per_s(&tmp_path, true)
         .ok()
         .map(|(mib_s, _)| mib_s)
-        .filter(|&bw| bw >= 10.0)
+        .filter(|&bw| bw.is_finite() && bw > 0.0)
 }
 
 #[cfg(test)]
