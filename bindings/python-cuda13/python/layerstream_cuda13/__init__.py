@@ -1,16 +1,16 @@
 """CUDA 13 dynamic backend plugin package for `layerstream`."""
 
 import ctypes
-import glob
 import importlib.util
 import os
+from pathlib import Path
 
 __version__ = "0.4.1"
 
 
 def backend_dir() -> str:
     """Return the directory containing `libggml-cuda.so`."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "_backends")
+    return str(Path(__file__).resolve().parent / "_backends")
 
 
 # Workaround: PyPI `nvidia-cuda-runtime` and `nvidia-cublas` (CUDA 13) install shared libraries
@@ -33,12 +33,14 @@ def preload_nvidia_libraries() -> list[str]:
         if spec is None or not spec.submodule_search_locations:
             continue
         for root in spec.submodule_search_locations:
-            lib_dir = os.path.join(root, "lib")
-            for match in sorted(glob.glob(os.path.join(lib_dir, pattern))):
-                if os.path.isfile(match):
+            lib_dir = Path(root) / "lib"
+            if not lib_dir.is_dir():
+                continue
+            for match in sorted(lib_dir.glob(pattern)):
+                if match.is_file():
                     try:
-                        ctypes.CDLL(match, mode=rtld_global)
-                        loaded.append(match)
+                        ctypes.CDLL(str(match), mode=rtld_global)
+                        loaded.append(str(match))
                         break
                     except OSError:
                         continue
