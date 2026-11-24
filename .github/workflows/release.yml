@@ -34,7 +34,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Verify tag matches workspace, plugin, Python, and Node versions
         if: startsWith(github.ref, 'refs/tags/v')
@@ -58,7 +58,7 @@ jobs:
           test "$tag_ver" = "$node_pkg_ver"
 
       - name: Checkout pinned llama.cpp
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
           ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
@@ -142,7 +142,7 @@ jobs:
           Expand-Archive -Path "$stable.zip" -DestinationPath "smoke-extract" -Force
           .\smoke-extract\layerstream\layerstream.exe --help
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: layerstream-${{ matrix.target }}
           path: |
@@ -186,10 +186,10 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Checkout pinned llama.cpp
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
           ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
@@ -240,7 +240,7 @@ jobs:
             ln -sf /opt/vk/bin/glslc /opt/vk/bin/cmake /opt/vk/bin/ninja /usr/local/bin/
           args: ${{ matrix.args }}
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
 
@@ -274,7 +274,7 @@ jobs:
             done
           )
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: layerstream-python-${{ matrix.target }}
           path: |
@@ -298,10 +298,10 @@ jobs:
             wheel_plat: manylinux_2_34_aarch64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Checkout pinned llama.cpp
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
           ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
@@ -333,7 +333,7 @@ jobs:
             '
           sudo chown -R "$(id -u):$(id -g)" bindings/python-cuda13/dist bindings/python-cuda13/build bindings/python-cuda13/python/layerstream_cuda13/_backends || true
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
 
@@ -349,7 +349,7 @@ jobs:
             done
           )
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: layerstream-python-cuda13-${{ matrix.target }}
           path: |
@@ -376,10 +376,10 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Checkout pinned llama.cpp
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
           ref: 7d9b931df9bb7c689f067a7fed23e7f5253951f6
@@ -430,7 +430,7 @@ jobs:
             done
           )
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: layerstream-node-release-${{ matrix.napi_triple }}
           path: |
@@ -450,7 +450,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
@@ -495,14 +495,14 @@ jobs:
         run: |
           echo "Skipping PyPI upload because vars.PYPI_PUBLISH is not set to 'true' in repository, org, or pypi environment."
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: vars.PYPI_PUBLISH == 'true'
         with:
           pattern: layerstream-python-*
           path: pypi-dist
           merge-multiple: true
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: vars.PYPI_PUBLISH == 'true'
         with:
           python-version: "3.14"
