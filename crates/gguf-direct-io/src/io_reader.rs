@@ -17,13 +17,24 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
+use parking_lot::{Condvar, Mutex};
+use quick_cache::{Weighter, unsync::Cache as QuickCache};
 
-use crate::ffi::LsSpanSlice;
 use crate::gguf_index::{CoalescedSpan, DIRECT_IO_ALIGN, GgufIndex, ResolvedTensorLoc, align_up};
+
+/// C-ABI-compatible slice descriptor returned by zero-copy `load_layer_direct_into`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirectSpanSlice {
+    pub src_offset: u64,
+    pub dst_offset: u64,
+    pub len: u64,
+    pub tensor_idx: u32,
+}
 
 const PARALLEL_READ_MIN_BYTES: usize = 4 * 1024 * 1024;
 /// Default staging chunk size for fallback O_DIRECT pread (full-layer 256 MiB spans
@@ -128,64 +139,31 @@ struct SliceKey {
     len: usize,
 }
 
-struct LruEntry {
-    key: SliceKey,
-    data: Vec<u8>,
-    prev: Option<usize>,
-    next: Option<usize>,
+#[derive(Clone, Copy)]
+struct SliceByteWeighter;
+
+impl Weighter<SliceKey, Vec<u8>> for SliceByteWeighter {
+    fn weight(&self, _key: &SliceKey, val: &Vec<u8>) -> u64 {
+        val.len() as u64
+    }
 }
 
-/// Bounded O(1) scan-resistant LFU-LRU cache of raw immutable GGUF expert slices in host RAM.
+/// Bounded scan-resistant S3-FIFO cache of raw immutable GGUF expert slices in host RAM.
 ///
 /// Sparse MoE routing is heavily Zipfian, and on large MoE models (e.g., 30B-A3B) a single
-/// token sweep can exceed the RAM cache budget. Pure LRU scan-thrashes to ~0% hit rate when
-/// `budget < 1 sweep`, so admission compares frequency counts (`freq[incoming] > freq[victim]`)
-/// across the LRU tail window and decays counts periodically to adapt to topic shifts.
-struct ExpertSliceLru {
+/// token sweep can exceed the RAM cache budget. `quick_cache`'s S3-FIFO policy resists
+/// cyclic scan thrashing while enforcing an exact byte-weight budget.
+struct ExpertSliceCache {
     budget_bytes: Option<usize>,
-    used_bytes: usize,
-    head: Option<usize>,
-    tail: Option<usize>,
-    entries: Vec<Option<LruEntry>>,
-    free_slots: Vec<usize>,
-    map: HashMap<SliceKey, usize>,
-    freq: HashMap<SliceKey, u16>,
-    access_ops: u64,
+    cache: Option<QuickCache<SliceKey, Vec<u8>, SliceByteWeighter>>,
 }
 
-impl ExpertSliceLru {
-    const TAIL_SAMPLE_WINDOW: usize = 8;
-    const FREQ_DECAY_INTERVAL: u64 = 32_768;
-
+impl ExpertSliceCache {
     fn new(explicit_budget_bytes: Option<usize>) -> Self {
         Self {
             budget_bytes: explicit_budget_bytes,
-            used_bytes: 0,
-            head: None,
-            tail: None,
-            entries: Vec::new(),
-            free_slots: Vec::new(),
-            map: HashMap::new(),
-            freq: HashMap::new(),
-            access_ops: 0,
+            cache: None,
         }
-    }
-
-    fn bump_freq(&mut self, key: SliceKey) -> u16 {
-        self.access_ops = self.access_ops.wrapping_add(1);
-        if self.access_ops.is_multiple_of(Self::FREQ_DECAY_INTERVAL) {
-            self.freq.retain(|_, v| {
-                *v >>= 1;
-                *v > 0
-            });
-        }
-        let count = self.freq.entry(key).or_insert(0);
-        *count = count.saturating_add(1);
-        *count
-    }
-
-    fn key_freq(&self, key: SliceKey) -> u16 {
-        self.freq.get(&key).copied().unwrap_or(0)
     }
 
     fn ensure_budget(&mut self) -> usize {
@@ -203,58 +181,20 @@ impl ExpertSliceLru {
         auto_bytes
     }
 
-    fn detach(&mut self, idx: usize) {
-        let (prev, next) = {
-            let e = self.entries[idx].as_ref().expect("valid LRU slot");
-            (e.prev, e.next)
-        };
-        if let Some(p) = prev {
-            self.entries[p].as_mut().expect("valid prev").next = next;
-        } else {
-            self.head = next;
+    fn ensure_cache(&mut self) -> Option<&mut QuickCache<SliceKey, Vec<u8>, SliceByteWeighter>> {
+        let budget = self.ensure_budget();
+        if budget == 0 {
+            return None;
         }
-        if let Some(n) = next {
-            self.entries[n].as_mut().expect("valid next").prev = prev;
-        } else {
-            self.tail = prev;
-        }
-        let e = self.entries[idx].as_mut().expect("valid LRU slot");
-        e.prev = None;
-        e.next = None;
-    }
-
-    fn push_front(&mut self, idx: usize) {
-        let old_head = self.head;
-        {
-            let e = self.entries[idx].as_mut().expect("valid LRU slot");
-            e.prev = None;
-            e.next = old_head;
-        }
-        if let Some(h) = old_head {
-            self.entries[h].as_mut().expect("valid head").prev = Some(idx);
-        } else {
-            self.tail = Some(idx);
-        }
-        self.head = Some(idx);
+        Some(self.cache.get_or_insert_with(|| {
+            // Estimate ~256 KiB per expert slice (min 16 slots for small unit-test budgets).
+            let est_items = (budget / (256 * 1024)).max(16);
+            QuickCache::with_weighter(est_items, budget as u64, SliceByteWeighter)
+        }))
     }
 
     fn get_and_touch(&mut self, key: SliceKey) -> Option<&[u8]> {
-        let idx = *self.map.get(&key)?;
-        self.bump_freq(key);
-        if self.head != Some(idx) {
-            self.detach(idx);
-            self.push_front(idx);
-        }
-        self.entries[idx].as_ref().map(|e| e.data.as_slice())
-    }
-
-    fn evict_slot(&mut self, idx: usize) {
-        self.detach(idx);
-        if let Some(entry) = self.entries[idx].take() {
-            self.map.remove(&entry.key);
-            self.used_bytes = self.used_bytes.saturating_sub(entry.data.len());
-        }
-        self.free_slots.push(idx);
+        self.cache.as_mut()?.get(&key).map(Vec::as_slice)
     }
 
     fn insert(&mut self, key: SliceKey, bytes: &[u8]) {
@@ -262,81 +202,20 @@ impl ExpertSliceLru {
         if budget == 0 || bytes.is_empty() || bytes.len() > budget / 2 {
             return;
         }
-        let incoming_freq = self.bump_freq(key);
-        if let Some(&idx) = self.map.get(&key) {
-            if self.head != Some(idx) {
-                self.detach(idx);
-                self.push_front(idx);
-            }
-            return;
+        if let Some(cache) = self.ensure_cache() {
+            cache.insert(key, bytes.to_vec());
         }
+    }
 
-        // Scan-resistant TinyLFU admission gate: pre-select coldest colder victims in the
-        // LRU tail window and verify we can reclaim enough space BEFORE evicting anything.
-        if self.used_bytes.saturating_add(bytes.len()) > budget {
-            let needed = self.used_bytes.saturating_add(bytes.len()) - budget;
-            let mut candidates: Vec<(u16, usize, usize, usize)> = Vec::new();
-            let mut cur = self.tail;
-            let mut steps = 0usize;
-            while let Some(idx) = cur
-                && steps < Self::TAIL_SAMPLE_WINDOW
-            {
-                let Some(entry) = &self.entries[idx] else {
-                    break;
-                };
-                let freq = self.key_freq(entry.key);
-                if freq < incoming_freq {
-                    candidates.push((freq, steps, idx, entry.data.len()));
-                }
-                cur = entry.prev;
-                steps += 1;
-            }
-            // Evict lowest frequency first, tie-broken by oldest (`steps` ascending).
-            candidates.sort_by_key(|&(freq, age, _, _)| (freq, age));
-            let mut reclaimable = 0usize;
-            let mut take_count = 0usize;
-            for &(_, _, _, sz) in &candidates {
-                reclaimable = reclaimable.saturating_add(sz);
-                take_count += 1;
-                if reclaimable >= needed {
-                    break;
-                }
-            }
-            if reclaimable < needed {
-                return;
-            }
-            for &(_, _, victim_idx, _) in &candidates[..take_count] {
-                self.evict_slot(victim_idx);
-            }
-        }
-        let entry = LruEntry {
-            key,
-            data: bytes.to_vec(),
-            prev: None,
-            next: None,
-        };
-        let idx = if let Some(slot) = self.free_slots.pop() {
-            self.entries[slot] = Some(entry);
-            slot
-        } else {
-            let slot = self.entries.len();
-            self.entries.push(Some(entry));
-            slot
-        };
-        self.used_bytes += bytes.len();
-        self.map.insert(key, idx);
-        self.push_front(idx);
+    #[cfg(test)]
+    fn used_bytes(&self) -> usize {
+        self.cache.as_ref().map_or(0, |c| c.weight() as usize)
     }
 
     fn clear(&mut self) {
-        self.map.clear();
-        self.freq.clear();
-        self.entries.clear();
-        self.free_slots.clear();
-        self.head = None;
-        self.tail = None;
-        self.used_bytes = 0;
-        self.access_ops = 0;
+        if let Some(cache) = self.cache.as_mut() {
+            cache.clear();
+        }
     }
 }
 
@@ -419,9 +298,9 @@ impl ScopedWorkerPool {
                     let mut seen_gen = 0u64;
                     loop {
                         let task_ptr = {
-                            let mut st = sh.state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut st = sh.state.lock();
                             while !st.shutdown && st.generation == seen_gen {
-                                st = sh.work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                                sh.work_cv.wait(&mut st);
                             }
                             if st.shutdown {
                                 break;
@@ -440,7 +319,7 @@ impl ScopedWorkerPool {
                                 let f: &(dyn Fn(usize) + Sync) = unsafe { &*ptr };
                                 f(worker_id);
                             }));
-                            let mut st = sh.state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut st = sh.state.lock();
                             st.done_bg += 1;
                             if st.done_bg == st.active_bg {
                                 sh.done_cv.notify_one();
@@ -472,7 +351,7 @@ impl ScopedWorkerPool {
             return;
         }
 
-        let _dispatch_guard = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _dispatch_guard = self.dispatch_lock.lock();
         let active_bg = actual_tasks - 1;
         let trait_obj: &(dyn Fn(usize) + Sync) = &f;
         // SAFETY: Erasing the lifetime to `'static` is sound because `WaitGuard` blocks until
@@ -481,7 +360,7 @@ impl ScopedWorkerPool {
             unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync), _>(trait_obj) };
 
         {
-            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = self.shared.state.lock();
             st.active_bg = active_bg;
             st.done_bg = 0;
             st.task_fn = Some(erased);
@@ -492,9 +371,9 @@ impl ScopedWorkerPool {
         struct WaitGuard<'a>(&'a PoolShared);
         impl Drop for WaitGuard<'_> {
             fn drop(&mut self) {
-                let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut st = self.0.state.lock();
                 while st.done_bg < st.active_bg {
-                    st = self.0.done_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                    self.0.done_cv.wait(&mut st);
                 }
                 st.task_fn = None;
                 st.active_bg = 0;
@@ -513,7 +392,7 @@ impl ScopedWorkerPool {
 impl Drop for ScopedWorkerPool {
     fn drop(&mut self) {
         {
-            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = self.shared.state.lock();
             st.shutdown = true;
             self.shared.work_cv.notify_all();
         }
@@ -536,7 +415,7 @@ pub struct LayerIoPool {
     scratch: Mutex<Option<AlignedBuf>>,
     moe_scratches: Mutex<Vec<AlignedBuf>>,
     span_cache: Mutex<HashMap<i32, Arc<[CoalescedSpan]>>>,
-    expert_cache: Mutex<ExpertSliceLru>,
+    expert_cache: Mutex<ExpertSliceCache>,
     bytes_read: AtomicU64,
     span_reads: AtomicU64,
     direct_zero_copy_loads: AtomicU64,
@@ -639,7 +518,7 @@ impl LayerIoPool {
             scratch: Mutex::new(None),
             moe_scratches: Mutex::new(Vec::new()),
             span_cache: Mutex::new(HashMap::new()),
-            expert_cache: Mutex::new(ExpertSliceLru::new(explicit_expert_cache)),
+            expert_cache: Mutex::new(ExpertSliceCache::new(explicit_expert_cache)),
             bytes_read: AtomicU64::new(0),
             span_reads: AtomicU64::new(0),
             direct_zero_copy_loads: AtomicU64::new(0),
@@ -677,9 +556,7 @@ impl LayerIoPool {
     }
 
     pub fn clear_expert_cache(&self) {
-        if let Ok(mut cache) = self.expert_cache.lock() {
-            cache.clear();
-        }
+        self.expert_cache.lock().clear();
     }
 
     pub fn stats(&self) -> IoStats {
@@ -705,19 +582,14 @@ impl LayerIoPool {
         layer_idx: i32,
         requests: Option<&[(&str, usize, usize)]>,
         pin_buf: &mut [u8],
-        out_slices: &mut [LsSpanSlice],
+        out_slices: &mut [DirectSpanSlice],
     ) -> Result<usize> {
         if layer_idx < 0 || !(pin_buf.as_ptr() as usize).is_multiple_of(DIRECT_IO_ALIGN as usize) {
             return Ok(0);
         }
 
         let spans = {
-            let cached = self
-                .span_cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("span_cache mutex poisoned"))?
-                .get(&layer_idx)
-                .cloned();
+            let cached = self.span_cache.lock().get(&layer_idx).cloned();
             if let Some(s) = cached {
                 s
             } else {
@@ -726,9 +598,9 @@ impl LayerIoPool {
                 };
                 let planned: Arc<[CoalescedSpan]> =
                     Arc::from(self.index.plan_coalesced_spans(reqs)?);
-                if let Ok(mut cache) = self.span_cache.lock() {
-                    cache.insert(layer_idx, Arc::clone(&planned));
-                }
+                self.span_cache
+                    .lock()
+                    .insert(layer_idx, Arc::clone(&planned));
                 planned
             }
         };
@@ -768,7 +640,7 @@ impl LayerIoPool {
             self.span_reads.fetch_add(1, Ordering::Relaxed);
 
             for s in &span.slices {
-                out_slices[slice_idx] = LsSpanSlice {
+                out_slices[slice_idx] = DirectSpanSlice {
                     src_offset: (buf_off + s.span_offset) as u64,
                     dst_offset: s.dst_offset as u64,
                     len: s.len as u64,
@@ -788,21 +660,12 @@ impl LayerIoPool {
         if layer_idx < 0 {
             return Ok(false);
         }
-        let cached = {
-            let guard = self
-                .span_cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("span_cache mutex poisoned"))?;
-            guard.get(&layer_idx).cloned()
-        };
+        let cached = self.span_cache.lock().get(&layer_idx).cloned();
         let Some(spans) = cached else {
             return Ok(false);
         };
 
-        let mut scratch_guard = self
-            .scratch
-            .lock()
-            .map_err(|_| anyhow::anyhow!("IO scratch mutex poisoned"))?;
+        let mut scratch_guard = self.scratch.lock();
         let scratch = match scratch_guard.as_mut() {
             Some(buf) => buf,
             None => scratch_guard.insert(AlignedBuf::new(4 * 1024 * 1024)?),
@@ -821,10 +684,8 @@ impl LayerIoPool {
         dst: &mut [u8],
     ) -> Result<()> {
         let spans: Arc<[CoalescedSpan]> = Arc::from(self.index.plan_coalesced_spans(requests)?);
-        if layer_idx >= 0
-            && let Ok(mut cache) = self.span_cache.lock()
-        {
-            cache.insert(layer_idx, Arc::clone(&spans));
+        if layer_idx >= 0 {
+            self.span_cache.lock().insert(layer_idx, Arc::clone(&spans));
         }
 
         if layer_idx < 0 {
@@ -837,10 +698,7 @@ impl LayerIoPool {
             return Ok(());
         }
 
-        let mut scratch_guard = self
-            .scratch
-            .lock()
-            .map_err(|_| anyhow::anyhow!("IO scratch mutex poisoned"))?;
+        let mut scratch_guard = self.scratch.lock();
         let scratch = match scratch_guard.as_mut() {
             Some(buf) => buf,
             None => scratch_guard.insert(AlignedBuf::new(4 * 1024 * 1024)?),
@@ -914,14 +772,11 @@ impl LayerIoPool {
             resolved_reqs.push((loc, src_off, dst_off, len, tidx));
         }
 
-        // 1. Check bounded hot-expert RAM LRU cache first.
+        // 1. Check bounded hot-expert RAM cache first.
         let mut misses: Vec<(ResolvedTensorLoc, u64, usize, usize, u32)> = Vec::new();
         let mut miss_meta: Vec<(SliceKey, usize, usize)> = Vec::new();
         let cache_enabled = {
-            let mut cache = self
-                .expert_cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("expert_cache mutex poisoned"))?;
+            let mut cache = self.expert_cache.lock();
             let budget = cache.ensure_budget();
             if budget > 0 {
                 let mut hits = 0u64;
@@ -971,10 +826,7 @@ impl LayerIoPool {
         let spans = self.index.plan_coalesced_sub_slices_resolved(active_reqs)?;
         let n_workers = self.moe_io_threads.min(spans.len()).max(1);
         if n_workers <= 1 {
-            let mut scratch_guard = self
-                .scratch
-                .lock()
-                .map_err(|_| anyhow::anyhow!("IO scratch mutex poisoned"))?;
+            let mut scratch_guard = self.scratch.lock();
             let scratch = match scratch_guard.as_mut() {
                 Some(buf) => buf,
                 None => scratch_guard.insert(AlignedBuf::new(4 * 1024 * 1024)?),
@@ -1019,10 +871,7 @@ impl LayerIoPool {
             // SAFETY: Worker `w` exclusively accesses `scratches[w]` (disjoint elements).
             unsafe impl Sync for SendScratchPtr {}
 
-            let mut scratches = self
-                .moe_scratches
-                .lock()
-                .map_err(|_| anyhow::anyhow!("moe_scratches mutex poisoned"))?;
+            let mut scratches = self.moe_scratches.lock();
             while scratches.len() < n_workers {
                 scratches.push(AlignedBuf::new(2 * 1024 * 1024)?);
             }
@@ -1049,9 +898,8 @@ impl LayerIoPool {
                     match self.read_sparse_span_into_disjoint_ptr(span, scratch_buf, base, len) {
                         Ok(n) => local_bytes = local_bytes.saturating_add(n),
                         Err(e) => {
-                            if let Ok(mut g) = first_err.lock()
-                                && g.is_none()
-                            {
+                            let mut g = first_err.lock();
+                            if g.is_none() {
                                 *g = Some(e);
                             }
                             return;
@@ -1065,17 +913,14 @@ impl LayerIoPool {
                 t_wall.elapsed().as_micros() as u64,
             );
 
-            if let Some(e) = first_err.into_inner().ok().flatten() {
+            if let Some(e) = first_err.into_inner() {
                 return Err(e);
             }
         }
 
-        // 2. Populate the hot-expert LRU cache with newly read misses.
+        // 2. Populate the hot-expert cache with newly read misses.
         if cache_enabled && !miss_meta.is_empty() {
-            let mut cache = self
-                .expert_cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("expert_cache mutex poisoned"))?;
+            let mut cache = self.expert_cache.lock();
             for (key, dst_off, len) in miss_meta {
                 cache.insert(key, &dst[dst_off..dst_off + len]);
             }
@@ -1558,8 +1403,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expert_slice_lru_evicts_least_recently_used_and_respects_budget() {
-        let mut lru = ExpertSliceLru::new(Some(12));
+    fn expert_slice_cache_respects_budget_and_clears() {
+        let mut cache = ExpertSliceCache::new(Some(12));
         let k1 = SliceKey {
             shard_idx: 0,
             file_offset: 0,
@@ -1581,39 +1426,37 @@ mod tests {
             len: 4,
         };
 
-        lru.insert(k1, b"AAAA");
-        lru.insert(k2, b"BBBB");
-        lru.insert(k3, b"CCCC");
-        assert_eq!(lru.used_bytes, 12);
+        cache.insert(k1, b"AAAA");
+        cache.insert(k2, b"BBBB");
+        cache.insert(k3, b"CCCC");
+        assert!(cache.used_bytes() <= 12);
+        assert_eq!(cache.get_and_touch(k1), Some(b"AAAA".as_slice()));
 
-        // Touch k1 so k1 has freq=2 while k2 and k3 have freq=1.
-        assert_eq!(lru.get_and_touch(k1), Some(b"AAAA".as_slice()));
+        // Oversized entries (> budget / 2) are rejected.
+        let k_big = SliceKey {
+            shard_idx: 0,
+            file_offset: 64,
+            len: 8,
+        };
+        cache.insert(k_big, b"12345678");
+        assert_eq!(cache.get_and_touch(k_big), None);
 
-        // First access to k4 (freq=1) does NOT thrash-evict existing entries (scan resistance).
-        lru.insert(k4, b"DDDD");
-        assert_eq!(lru.used_bytes, 12);
-        assert_eq!(lru.get_and_touch(k4), None);
-        assert_eq!(lru.get_and_touch(k1), Some(b"AAAA".as_slice()));
+        // Inserting k4 stays strictly within byte budget while keeping hot k1 resident.
+        cache.insert(k4, b"DDDD");
+        assert!(cache.used_bytes() <= 12);
+        assert_eq!(cache.get_and_touch(k1), Some(b"AAAA".as_slice()));
 
-        // Second access to k4 (freq=2) beats the oldest freq=1 victim (k2) and is admitted!
-        lru.insert(k4, b"DDDD");
-        assert_eq!(lru.used_bytes, 12);
-        assert_eq!(lru.get_and_touch(k2), None);
-        assert_eq!(lru.get_and_touch(k1), Some(b"AAAA".as_slice()));
-        assert_eq!(lru.get_and_touch(k3), Some(b"CCCC".as_slice()));
-        assert_eq!(lru.get_and_touch(k4), Some(b"DDDD".as_slice()));
-
-        lru.clear();
-        assert_eq!(lru.used_bytes, 0);
-        assert_eq!(lru.get_and_touch(k1), None);
+        cache.clear();
+        assert_eq!(cache.used_bytes(), 0);
+        assert_eq!(cache.get_and_touch(k1), None);
     }
 
     #[test]
-    fn expert_slice_lru_resists_cyclic_scan_thrashing() {
-        // Capacity 12 (3 items) scanning 5 items repeatedly: pure LRU gets 0% hits,
-        // scan-resistant TinyLFU-LRU keeps 3/5 = 60% hits across sweeps!
-        let mut lru = ExpertSliceLru::new(Some(12));
-        let keys: Vec<SliceKey> = (0..5)
+    fn expert_slice_cache_resists_cyclic_scan_thrashing() {
+        // Capacity 80 bytes (20 items) scanning 30 items repeatedly: pure LRU gets 0% hits,
+        // S3-FIFO keeps hot items resident across sweeps.
+        let mut cache = ExpertSliceCache::new(Some(80));
+        let keys: Vec<SliceKey> = (0..30)
             .map(|i| SliceKey {
                 shard_idx: 0,
                 file_offset: i * 4,
@@ -1622,37 +1465,37 @@ mod tests {
             .collect();
         let mut hits = 0usize;
         let mut total = 0usize;
-        for sweep in 0..5 {
+        for sweep in 0..8 {
             for &k in &keys {
-                if sweep > 0 {
+                if sweep >= 2 {
                     total += 1;
                 }
-                if lru.get_and_touch(k).is_some() {
-                    if sweep > 0 {
+                if cache.get_and_touch(k).is_some() {
+                    if sweep >= 2 {
                         hits += 1;
                     }
                 } else {
-                    lru.insert(k, b"DATA");
+                    cache.insert(k, b"DATA");
                 }
             }
         }
         assert!(
-            hits * 100 / total >= 55,
-            "expected >=55% hit rate under cyclic scan, got {hits}/{total}"
+            hits * 100 / total >= 40,
+            "expected >=40% hit rate under cyclic scan, got {hits}/{total}"
         );
     }
 
     #[test]
-    fn expert_slice_lru_disabled_at_zero_budget() {
-        let mut lru = ExpertSliceLru::new(Some(0));
+    fn expert_slice_cache_disabled_at_zero_budget() {
+        let mut cache = ExpertSliceCache::new(Some(0));
         let k = SliceKey {
             shard_idx: 0,
             file_offset: 0,
             len: 4,
         };
-        lru.insert(k, b"TEST");
-        assert_eq!(lru.used_bytes, 0);
-        assert_eq!(lru.get_and_touch(k), None);
+        cache.insert(k, b"TEST");
+        assert_eq!(cache.used_bytes(), 0);
+        assert_eq!(cache.get_and_touch(k), None);
     }
 
     #[test]

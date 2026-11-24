@@ -21,6 +21,7 @@ python-stage-backends = []
 [dependencies]
 anyhow.workspace = true
 getrandom.workspace = true
+gguf-direct-io = { path = "../gguf-direct-io" }
 json-schema-gbnf = { path = "../json-schema-gbnf" }
 libc.workspace = true
 serde.workspace = true
