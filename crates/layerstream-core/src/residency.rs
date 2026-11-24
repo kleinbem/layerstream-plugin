@@ -197,3 +197,98 @@ impl<E: Send + 'static> Residency<E> {
         self.loaded.load(Ordering::SeqCst)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DropTracker {
+        id: &'static str,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Drop for DropTracker {
+        fn drop(&mut self) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("drop:{}", self.id));
+        }
+    }
+
+    #[tokio::test]
+    async fn model_swap_drops_previous_before_loading_next() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let res: Residency<DropTracker> = Residency::new(Duration::from_secs(60), 2);
+
+        {
+            let mut lease = res.acquire().await.unwrap();
+            let ev = events.clone();
+            lease
+                .get_or_load("m1", move || {
+                    ev.lock().unwrap().push("load:m1".to_string());
+                    Ok(DropTracker {
+                        id: "m1",
+                        events: ev,
+                    })
+                })
+                .unwrap();
+            assert_eq!(lease.model_id(), Some("m1"));
+            assert!(res.is_loaded());
+        }
+
+        {
+            let mut lease = res.acquire().await.unwrap();
+            let ev = events.clone();
+            lease
+                .get_or_load("m2", move || {
+                    ev.lock().unwrap().push("load:m2".to_string());
+                    Ok(DropTracker {
+                        id: "m2",
+                        events: ev,
+                    })
+                })
+                .unwrap();
+            assert_eq!(lease.model_id(), Some("m2"));
+        }
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["load:m1", "drop:m1", "load:m2"]
+        );
+        assert!(res.evict_now().await);
+        assert!(!res.is_loaded());
+        assert!(!res.evict_now().await);
+    }
+
+    #[tokio::test]
+    async fn immediate_evict_and_admission_limit_enforced() {
+        let res: Residency<u32> = Residency::new(Duration::ZERO, 1);
+        let p1 = res.try_acquire_admission().unwrap();
+        assert!(res.try_acquire_admission().is_err());
+
+        {
+            let mut lease = res.lock_with_permit(p1).await;
+            lease.get_or_load("m1", || Ok(42)).unwrap();
+            assert!(res.is_loaded());
+        }
+        assert!(!res.is_loaded());
+        assert!(res.try_acquire_admission().is_ok());
+    }
+
+    #[tokio::test]
+    async fn idle_eviction_waits_for_timeout_and_respects_in_flight() {
+        let res: Residency<u32> = Residency::new(Duration::from_secs(10), 2);
+        {
+            let mut lease = res.acquire().await.unwrap();
+            lease.get_or_load("m1", || Ok(7)).unwrap();
+            assert!(!res.evict_idle(Instant::now() + Duration::from_secs(60)));
+        }
+
+        assert!(!res.evict_idle(Instant::now()));
+        assert!(res.is_loaded());
+        assert!(res.evict_idle(Instant::now() + Duration::from_secs(15)));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!res.is_loaded());
+    }
+}

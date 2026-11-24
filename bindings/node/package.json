@@ -56,6 +56,6 @@
     "build": "node scripts/build-native.mjs --release",
     "build:debug": "node scripts/build-native.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test test/layerstream.test.js"
+    "test": "node --test test/layerstream.test.js test/esm-and-native.test.mjs"
   }
 }
