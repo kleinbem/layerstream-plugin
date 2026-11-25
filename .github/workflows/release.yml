@@ -250,7 +250,7 @@ jobs:
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             sudo chown -R "$(id -u):$(id -g)" dist python/layerstream/_backends || true
-            python scripts/audit_wheel_elf.py dist/*.whl
+            cargo run --manifest-path ../../Cargo.toml --locked -p xtask -- audit-wheel-elf dist/*.whl
           fi
           uv pip install --system pytest pytest-asyncio pytest-timeout hypothesis twine
           python -m twine check --strict dist/*.whl
@@ -327,9 +327,9 @@ jobs:
               export LLAMA_CPP_DIR="/io/third_party/llama.cpp"
               export LAYERSTREAM_CUDA_WHEEL_PLAT="${{ matrix.wheel_plat }}"
               "$PY_BIN" scripts/build_wheel.py --out dist
-              "$PY_BIN" /io/bindings/python/scripts/audit_wheel_elf.py dist/*.whl
             '
           sudo chown -R "$(id -u):$(id -g)" bindings/python-cuda13/dist bindings/python-cuda13/build bindings/python-cuda13/python/layerstream_cuda13/_backends || true
+          cargo run --locked -p xtask -- audit-wheel-elf bindings/python-cuda13/dist/*.whl
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:

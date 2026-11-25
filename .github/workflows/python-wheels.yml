@@ -66,8 +66,8 @@ jobs:
         working-directory: bindings/python
         run: |
           uv pip install --system ruff pyright pip-audit pytest pytest-asyncio pytest-timeout hypothesis
-          ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../../benchmarks
-          ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../../benchmarks
+          ruff check python tests ../python-cuda13/python ../python-cuda13/scripts ../../benchmarks
+          ruff format --check python tests ../python-cuda13/python ../python-cuda13/scripts ../../benchmarks
           pyright python/layerstream tests
           pip-audit --strict
 
@@ -183,7 +183,7 @@ jobs:
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             sudo chown -R "$(id -u):$(id -g)" dist python/layerstream/_backends || true
-            python scripts/audit_wheel_elf.py dist/*.whl
+            cargo run --manifest-path ../../Cargo.toml --locked -p xtask -- audit-wheel-elf dist/*.whl
           fi
           uv pip install --system pytest pytest-asyncio pytest-cov pytest-timeout hypothesis twine
           python -m twine check --strict dist/*.whl
