@@ -40,7 +40,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 io-uring = "0.7"
 libc = "0.2"
-mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "5be31fba855d3c9724ddc24a62f181036149338d" }
+mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "3cde80dd6db2cbe239e31864e2917c6c4a277cd2" }
 parking_lot = "0.12"
 quick_cache = "0.7"
 serde = { version = "1", features = ["derive"] }
