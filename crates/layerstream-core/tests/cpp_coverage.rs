@@ -1298,3 +1298,60 @@ fn ffi_io_callback_error_and_direct_grammar_edge_cases() {
         ls_engine_free(eng);
     }
 }
+
+#[test]
+fn cpp_profile_moe_split_on_topk_and_vram_auto_cpu_paths() {
+    let gguf = write_synthetic_mixed_dense_moe_gguf();
+
+    // Exercise LAYERSTREAM_PROFILE=1 + LAYERSTREAM_MOE_SPLIT_ON_TOPK=1 + vram_budget_auto=true on CPU.
+    // SAFETY: Tests in this suite run serialized via `--test-threads 1`.
+    unsafe {
+        std::env::set_var("LAYERSTREAM_PROFILE", "1");
+        std::env::set_var("LAYERSTREAM_MOE_SPLIT_ON_TOPK", "1");
+    }
+
+    let mut cfg = EngineConfig::streaming(gguf.path());
+    cfg.n_ctx = 128;
+    cfg.n_batch = 32;
+    cfg.n_threads = 1;
+    cfg.use_gpu = false;
+    cfg.prefer_direct_io = false;
+    cfg.vram_budget_auto = true;
+    cfg.resident_layers = None;
+    cfg.moe_active_streaming = true;
+
+    let mut engine = StreamEngine::open(&cfg).expect("open streaming with profile+moe split");
+    let opts = GenerateOptions {
+        max_tokens: 4,
+        ..GenerateOptions::default()
+    };
+    let mut out = String::new();
+    let sum = engine
+        .generate_stream("a b c", &opts, None, |_tok, piece| {
+            out.push_str(piece);
+            true
+        })
+        .expect("generate with profile+moe split");
+    assert!(sum.completion_tokens >= 1);
+
+    // Also exercise mid-eval cooperative cancellation callback in C++ sched_eval_cb.
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut seen = 0usize;
+    let sum_cancel = engine
+        .generate_stream_with_cancel("a b c d", &opts, None, Some(&cancel), |_tok, _piece| {
+            seen += 1;
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        })
+        .expect("mid-eval cancel");
+    assert!(seen <= 2);
+    assert!(!sum_cancel.finish_reason.is_empty());
+
+    drop(engine);
+
+    // SAFETY: Tests in this suite run serialized via `--test-threads 1`.
+    unsafe {
+        std::env::remove_var("LAYERSTREAM_PROFILE");
+        std::env::remove_var("LAYERSTREAM_MOE_SPLIT_ON_TOPK");
+    }
+}
