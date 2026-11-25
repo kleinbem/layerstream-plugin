@@ -564,7 +564,7 @@ async fn server_chat_text_streaming_unload_errors_and_graceful_serve() {
     assert_eq!(uv["unloaded"], true);
     assert_eq!(uv["loaded"], false);
 
-    // 6. api_error 500 branch & serve_with_state_until graceful shutdown.
+    // 6. api_error 500 branch & serve_* entrypoints (graceful shutdown + spawn/abort).
     let err500 = api_error(StatusCode::INTERNAL_SERVER_ERROR, "boom");
     assert_eq!(err500.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -572,7 +572,7 @@ async fn server_chat_text_streaming_unload_errors_and_graceful_serve() {
         .await
         .unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let srv_state = AppState::new(make_config(reg, Duration::from_secs(60)));
+    let srv_state = AppState::new(make_config(reg.clone(), Duration::from_secs(60)));
     let srv_state_shut = srv_state.clone();
     let task = tokio::spawn(async move {
         serve_with_state_until(listener, srv_state, None, async move {
@@ -585,4 +585,29 @@ async fn server_chat_text_streaming_unload_errors_and_graceful_serve() {
     srv_state_shut.request_shutdown();
     let _ = tx.send(());
     task.await.unwrap();
+
+    for mode in 0..4 {
+        let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let cfg = make_config(reg.clone(), Duration::from_secs(60));
+        let h = tokio::spawn(async move {
+            let _ = match mode {
+                0 => layerstream_server::serve(l, cfg).await,
+                1 => layerstream_server::serve_with_api_key(l, cfg, Some("k".into())).await,
+                2 => layerstream_server::serve_with_state(l, AppState::new(cfg)).await,
+                _ => {
+                    layerstream_server::serve_with_state_and_token(
+                        l,
+                        AppState::new(cfg),
+                        "tok".into(),
+                    )
+                    .await
+                }
+            };
+        });
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        h.abort();
+        let _ = h.await;
+    }
 }

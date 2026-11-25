@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "Pure-Rust GGUF v2/v3 header parser, 4K-aligned coalesced span planner, and O_DIRECT pread reader"
 repository = "https://github.com/kleinbem/layerstream-plugin"
-homepage = "https://github.com/kleinbem/layerstream-plugin"
 readme = "README.md"
 keywords = ["gguf", "o-direct", "llm", "llama-cpp", "io"]
 categories = ["filesystem", "parsing"]

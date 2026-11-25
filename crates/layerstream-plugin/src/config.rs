@@ -343,3 +343,69 @@ impl SaturatingSubF64 for f64 {
         (self - rhs).max(0.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args() -> EngineArgs {
+        EngineArgs {
+            models: Vec::new(),
+            models_dir: None,
+            draft_model: None,
+            cache_dir: Some(std::env::temp_dir().join("ls-cfg-test-cache")),
+            ctx_size: 2048,
+            vram_budget_mb: "auto".to_string(),
+            kv_cache_type: "q8_0".to_string(),
+            idle_timeout_secs: None,
+            in_process: false,
+            allow_slow: true,
+            batch_size: 256,
+            threads: None,
+            no_gpu: true,
+            low_vram: false,
+            max_draft_tokens: 4,
+        }
+    }
+
+    #[test]
+    fn engine_args_validation_vram_budget_and_deferred_hf_detection() {
+        let mut args = base_args();
+        assert!(!args.has_model_sources());
+        assert!(!args.has_uncached_hf());
+
+        // Numeric vram_budget_mb + managed_idle_timeout_secs fallback
+        args.vram_budget_mb = "2048".to_string();
+        args.no_gpu = false;
+        let (cfg, deferred) = args
+            .clone()
+            .into_server_config_with_deferred(false, Some(45))
+            .expect("valid numeric vram budget");
+        assert!(deferred.is_none());
+        assert!(!cfg.vram_budget_auto);
+        assert_eq!(cfg.vram_budget_bytes, 2048 * 1024 * 1024);
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(45));
+        assert_eq!(cfg.n_threads, 2);
+
+        // Invalid vram_budget_mb -> error
+        let mut bad_vram = base_args();
+        bad_vram.vram_budget_mb = "not-a-number".to_string();
+        assert!(bad_vram.into_server_config().is_err());
+
+        // Invalid kv_cache_type -> error
+        let mut bad_kv = base_args();
+        bad_kv.kv_cache_type = "fp99".to_string();
+        assert!(bad_kv.into_server_config().is_err());
+
+        // Uncached hf:// model + draft triggers deferred pull plan
+        let mut hf_args = base_args();
+        hf_args.models = vec!["hf://org/nonexistent-repo:model.gguf".to_string()];
+        hf_args.draft_model = Some("hf://org/nonexistent-repo:draft.gguf".to_string());
+        assert!(hf_args.has_model_sources());
+        assert!(hf_args.has_uncached_hf());
+        let (_cfg2, deferred2) = hf_args
+            .into_server_config_with_deferred(true, None)
+            .expect("deferred hf plan");
+        assert!(deferred2.is_some());
+    }
+}

@@ -692,4 +692,78 @@ mod tests {
             "<tool_call>{\"name\":\"x\",\"arguments\":\"unclosed\n</tool_call>answer"
         );
     }
+
+    #[test]
+    fn incoming_chat_message_content_variants_tool_calls_and_tool_role() {
+        // Array of strings + text/input_text objects
+        let m_arr = IncomingChatMessage {
+            role: "user".to_string(),
+            content: json!(["line1", {"type": "text", "text": "line2"}, {"type": "input_text", "text": "line3"}]),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let cm = m_arr.to_chat_message().unwrap();
+        assert_eq!(cm.content, "line1\nline2\nline3");
+
+        // Null content + assistant tool_calls (JSON string args + object args + id)
+        let m_tc = IncomingChatMessage {
+            role: "assistant".to_string(),
+            content: Value::Null,
+            tool_calls: Some(vec![
+                json!({"id": "call_1", "function": {"name": "search", "arguments": "{\"q\":\"rust\"}"}}),
+                json!({"function": {"name": "ping", "arguments": {"x": 1}}}),
+            ]),
+            tool_call_id: None,
+            name: None,
+        };
+        let cm_tc = m_tc.to_chat_message().unwrap();
+        assert!(cm_tc.content.contains("<tool_call>"));
+        assert!(cm_tc.content.contains("call_1"));
+        assert!(cm_tc.content.contains("ping"));
+
+        // Tool role preserves name + tool_call_id prefix
+        let m_tool = IncomingChatMessage {
+            role: "tool".to_string(),
+            content: json!("ok"),
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            name: Some("search".to_string()),
+        };
+        let cm_tool = m_tool.to_chat_message().unwrap();
+        assert_eq!(cm_tool.content, "tool=search call_id=call_1: ok");
+
+        // Error branches: missing text field, unsupported multimodal type, non-object part, scalar content
+        for bad in [
+            json!([{"type": "text"}]),
+            json!([{"type": "image_url", "image_url": {"url": "x"}}]),
+            json!([123]),
+            json!(42),
+        ] {
+            let m_bad = IncomingChatMessage {
+                role: "user".to_string(),
+                content: bad,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            };
+            assert!(m_bad.to_chat_message().is_err());
+        }
+
+        // inject_tools_into_messages: empty tools is no-op; existing system message is appended
+        let mut msgs = vec![ChatMessage {
+            role: "system".to_string(),
+            content: "You are helpful.".to_string(),
+        }];
+        inject_tools_into_messages(&mut msgs, &[]);
+        assert_eq!(msgs[0].content, "You are helpful.");
+        inject_tools_into_messages(
+            &mut msgs,
+            &[
+                json!({"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object"}}}),
+            ],
+        );
+        assert!(msgs[0].content.starts_with("You are helpful.\n\n"));
+        assert!(msgs[0].content.contains("f"));
+    }
 }

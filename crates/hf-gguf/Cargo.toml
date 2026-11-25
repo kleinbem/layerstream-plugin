@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "Pure-Rust Hugging Face GGUF discovery, quant recommendation, and resumable multi-shard downloader"
 repository = "https://github.com/kleinbem/layerstream-plugin"
-homepage = "https://github.com/kleinbem/layerstream-plugin"
 readme = "README.md"
 keywords = ["huggingface", "gguf", "llm", "llama-cpp", "downloader"]
 categories = ["network-programming", "api-bindings"]
