@@ -103,7 +103,7 @@
             packages =
               commonPackages
               ++ (with pkgs; [
-                (python314.withPackages (
+                (python315.withPackages (
                   ps: with ps; [
                     pytest
                     pytest-asyncio
@@ -112,7 +112,6 @@
                     hypothesis
                     pip
                     setuptools
-                    wheel
                   ]
                 ))
                 maturin

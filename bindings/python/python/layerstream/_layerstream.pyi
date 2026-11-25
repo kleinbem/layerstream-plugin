@@ -1,7 +1,9 @@
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from os import PathLike
 from types import TracebackType
-from typing import Any, Literal, overload
+from typing import Any, Literal, Unpack, overload
+
+from ._types import SamplingOptions
 
 __version__: str
 
@@ -62,7 +64,26 @@ class NativeWorkerClient:
     def spawn(
         program: str,
         args: list[str],
-        open_json: str,
+        model: str,
+        *,
+        draft_model: str | None = None,
+        quant: str | None = None,
+        revision: str | None = None,
+        cache_dir: str | PathLike[str] | None = None,
+        vram_budget_mb: int | str | None = "auto",
+        resident_layers: int | None = None,
+        ctx_size: int = 4096,
+        batch_size: int = 512,
+        threads: int | None = None,
+        kv_cache_type: str = "q8_0",
+        use_gpu: bool = True,
+        prefer_direct_io: bool = True,
+        cpu_embeddings: bool = False,
+        cpu_head: bool = False,
+        stream_head: bool = False,
+        moe_active_streaming: bool = True,
+        max_draft_tokens: int = 5,
+        verbose: bool = False,
         on_progress: Callable[[dict[str, Any]], Any] | None = None,
     ) -> NativeWorkerClient: ...
     @property
@@ -74,24 +95,46 @@ class NativeWorkerClient:
     @property
     def last_summary(self) -> dict[str, Any] | None: ...
     def stats(self) -> dict[str, Any]: ...
-    def tokenize(self, text: str, add_special: bool, parse_special: bool) -> list[int]: ...
-    def detokenize(self, tokens: list[int]) -> str: ...
+    def tokenize(
+        self, text: str, *, add_special: bool = False, parse_special: bool = False
+    ) -> list[int]: ...
+    def detokenize(self, tokens: Sequence[int]) -> str: ...
     def apply_chat_template(
         self,
-        messages_json: str,
+        messages: Sequence[Mapping[str, Any]],
+        *,
         add_generation_prompt: bool = True,
-        tools_json: str | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> str: ...
     def kv_clear(self) -> None: ...
     def kv_trim(self, pos_min: int) -> bool: ...
     def save_state(self, path: str) -> int: ...
     def load_state(self, path: str) -> int: ...
-    def generate(self, prompt: str, params_json: str) -> tuple[str, dict[str, Any] | None]: ...
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 256,
+        stream: bool = False,
+        grammar: str | None = None,
+        json_schema: Any = None,
+        return_summary: bool = False,
+        **sampling: Unpack[SamplingOptions],
+    ) -> Any: ...
     def chat(
-        self, messages_json: str, params_json: str
-    ) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]: ...
-    def generate_stream(self, prompt: str, params_json: str) -> NativeWorkerStream: ...
-    def chat_stream(self, messages_json: str, params_json: str) -> NativeWorkerStream: ...
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        max_tokens: int = 256,
+        stream: bool = False,
+        add_generation_prompt: bool = True,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        grammar: str | None = None,
+        json_schema: Any = None,
+        parse_output: bool = False,
+        return_summary: bool = False,
+        **sampling: Unpack[SamplingOptions],
+    ) -> Any: ...
     def unload(self) -> None: ...
 
 def run_worker_server(port: int) -> None: ...
@@ -128,22 +171,11 @@ class NativeAutoModel:
         prompt: str,
         *,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[True],
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
         return_summary: Literal[False] = False,
+        **sampling: Unpack[SamplingOptions],
     ) -> TokenStream: ...
     @overload
     def generate(
@@ -151,22 +183,11 @@ class NativeAutoModel:
         prompt: str,
         *,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[False] = False,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
         return_summary: Literal[True],
+        **sampling: Unpack[SamplingOptions],
     ) -> tuple[str, dict[str, Any]]: ...
     @overload
     def generate(
@@ -174,22 +195,11 @@ class NativeAutoModel:
         prompt: str,
         *,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: bool = False,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
         return_summary: bool = False,
+        **sampling: Unpack[SamplingOptions],
     ) -> str | TokenStream | tuple[str, dict[str, Any]]: ...
     @overload
     def chat(
@@ -197,25 +207,14 @@ class NativeAutoModel:
         messages: Sequence[Mapping[str, Any]],
         *,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[True],
         add_generation_prompt: bool = True,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
         parse_output: bool = False,
         return_summary: Literal[False] = False,
+        **sampling: Unpack[SamplingOptions],
     ) -> TokenStream: ...
     @overload
     def chat(
@@ -223,25 +222,14 @@ class NativeAutoModel:
         messages: Sequence[Mapping[str, Any]],
         *,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[False] = False,
         add_generation_prompt: bool = True,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
         parse_output: bool = False,
         return_summary: Literal[True],
+        **sampling: Unpack[SamplingOptions],
     ) -> tuple[str | dict[str, Any], dict[str, Any]]: ...
     @overload
     def chat(
@@ -249,25 +237,14 @@ class NativeAutoModel:
         messages: Sequence[Mapping[str, Any]],
         *,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: bool = False,
         add_generation_prompt: bool = True,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
         parse_output: bool = False,
         return_summary: bool = False,
+        **sampling: Unpack[SamplingOptions],
     ) -> str | dict[str, Any] | TokenStream | tuple[str | dict[str, Any], dict[str, Any]]: ...
     def tokenize(
         self,
@@ -360,17 +337,5 @@ def json_object_gbnf() -> str: ...
 def compile_response_format(
     response_format: Any, allow_raw_schema: bool = False
 ) -> tuple[str | None, bool]: ...
-def validate_sample_params(
-    temperature: float,
-    top_p: float,
-    min_p: float,
-    repeat_penalty: float,
-    frequency_penalty: float,
-    presence_penalty: float,
-    penalty_last_n: int = 64,
-) -> None: ...
-def normalize_open_budget_and_kv(
-    vram_budget_mb: Any, kv_cache_type: str
-) -> tuple[bool, int, str]: ...
 def parse_assistant_output(raw: str) -> dict[str, Any]: ...
 def format_tools_system_prompt(tools: Sequence[Mapping[str, Any]]) -> str: ...

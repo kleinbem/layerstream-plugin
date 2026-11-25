@@ -1,16 +1,17 @@
-"""Native Python 3.14+ SDK for `layerstream-core` and `layerstream-server`."""
+"""Native Python 3.15+ SDK for `layerstream-core` and `layerstream-server`."""
 
-import asyncio
 import atexit
 import contextlib
 import ctypes
 import os
+import sys
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Protocol, override
+from typing import Any, Literal, Protocol, Unpack, cast, overload, override
+lazy import asyncio
 
 _DLL_DIR_HANDLES: list[Any] = []
 
@@ -100,6 +101,8 @@ def configured_backend_dirs() -> list[str]:
 
 from ._layerstream import (  # noqa: E402
     NativeAutoModel as _NativeAutoModel,
+    NativeWorkerClient as _NativeWorkerClient,
+    NativeWorkerStream as _WorkerTokenStream,
     ServerHandle,
     StreamTagParser,
     TokenStream as _NativeTokenStream,
@@ -116,12 +119,24 @@ from ._layerstream import (  # noqa: E402
     recommend,
     start_server,
 )
-from ._worker import (  # noqa: E402
-    IsolatedWorkerClient as _IsolatedWorkerClient,
-    WorkerTokenStream as _WorkerTokenStream,
-    normalize_open_kwargs as _normalize_open_kwargs,
+from ._streams import AsyncStreamMixin as _AsyncStreamMixin  # noqa: E402
+from ._types import (  # noqa: E402
+    CheckReportDict,
+    EngineStatsDict,
+    GenerateSummaryDict,
+    GgufInfoDict,
+    IoStatsDict,
+    LayerStreamError,
+    ModelLoadOptions,
+    ParsedAssistantOutputDict,
+    ProgressEventDict,
+    QuantRecommendationDict,
+    SamplingOptions,
+    SpeculationStatsDict,
+    ToolCallDict,
+    ToolCallFunctionDict,
 )
-from .openai import AsyncOpenAI, AsyncStreamMixin as _AsyncStreamMixin, OpenAI  # noqa: E402
+from .openai import AsyncOpenAI, OpenAI  # noqa: E402
 
 
 def serve(
@@ -130,26 +145,8 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8080,
     api_key: str | None = None,
-    draft_model: str | None = None,
-    quant: str | None = None,
-    revision: str | None = None,
-    cache_dir: str | PathLike[str] | None = None,
-    vram_budget_mb: int | str | None = "auto",
-    resident_layers: int | None = None,
-    ctx_size: int = 4096,
-    batch_size: int = 512,
-    threads: int | None = None,
-    kv_cache_type: str = "q8_0",
-    use_gpu: bool = True,
-    prefer_direct_io: bool = True,
-    cpu_embeddings: bool = False,
-    cpu_head: bool = False,
-    stream_head: bool = False,
-    moe_active_streaming: bool = True,
     idle_timeout_secs: int = 60,
-    max_draft_tokens: int = 5,
-    verbose: bool = False,
-    on_progress: Callable[[dict[str, Any]], Any] | None = None,
+    **options: Unpack[ModelLoadOptions],
 ) -> None:
     """Run `layerstream-server` (native Rust `axum` + `tokio` OpenAI HTTP/SSE server) until interrupted."""
     with start_server(
@@ -157,26 +154,8 @@ def serve(
         host=host,
         port=port,
         api_key=api_key,
-        draft_model=draft_model,
-        quant=quant,
-        revision=revision,
-        cache_dir=cache_dir,
-        vram_budget_mb=vram_budget_mb,
-        resident_layers=resident_layers,
-        ctx_size=ctx_size,
-        batch_size=batch_size,
-        threads=threads,
-        kv_cache_type=kv_cache_type,
-        use_gpu=use_gpu,
-        prefer_direct_io=prefer_direct_io,
-        cpu_embeddings=cpu_embeddings,
-        cpu_head=cpu_head,
-        stream_head=stream_head,
-        moe_active_streaming=moe_active_streaming,
         idle_timeout_secs=idle_timeout_secs,
-        max_draft_tokens=max_draft_tokens,
-        verbose=verbose,
-        on_progress=on_progress,
+        **options,
     ) as handle:
         handle.wait()
 
@@ -213,8 +192,8 @@ class TokenStream(_AsyncStreamMixin[str]):
         self._inner.close()
 
     @property
-    def summary(self) -> dict[str, Any] | None:
-        return self._inner.summary
+    def summary(self) -> GenerateSummaryDict | None:
+        return cast(GenerateSummaryDict | None, self._inner.summary)
 
 
 class _ModelBackend(Protocol):
@@ -233,47 +212,25 @@ class _ModelBackend(Protocol):
         prompt: str,
         *,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: bool = False,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
         return_summary: bool = False,
+        **sampling: Unpack[SamplingOptions],
     ) -> Any: ...
     def chat(
         self,
         messages: Sequence[Mapping[str, Any]],
         *,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: bool = False,
         add_generation_prompt: bool = True,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
         parse_output: bool = False,
         return_summary: bool = False,
+        **sampling: Unpack[SamplingOptions],
     ) -> Any: ...
     def tokenize(
         self, text: str, *, add_special: bool = False, parse_special: bool = False
@@ -310,7 +267,7 @@ class AutoModel:
         cls,
         model: str,
         *,
-        draft_model: str | None = None,
+        draft_model: str | Literal["auto"] | None = None,
         quant: str | None = None,
         revision: str | None = None,
         cache_dir: str | PathLike[str] | None = None,
@@ -319,7 +276,7 @@ class AutoModel:
         ctx_size: int = 4096,
         batch_size: int = 512,
         threads: int | None = None,
-        kv_cache_type: str = "q8_0",
+        kv_cache_type: Literal["f16", "q8_0", "q4_0"] = "q8_0",
         use_gpu: bool = True,
         prefer_direct_io: bool = True,
         cpu_embeddings: bool = False,
@@ -358,7 +315,9 @@ class AutoModel:
             )
             return cls(native, isolated_worker=False)
 
-        open_kwargs = _normalize_open_kwargs(
+        worker = _NativeWorkerClient.spawn(
+            sys.executable,
+            ["-c", "from layerstream._worker import _main; _main()"],
             model,
             draft_model=draft_model,
             quant=quant,
@@ -378,49 +337,51 @@ class AutoModel:
             moe_active_streaming=moe_active_streaming,
             max_draft_tokens=max_draft_tokens,
             verbose=verbose,
+            on_progress=on_progress,
         )
-        worker = _IsolatedWorkerClient(open_kwargs, on_progress=on_progress)
         return cls(worker, isolated_worker=True)
+
+    @overload
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 256,
+        stream: Literal[False] = False,
+        grammar: str | None = None,
+        json_schema: Any = None,
+        **sampling: Unpack[SamplingOptions],
+    ) -> str: ...
+
+    @overload
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 256,
+        stream: Literal[True],
+        grammar: str | None = None,
+        json_schema: Any = None,
+        **sampling: Unpack[SamplingOptions],
+    ) -> TokenStream: ...
 
     def generate(
         self,
         prompt: str,
         *,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: bool = False,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
+        **sampling: Unpack[SamplingOptions],
     ) -> str | TokenStream:
         res = self._backend.generate(
             prompt,
             max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            min_p=min_p,
-            top_k=top_k,
-            repeat_penalty=repeat_penalty,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            penalty_last_n=penalty_last_n,
-            seed=seed,
-            stop=stop,
             stream=stream,
-            ngram_speculation=ngram_speculation,
-            max_draft_tokens=max_draft_tokens,
             grammar=grammar,
             json_schema=json_schema,
+            **sampling,
         )
         if isinstance(res, (_NativeTokenStream, _WorkerTokenStream)):
             return TokenStream(res)
@@ -434,55 +395,78 @@ class AutoModel:
         text, summary = self._backend.generate(prompt, stream=False, return_summary=True, **kwargs)
         return str(text), summary
 
+    @overload
     def chat(
         self,
         messages: Sequence[Mapping[str, Any]],
         *,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
+        stream: Literal[False] = False,
+        add_generation_prompt: bool = True,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        grammar: str | None = None,
+        json_schema: Any = None,
+        parse_output: Literal[False] = False,
+        **sampling: Unpack[SamplingOptions],
+    ) -> str: ...
+
+    @overload
+    def chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        max_tokens: int = 256,
+        stream: Literal[False] = False,
+        add_generation_prompt: bool = True,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        grammar: str | None = None,
+        json_schema: Any = None,
+        parse_output: Literal[True],
+        **sampling: Unpack[SamplingOptions],
+    ) -> ParsedAssistantOutputDict: ...
+
+    @overload
+    def chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        max_tokens: int = 256,
+        stream: Literal[True],
+        add_generation_prompt: bool = True,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        grammar: str | None = None,
+        json_schema: Any = None,
+        parse_output: Literal[False] = False,
+        **sampling: Unpack[SamplingOptions],
+    ) -> TokenStream: ...
+
+    def chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        max_tokens: int = 256,
         stream: bool = False,
         add_generation_prompt: bool = True,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
         grammar: str | None = None,
         json_schema: Any = None,
         parse_output: bool = False,
-    ) -> str | dict[str, Any] | TokenStream:
+        **sampling: Unpack[SamplingOptions],
+    ) -> str | ParsedAssistantOutputDict | TokenStream:
         res = self._backend.chat(
             messages,
             max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            min_p=min_p,
-            top_k=top_k,
-            repeat_penalty=repeat_penalty,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            penalty_last_n=penalty_last_n,
-            seed=seed,
-            stop=stop,
             stream=stream,
             add_generation_prompt=add_generation_prompt,
-            ngram_speculation=ngram_speculation,
-            max_draft_tokens=max_draft_tokens,
             tools=tools,
             grammar=grammar,
             json_schema=json_schema,
             parse_output=parse_output,
+            **sampling,
         )
         if isinstance(res, (_NativeTokenStream, _WorkerTokenStream)):
             return TokenStream(res)
-        return res
+        return cast(str | ParsedAssistantOutputDict, res)
 
     def _chat_with_summary(
         self,
@@ -544,16 +528,16 @@ class AutoModel:
             raise FileNotFoundError(f"KV state file not found: '{raw_path}'")
         return int(self._backend.load_state(raw_path))
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self) -> EngineStatsDict:
         st = self._backend.stats()
         if st.get("loaded"):
             st.setdefault("isolated_worker", False)
             st.setdefault("worker_pid", None)
-        return st
+        return cast(EngineStatsDict, st)
 
     @property
-    def last_summary(self) -> dict[str, Any] | None:
-        return self._backend.last_summary
+    def last_summary(self) -> GenerateSummaryDict | None:
+        return cast(GenerateSummaryDict | None, self._backend.last_summary)
 
     @property
     def is_loaded(self) -> bool:
@@ -565,7 +549,7 @@ class AutoModel:
 
     @property
     def worker_pid(self) -> int | None:
-        if isinstance(self._backend, _IsolatedWorkerClient):
+        if isinstance(self._backend, _NativeWorkerClient):
             return self._backend.worker_pid
         return None
 
@@ -609,10 +593,24 @@ class AutoModel:
 __all__ = [
     "AsyncOpenAI",
     "AutoModel",
+    "CheckReportDict",
+    "EngineStatsDict",
+    "GenerateSummaryDict",
+    "GgufInfoDict",
+    "IoStatsDict",
+    "LayerStreamError",
+    "ModelLoadOptions",
     "OpenAI",
+    "ParsedAssistantOutputDict",
+    "ProgressEventDict",
+    "QuantRecommendationDict",
+    "SamplingOptions",
     "ServerHandle",
+    "SpeculationStatsDict",
     "StreamTagParser",
     "TokenStream",
+    "ToolCallDict",
+    "ToolCallFunctionDict",
     "__version__",
     "check",
     "configured_backend_dirs",

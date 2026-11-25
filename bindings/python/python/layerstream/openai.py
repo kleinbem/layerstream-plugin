@@ -1,446 +1,39 @@
-"""In-process OpenAI-compatible sync (`OpenAI`) & async (`AsyncOpenAI`) clients (Python 3.14+)."""
+"""In-process OpenAI-compatible sync (`OpenAI`) & async (`AsyncOpenAI`) clients (Python 3.15+)."""
 
-import asyncio
-import dataclasses
-import enum
-import functools
-import importlib
-import json
-import sys
 import threading
-import time
-import types
-import typing
-import uuid
-from collections import deque
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from collections.abc import Mapping, Sequence
 from types import TracebackType
-from typing import Any, Literal, Union, get_args, get_origin, overload, override
+from typing import Any, Literal, Unpack, overload
+lazy import asyncio
+lazy import time
+lazy import uuid
 
-from ._layerstream import (
-    StreamTagParser,
-    compile_response_format as _native_compile_response_format,
-    json_schema_to_gbnf,
-    parse_assistant_output,
+from ._layerstream import parse_assistant_output
+from ._openai_types import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ChatCompletionMessage,
+    ChatCompletionMessageToolCall,
+    Choice,
+    ChoiceDelta,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
+    ChunkChoice,
+    Completion,
+    CompletionChoice,
+    CompletionUsage,
+    FunctionCall,
+    ModelObject,
+    SyncPage,
 )
-
-type JsonDict = dict[str, Any]
-
-
-class _OpenAIModel:
-    """Shared serialization base for OpenAI response dataclasses."""
-
-    __slots__ = ()
-
-    def model_dump(self) -> JsonDict:
-        return asdict(self)  # type: ignore[call-overload]
-
-    to_dict = model_dump
-
-
-@dataclass(frozen=True, slots=True)
-class FunctionCall(_OpenAIModel):
-    name: str
-    arguments: str
-
-
-@dataclass(frozen=True, slots=True)
-class ChatCompletionMessageToolCall(_OpenAIModel):
-    id: str
-    function: FunctionCall
-    type: str = "function"
-
-
-@dataclass(frozen=True, slots=True)
-class ChoiceDeltaToolCallFunction(_OpenAIModel):
-    name: str | None = None
-    arguments: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ChoiceDeltaToolCall(_OpenAIModel):
-    index: int
-    id: str | None = None
-    type: str = "function"
-    function: ChoiceDeltaToolCallFunction | None = None
-
-
-@dataclass(slots=True)
-class ChatCompletionMessage(_OpenAIModel):
-    role: str = "assistant"
-    content: str | None = None
-    reasoning_content: str | None = None
-    tool_calls: list[ChatCompletionMessageToolCall] | None = None
-    parsed: Any = None
-
-
-@dataclass(frozen=True, slots=True)
-class Choice(_OpenAIModel):
-    index: int
-    message: ChatCompletionMessage
-    finish_reason: str | None = "stop"
-    logprobs: None = None
-
-
-@dataclass(frozen=True, slots=True)
-class CompletionUsage(_OpenAIModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-@dataclass(frozen=True, slots=True)
-class ChatCompletion(_OpenAIModel):
-    id: str
-    choices: list[Choice]
-    created: int
-    model: str
-    object: str = "chat.completion"
-    usage: CompletionUsage | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ChoiceDelta(_OpenAIModel):
-    role: str | None = None
-    content: str | None = None
-    reasoning_content: str | None = None
-    tool_calls: list[ChoiceDeltaToolCall] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ChunkChoice(_OpenAIModel):
-    index: int
-    delta: ChoiceDelta
-    finish_reason: str | None = None
-    logprobs: None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ChatCompletionChunk(_OpenAIModel):
-    id: str
-    choices: list[ChunkChoice]
-    created: int
-    model: str
-    object: str = "chat.completion.chunk"
-    usage: CompletionUsage | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class CompletionChoice(_OpenAIModel):
-    text: str
-    index: int = 0
-    finish_reason: str | None = "stop"
-    logprobs: None = None
-
-
-@dataclass(frozen=True, slots=True)
-class Completion(_OpenAIModel):
-    id: str
-    choices: list[CompletionChoice]
-    created: int
-    model: str
-    object: str = "text_completion"
-    usage: CompletionUsage | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ModelObject(_OpenAIModel):
-    id: str
-    created: int = 0
-    object: str = "model"
-    owned_by: str = "layerstream"
-
-
-def _empty_model_list() -> list[ModelObject]:
-    return []
-
-
-@dataclass(frozen=True, slots=True)
-class SyncPage(_OpenAIModel):
-    data: list[ModelObject] = field(default_factory=_empty_model_list)
-    object: str = "list"
-
-    def __iter__(self) -> Iterator[ModelObject]:
-        return iter(self.data)
-
-
-class AsyncStreamMixin[T](Iterator[T], AsyncIterator[T]):
-    """Generic PEP 695 sync + async context-managed stream base."""
-
-    def close(self) -> None:
-        raise NotImplementedError
-
-    @override
-    def __iter__(self) -> Iterator[T]:
-        return self
-
-    def __enter__(self) -> typing.Self:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None = None,
-        exc_val: BaseException | None = None,
-        exc_tb: TracebackType | None = None,
-    ) -> None:
-        self.close()
-
-    @override
-    def __aiter__(self) -> AsyncIterator[T]:
-        return self
-
-    @override
-    async def __anext__(self) -> T:
-        def _step() -> tuple[bool, T | None]:
-            try:
-                return True, next(self)
-            except StopIteration:
-                return False, None
-
-        try:
-            has_item, chunk = await asyncio.to_thread(_step)
-        except asyncio.CancelledError:
-            try:
-                await asyncio.to_thread(self.close)
-            except asyncio.CancelledError:
-                self.close()
-            raise
-        if not has_item or chunk is None:
-            raise StopAsyncIteration
-        return chunk
-
-    async def __aenter__(self) -> typing.Self:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None = None,
-        exc_val: BaseException | None = None,
-        exc_tb: TracebackType | None = None,
-    ) -> None:
-        await self.aclose()
-
-    async def aclose(self) -> None:
-        await asyncio.to_thread(self.close)
-
-
-@functools.cache
-def _get_pydantic() -> Any:
-    try:
-        return importlib.import_module("pydantic")
-    except ImportError:
-        return None
-
-
-def _annotation_to_json_schema(
-    tp: Any, field_label: str, *, _seen: frozenset[type[Any]] = frozenset()
-) -> JsonDict:
-    if tp is Any:
-        return {}
-    if tp is None or tp is types.NoneType:
-        return {"type": "null"}
-    if tp is str:
-        return {"type": "string"}
-    if tp is int:
-        return {"type": "integer"}
-    if tp is float:
-        return {"type": "number"}
-    if tp is bool:
-        return {"type": "boolean"}
-    if tp in (list, tuple, Sequence):
-        return {"type": "array"}
-    if tp in (dict, Mapping):
-        return {"type": "object"}
-
-    if isinstance(tp, type):
-        cls = typing.cast(type[Any], tp)
-        if issubclass(cls, enum.Enum):
-            return {"enum": [member.value for member in cls]}
-        if dataclasses.is_dataclass(cls):
-            return _dataclass_to_json_schema(cls, _seen=_seen)
-        if hasattr(cls, "model_json_schema"):
-            schema_fn: Any = cls.model_json_schema
-            return dict(typing.cast(Mapping[str, Any], schema_fn()))
-        if hasattr(cls, "schema"):
-            schema_fn_v1: Any = cls.schema
-            return dict(typing.cast(Mapping[str, Any], schema_fn_v1()))
-
-    origin = get_origin(tp)
-    args = get_args(tp)
-    if origin in (Union, types.UnionType):
-        return {"anyOf": [_annotation_to_json_schema(a, field_label, _seen=_seen) for a in args]}
-    if origin is Literal:
-        for a in args:
-            if not isinstance(a, (str, int, float, bool, type(None))):
-                raise TypeError(f"unsupported Literal value {a!r} on '{field_label}'")
-        return {"enum": list(args)}
-    if origin in (list, Sequence):
-        return (
-            {
-                "type": "array",
-                "items": _annotation_to_json_schema(args[0], field_label, _seen=_seen),
-            }
-            if args
-            else {"type": "array"}
-        )
-    if origin is tuple:
-        if not args:
-            if getattr(tp, "__args__", None) == ():
-                return {"type": "array", "maxItems": 0}
-            return {"type": "array"}
-        if len(args) == 2 and args[1] is Ellipsis:
-            return {
-                "type": "array",
-                "items": _annotation_to_json_schema(args[0], field_label, _seen=_seen),
-            }
-        pfx = [_annotation_to_json_schema(a, field_label, _seen=_seen) for a in args]
-        return {
-            "type": "array",
-            "prefixItems": pfx,
-            "minItems": len(pfx),
-            "maxItems": len(pfx),
-        }
-    if origin in (dict, Mapping):
-        if not args:
-            return {"type": "object"}
-        if args[0] is not str:
-            raise TypeError(f"JSON object keys in '{field_label}' must be 'str', got {args[0]!r}")
-        return {
-            "type": "object",
-            "additionalProperties": _annotation_to_json_schema(args[1], field_label, _seen=_seen),
-        }
-
-    raise TypeError(f"unsupported dataclass field annotation {tp!r} on '{field_label}'")
-
-
-def _resolve_dataclass_field_types(dc_cls: type[Any]) -> dict[str, Any]:
-    """Resolve PEP 649 deferred annotations in Python 3.14+ without `eval()`."""
-    mod_ns = getattr(sys.modules.get(dc_cls.__module__), "__dict__", None)
-    return typing.get_type_hints(dc_cls, globalns=mod_ns)
-
-
-def _dataclass_to_json_schema(
-    dc_cls: type[Any], *, _seen: frozenset[type[Any]] = frozenset()
-) -> JsonDict:
-    if dc_cls in _seen:
-        raise ValueError(
-            f"recursive dataclass '{dc_cls.__name__}' is not supported without pydantic"
-        )
-    if not _seen and (pydantic := _get_pydantic()) is not None:
-        return dict(typing.cast(Mapping[str, Any], pydantic.TypeAdapter(dc_cls).json_schema()))
-
-    next_seen = _seen | {dc_cls}
-    resolved_types = _resolve_dataclass_field_types(dc_cls)
-    props: JsonDict = {}
-    required: list[str] = []
-    for f in dataclasses.fields(dc_cls):
-        py_t = resolved_types.get(f.name, f.type)
-        props[f.name] = _annotation_to_json_schema(
-            py_t, f"{dc_cls.__name__}.{f.name}", _seen=next_seen
-        )
-        if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:
-            required.append(f.name)
-    return {
-        "type": "object",
-        "properties": props,
-        "required": required,
-        "additionalProperties": False,
-    }
-
-
-def _coerce_value_for_type(val: Any, tp: Any) -> Any:
-    if val is None or isinstance(tp, str):
-        return val
-    if isinstance(tp, type):
-        cls = typing.cast(type[Any], tp)
-        if issubclass(cls, enum.Enum):
-            return cls(val)
-        if dataclasses.is_dataclass(cls) and isinstance(val, Mapping):
-            return _instantiate_dataclass(cls, typing.cast(Mapping[str, Any], val))
-        return val
-    origin = get_origin(tp)
-    args = get_args(tp)
-    if origin in (Union, types.UnionType):
-        for branch in args:
-            try:
-                return _coerce_value_for_type(val, branch)
-            except TypeError, ValueError, KeyError:
-                continue
-        return val
-    if origin in (list, Sequence) and args and isinstance(val, list):
-        items = typing.cast(list[Any], val)
-        return [_coerce_value_for_type(v, args[0]) for v in items]
-    if origin is tuple and isinstance(val, list):
-        items = typing.cast(list[Any], val)
-        if len(args) == 2 and args[1] is Ellipsis:
-            return tuple(_coerce_value_for_type(v, args[0]) for v in items)
-        if args and len(args) == len(items):
-            return tuple(_coerce_value_for_type(v, a) for v, a in zip(items, args, strict=True))
-        return tuple(items)
-    if origin in (dict, Mapping) and len(args) == 2 and isinstance(val, Mapping):
-        mapping = typing.cast(Mapping[Any, Any], val)
-        return {k: _coerce_value_for_type(v, args[1]) for k, v in mapping.items()}
-    return val
-
-
-def _instantiate_dataclass(dc_cls: type[Any], data: Mapping[str, Any]) -> Any:
-    if (pydantic := _get_pydantic()) is not None:
-        return pydantic.TypeAdapter(dc_cls).validate_python(data)
-
-    resolved_types = _resolve_dataclass_field_types(dc_cls)
-    kwargs = {
-        k: _coerce_value_for_type(v, resolved_types[k]) if k in resolved_types else v
-        for k, v in data.items()
-    }
-    return dc_cls(**kwargs)
-
-
-def _compile_response_format(response_format: Any) -> tuple[str | None, Any]:
-    if response_format is None:
-        return None, None
-
-    if isinstance(response_format, type):
-        cls = typing.cast(type[Any], response_format)
-        if hasattr(cls, "model_json_schema") or hasattr(cls, "schema"):
-            return json_schema_to_gbnf(cls), cls
-        if dataclasses.is_dataclass(cls):
-            schema = _dataclass_to_json_schema(cls)
-            return json_schema_to_gbnf(schema), cls
-        raise TypeError(f"unsupported response_format class '{cls.__name__}'")
-
-    if isinstance(response_format, Mapping):
-        grammar, expects_json = _native_compile_response_format(response_format, False)
-        return grammar, (dict if expects_json else None)
-
-    raise TypeError(
-        "response_format must be None, a mapping ({'type': ...}), or a Pydantic/dataclass type"
-    )
-
-
-def _parse_structured_text(raw_text: str, parser_target: Any) -> Any:
-    if parser_target is None:
-        return None
-    if hasattr(parser_target, "model_validate_json"):
-        return parser_target.model_validate_json(raw_text)
-    if hasattr(parser_target, "parse_raw"):
-        return parser_target.parse_raw(raw_text)
-    data = json.loads(raw_text)
-    if isinstance(parser_target, type) and dataclasses.is_dataclass(parser_target):
-        if not isinstance(data, Mapping):
-            raise ValueError("expected JSON object for dataclass response_format")
-        return _instantiate_dataclass(
-            typing.cast(type[Any], parser_target), typing.cast(Mapping[str, Any], data)
-        )
-    return data
-
-
-def _usage_from_summary(summary: Mapping[str, Any] | None) -> CompletionUsage | None:
-    if summary is None:
-        return None
-    p = int(summary.get("prompt_tokens", 0))
-    c = int(summary.get("completion_tokens", 0))
-    return CompletionUsage(prompt_tokens=p, completion_tokens=c, total_tokens=p + c)
+from ._schema import compile_response_format, parse_structured_text
+from ._streams import (
+    AsyncStreamMixin,
+    ChatCompletionStream,
+    CompletionStream,
+    usage_from_summary,
+)
+from ._types import JsonDict, SamplingOptions
 
 
 def _merge_extra_body(
@@ -468,165 +61,6 @@ def _merge_extra_body(
     if "max_draft_tokens" in extra_body and extra_body["max_draft_tokens"] is not None:
         max_draft_tokens = int(extra_body["max_draft_tokens"])
     return min_p, top_k, repeat_penalty, penalty_last_n, ngram_speculation, max_draft_tokens
-
-
-class ChatCompletionStream(AsyncStreamMixin[ChatCompletionChunk]):
-    """Synchronous & asynchronous iterator yielding OpenAI `ChatCompletionChunk` events."""
-
-    def __init__(
-        self,
-        token_stream: Any,
-        req_id: str,
-        created: int,
-        model_id: str,
-        structured_json: bool,
-    ) -> None:
-        self._stream = token_stream
-        self._id = req_id
-        self._created = created
-        self._model_id = model_id
-        self._tag_parser = None if structured_json else StreamTagParser()
-        self._pending: deque[ChatCompletionChunk] = deque(
-            [
-                ChatCompletionChunk(
-                    id=req_id,
-                    created=created,
-                    model=model_id,
-                    choices=[ChunkChoice(index=0, delta=ChoiceDelta(role="assistant"))],
-                )
-            ]
-        )
-        self._finished = False
-
-    @override
-    def close(self) -> None:
-        self._finished = True
-        self._stream.close()
-
-    def _enqueue_deltas(self, deltas: Sequence[Mapping[str, Any]]) -> None:
-        for ev in deltas:
-            match ev["type"]:
-                case "content":
-                    delta = ChoiceDelta(content=str(ev["text"]))
-                case "reasoning":
-                    delta = ChoiceDelta(reasoning_content=str(ev["text"]))
-                case "tool_call":
-                    delta = ChoiceDelta(
-                        tool_calls=[
-                            ChoiceDeltaToolCall(
-                                index=int(ev["index"]),
-                                id=str(ev["id"]),
-                                type="function",
-                                function=ChoiceDeltaToolCallFunction(
-                                    name=str(ev["name"]),
-                                    arguments=str(ev["arguments"]),
-                                ),
-                            )
-                        ]
-                    )
-                case _:
-                    continue
-            self._pending.append(
-                ChatCompletionChunk(
-                    id=self._id,
-                    created=self._created,
-                    model=self._model_id,
-                    choices=[ChunkChoice(index=0, delta=delta)],
-                )
-            )
-
-    @override
-    def __next__(self) -> ChatCompletionChunk:
-        while not self._pending:
-            if self._finished:
-                raise StopIteration
-            try:
-                piece = next(self._stream)
-            except StopIteration:
-                self._finished = True
-                if self._tag_parser is not None:
-                    self._enqueue_deltas(self._tag_parser.flush())
-                summary = getattr(self._stream, "summary", None)
-                raw_reason = summary["finish_reason"] if summary else "stop"
-                if self._tag_parser is not None and self._tag_parser.has_tool_calls:
-                    finish_reason = "tool_calls"
-                elif raw_reason == "length":
-                    finish_reason = "length"
-                else:
-                    finish_reason = "stop"
-                self._pending.append(
-                    ChatCompletionChunk(
-                        id=self._id,
-                        created=self._created,
-                        model=self._model_id,
-                        choices=[
-                            ChunkChoice(index=0, delta=ChoiceDelta(), finish_reason=finish_reason)
-                        ],
-                        usage=_usage_from_summary(summary),
-                    )
-                )
-                break
-
-            if self._tag_parser is None:
-                if piece:
-                    self._pending.append(
-                        ChatCompletionChunk(
-                            id=self._id,
-                            created=self._created,
-                            model=self._model_id,
-                            choices=[ChunkChoice(index=0, delta=ChoiceDelta(content=piece))],
-                        )
-                    )
-            else:
-                self._enqueue_deltas(self._tag_parser.push(piece))
-
-        return self._pending.popleft()
-
-
-class CompletionStream(AsyncStreamMixin[Completion]):
-    """Synchronous & asynchronous iterator yielding OpenAI `Completion` text chunks."""
-
-    def __init__(
-        self,
-        token_stream: Any,
-        req_id: str,
-        created: int,
-        model_id: str,
-    ) -> None:
-        self._stream = token_stream
-        self._id = req_id
-        self._created = created
-        self._model_id = model_id
-        self._finished = False
-
-    @override
-    def close(self) -> None:
-        self._finished = True
-        self._stream.close()
-
-    @override
-    def __next__(self) -> Completion:
-        if self._finished:
-            raise StopIteration
-        try:
-            piece = next(self._stream)
-            return Completion(
-                id=self._id,
-                created=self._created,
-                model=self._model_id,
-                choices=[CompletionChoice(text=piece, index=0, finish_reason=None)],
-            )
-        except StopIteration:
-            self._finished = True
-            summary = getattr(self._stream, "summary", None)
-            reason = summary["finish_reason"] if summary else "stop"
-            return Completion(
-                id=self._id,
-                created=self._created,
-                model=self._model_id,
-                choices=[CompletionChoice(text="", index=0, finish_reason=reason)],
-                usage=_usage_from_summary(summary),
-            )
 
 
 class _ModelManager:
@@ -719,23 +153,12 @@ class _ChatCompletionsResource:
         model: str | None = None,
         max_tokens: int | None = None,
         max_completion_tokens: int | None = None,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[False] = False,
         tools: Sequence[Mapping[str, Any]] | None = None,
         response_format: Any = None,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
-    ) -> ChatCompletion: ...
+        **sampling: Unpack[SamplingOptions],
+    ) -> ChatCompletion[Any]: ...
 
     @overload
     def create(
@@ -745,22 +168,11 @@ class _ChatCompletionsResource:
         model: str | None = None,
         max_tokens: int | None = None,
         max_completion_tokens: int | None = None,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[True],
         tools: Sequence[Mapping[str, Any]] | None = None,
         response_format: Any = None,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
+        **sampling: Unpack[SamplingOptions],
     ) -> ChatCompletionStream: ...
 
     def create(
@@ -770,44 +182,22 @@ class _ChatCompletionsResource:
         model: str | None = None,
         max_tokens: int | None = None,
         max_completion_tokens: int | None = None,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: bool = False,
         tools: Sequence[Mapping[str, Any]] | None = None,
         response_format: Any = None,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
-    ) -> ChatCompletion | ChatCompletionStream:
+        **sampling: Unpack[SamplingOptions],
+    ) -> ChatCompletion[Any] | ChatCompletionStream:
         return self._create_impl(
             messages=messages,
             model=model,
             max_tokens=max_tokens,
             max_completion_tokens=max_completion_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            min_p=min_p,
-            top_k=top_k,
-            repeat_penalty=repeat_penalty,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            penalty_last_n=penalty_last_n,
-            seed=seed,
-            stop=stop,
             stream=stream,
             tools=tools,
             response_format=response_format,
-            ngram_speculation=ngram_speculation,
-            max_draft_tokens=max_draft_tokens,
             extra_body=extra_body,
+            **sampling,
         )
 
     def _create_impl(
@@ -834,7 +224,7 @@ class _ChatCompletionsResource:
         ngram_speculation: bool = True,
         max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
-    ) -> ChatCompletion | ChatCompletionStream:
+    ) -> ChatCompletion[Any] | ChatCompletionStream:
         (
             min_p,
             top_k,
@@ -861,7 +251,7 @@ class _ChatCompletionsResource:
         grammar = (
             compiled_grammar
             if compiled_grammar is not None
-            else _compile_response_format(response_format)[0]
+            else compile_response_format(response_format)[0]
         )
         req_id = f"chatcmpl-ls-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
@@ -928,7 +318,7 @@ class _ChatCompletionsResource:
         raw_reason = summary["finish_reason"] if summary else "stop"
 
         if grammar is not None:
-            msg = ChatCompletionMessage(role="assistant", content=raw)
+            msg: ChatCompletionMessage[Any] = ChatCompletionMessage(role="assistant", content=raw)
             finish_reason = "length" if raw_reason == "length" else "stop"
         else:
             parsed_dict = parse_assistant_output(raw)
@@ -961,8 +351,26 @@ class _ChatCompletionsResource:
             created=created,
             model=model_id,
             choices=[Choice(index=0, message=msg, finish_reason=finish_reason)],
-            usage=_usage_from_summary(summary),
+            usage=usage_from_summary(summary),
         )
+
+    @overload
+    def parse[T](
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        response_format: type[T],
+        **kwargs: Any,
+    ) -> ChatCompletion[T]: ...
+
+    @overload
+    def parse(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        response_format: Mapping[str, Any] | None,
+        **kwargs: Any,
+    ) -> ChatCompletion[Any]: ...
 
     def parse(
         self,
@@ -970,8 +378,8 @@ class _ChatCompletionsResource:
         messages: Sequence[Mapping[str, Any]],
         response_format: Any,
         **kwargs: Any,
-    ) -> ChatCompletion:
-        grammar, parser_target = _compile_response_format(response_format)
+    ) -> ChatCompletion[Any]:
+        grammar, parser_target = compile_response_format(response_format)
         resp = self._create_impl(
             messages=messages,
             response_format=None,
@@ -982,7 +390,7 @@ class _ChatCompletionsResource:
         if not isinstance(resp, ChatCompletion):
             raise TypeError("expected non-streaming ChatCompletion")
         content = resp.choices[0].message.content or ""
-        resp.choices[0].message.parsed = _parse_structured_text(content, parser_target)
+        resp.choices[0].message.parsed = parse_structured_text(content, parser_target)
         return resp
 
 
@@ -1002,22 +410,11 @@ class _CompletionsResource:
         prompt: str,
         model: str | None = None,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[False] = False,
         grammar: str | None = None,
         json_schema: Any = None,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
+        **sampling: Unpack[SamplingOptions],
     ) -> Completion: ...
 
     @overload
@@ -1027,22 +424,11 @@ class _CompletionsResource:
         prompt: str,
         model: str | None = None,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[True],
         grammar: str | None = None,
         json_schema: Any = None,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
+        **sampling: Unpack[SamplingOptions],
     ) -> CompletionStream: ...
 
     def create(
@@ -1051,22 +437,11 @@ class _CompletionsResource:
         prompt: str,
         model: str | None = None,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: bool = False,
         grammar: str | None = None,
         json_schema: Any = None,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
+        **sampling: Unpack[SamplingOptions],
     ) -> Completion | CompletionStream:
         (
             min_p,
@@ -1077,27 +452,27 @@ class _CompletionsResource:
             max_draft_tokens,
         ) = _merge_extra_body(
             extra_body,
-            min_p=min_p,
-            top_k=top_k,
-            repeat_penalty=repeat_penalty,
-            penalty_last_n=penalty_last_n,
-            ngram_speculation=ngram_speculation,
-            max_draft_tokens=max_draft_tokens,
+            min_p=sampling.get("min_p", 0.0),
+            top_k=sampling.get("top_k", 40),
+            repeat_penalty=sampling.get("repeat_penalty", 1.0),
+            penalty_last_n=sampling.get("penalty_last_n", 64),
+            ngram_speculation=sampling.get("ngram_speculation", True),
+            max_draft_tokens=sampling.get("max_draft_tokens"),
         )
-
+        stop = sampling.get("stop")
         model_id, eng = self._mgr.resolve(model)
         req_id = f"cmpl-ls-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
         sample_kw: JsonDict = {
-            "temperature": temperature,
-            "top_p": top_p,
+            "temperature": sampling.get("temperature", 0.0),
+            "top_p": sampling.get("top_p", 0.95),
             "min_p": min_p,
             "top_k": top_k,
             "repeat_penalty": repeat_penalty,
-            "frequency_penalty": frequency_penalty,
-            "presence_penalty": presence_penalty,
+            "frequency_penalty": sampling.get("frequency_penalty", 0.0),
+            "presence_penalty": sampling.get("presence_penalty", 0.0),
             "penalty_last_n": penalty_last_n,
-            "seed": seed,
+            "seed": sampling.get("seed", 42),
         }
 
         if stream:
@@ -1147,7 +522,7 @@ class _CompletionsResource:
             created=created,
             model=model_id,
             choices=[CompletionChoice(text=text, index=0, finish_reason=reason)],
-            usage=_usage_from_summary(summary),
+            usage=usage_from_summary(summary),
         )
 
 
@@ -1209,23 +584,12 @@ class _AsyncChatCompletionsResource:
         model: str | None = None,
         max_tokens: int | None = None,
         max_completion_tokens: int | None = None,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[False] = False,
         tools: Sequence[Mapping[str, Any]] | None = None,
         response_format: Any = None,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
-    ) -> ChatCompletion: ...
+        **sampling: Unpack[SamplingOptions],
+    ) -> ChatCompletion[Any]: ...
 
     @overload
     async def create(
@@ -1235,26 +599,33 @@ class _AsyncChatCompletionsResource:
         model: str | None = None,
         max_tokens: int | None = None,
         max_completion_tokens: int | None = None,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[True],
         tools: Sequence[Mapping[str, Any]] | None = None,
         response_format: Any = None,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
+        **sampling: Unpack[SamplingOptions],
     ) -> ChatCompletionStream: ...
 
-    async def create(self, **kwargs: Any) -> ChatCompletion | ChatCompletionStream:
+    async def create(self, **kwargs: Any) -> ChatCompletion[Any] | ChatCompletionStream:
         return await asyncio.to_thread(self._sync.create, **kwargs)
+
+    @overload
+    async def parse[T](
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        response_format: type[T],
+        **kwargs: Any,
+    ) -> ChatCompletion[T]: ...
+
+    @overload
+    async def parse(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        response_format: Mapping[str, Any] | None,
+        **kwargs: Any,
+    ) -> ChatCompletion[Any]: ...
 
     async def parse(
         self,
@@ -1262,7 +633,7 @@ class _AsyncChatCompletionsResource:
         messages: Sequence[Mapping[str, Any]],
         response_format: Any,
         **kwargs: Any,
-    ) -> ChatCompletion:
+    ) -> ChatCompletion[Any]:
         return await asyncio.to_thread(
             self._sync.parse,
             messages=messages,
@@ -1287,22 +658,11 @@ class _AsyncCompletionsResource:
         prompt: str,
         model: str | None = None,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[False] = False,
         grammar: str | None = None,
         json_schema: Any = None,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
+        **sampling: Unpack[SamplingOptions],
     ) -> Completion: ...
 
     @overload
@@ -1312,22 +672,11 @@ class _AsyncCompletionsResource:
         prompt: str,
         model: str | None = None,
         max_tokens: int = 256,
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        min_p: float = 0.0,
-        top_k: int = 40,
-        repeat_penalty: float = 1.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        penalty_last_n: int = 64,
-        seed: int = 42,
-        stop: str | Sequence[str] | None = None,
         stream: Literal[True],
         grammar: str | None = None,
         json_schema: Any = None,
-        ngram_speculation: bool = True,
-        max_draft_tokens: int | None = None,
         extra_body: Mapping[str, Any] | None = None,
+        **sampling: Unpack[SamplingOptions],
     ) -> CompletionStream: ...
 
     async def create(self, **kwargs: Any) -> Completion | CompletionStream:
@@ -1377,3 +726,27 @@ class AsyncOpenAI:
         exc_tb: TracebackType | None = None,
     ) -> None:
         await self.unload()
+
+
+__all__ = [
+    "AsyncOpenAI",
+    "AsyncStreamMixin",
+    "ChatCompletion",
+    "ChatCompletionChunk",
+    "ChatCompletionMessage",
+    "ChatCompletionMessageToolCall",
+    "ChatCompletionStream",
+    "Choice",
+    "ChoiceDelta",
+    "ChoiceDeltaToolCall",
+    "ChoiceDeltaToolCallFunction",
+    "ChunkChoice",
+    "Completion",
+    "CompletionChoice",
+    "CompletionStream",
+    "CompletionUsage",
+    "FunctionCall",
+    "ModelObject",
+    "OpenAI",
+    "SyncPage",
+]

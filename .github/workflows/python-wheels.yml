@@ -50,7 +50,7 @@ jobs:
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
@@ -73,7 +73,7 @@ jobs:
 
       - name: Smoke-test layerstream-cuda13 companion wheel packaging & metadata
         run: |
-          uv pip install --system "setuptools>=77" wheel twine
+          uv pip install --system "setuptools>=77" twine
           mkdir -p bindings/python-cuda13/python/layerstream_cuda13/_backends
           gcc -shared -fPIC -Wl,-soname,libggml-cuda.so -Wl,-rpath,'$ORIGIN' \
             -o bindings/python-cuda13/python/layerstream_cuda13/_backends/libggml-cuda.so -xc /dev/null
@@ -173,7 +173,7 @@ jobs:
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
@@ -199,20 +199,6 @@ jobs:
           uv pip install --system --reinstall dist/*.whl
           layerstream --version
           python -m pytest -v --cov=layerstream --cov-report=term-missing --cov-fail-under=100
-
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        with:
-          python-version: "3.15"
-
-      - name: Smoke-test cp314-abi3 forward compatibility on Python 3.15
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        working-directory: bindings/python
-        run: |
-          uv pip install --system --reinstall dist/*.whl
-          layerstream --version
-          expected=$(awk -F'"' '/^version =/{print $2; exit}' ../../Cargo.toml)
-          python -c "import layerstream, sys; assert layerstream.__version__ == sys.argv[1], (layerstream.__version__, sys.argv[1])" "$expected"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

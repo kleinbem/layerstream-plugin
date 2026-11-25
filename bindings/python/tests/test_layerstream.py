@@ -1535,8 +1535,8 @@ class _RecursiveTreeNode:
 
 def test_recursive_dataclass_schema_raises_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Self-referential dataclasses fail cleanly with ValueError instead of RecursionError."""
-    import layerstream.openai as ls_openai
+    import layerstream._schema as ls_schema
 
-    monkeypatch.setattr(ls_openai, "_get_pydantic", lambda: None)
+    monkeypatch.setattr(ls_schema, "_get_pydantic", lambda: None)
     with pytest.raises(ValueError, match="recursive dataclass '_RecursiveTreeNode'"):
-        ls_openai._dataclass_to_json_schema(_RecursiveTreeNode)
+        ls_schema._dataclass_to_json_schema(_RecursiveTreeNode)
