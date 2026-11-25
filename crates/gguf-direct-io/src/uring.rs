@@ -300,7 +300,28 @@ mod tests {
         assert!(reader.read_aligned_span(fd, &mut big, 0, size));
         assert_eq!(big, data);
 
-        // 3. Unexpected EOF error when reading past end of file with `min_valid > 0`.
+        // 3. Zero-length op + short-read-at-EOF where `min_valid` is satisfied.
+        let mut partial_buf = vec![0u8; 4096];
+        let zero_and_partial = [
+            UringReadOp {
+                fd,
+                ptr: partial_buf.as_mut_ptr(),
+                len: 0,
+                offset: 0,
+                min_valid: 0,
+            },
+            UringReadOp {
+                fd,
+                ptr: partial_buf.as_mut_ptr(),
+                len: 4096,
+                offset: (size - 1024) as u64,
+                min_valid: 1024,
+            },
+        ];
+        assert_eq!(reader.read_batch(&zero_and_partial).unwrap(), 1024);
+        assert_eq!(&partial_buf[..1024], &data[size - 1024..]);
+
+        // 4. Unexpected EOF error when reading past end of file with `min_valid > 0`.
         let mut eof_buf = vec![0u8; 4096];
         let eof_op = [UringReadOp {
             fd,
