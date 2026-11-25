@@ -913,6 +913,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "layerstream-ffi"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "layerstream-core",
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "layerstream-plugin"
 version = "0.5.0"
 dependencies = [

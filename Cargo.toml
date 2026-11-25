@@ -5,6 +5,7 @@ members = [
     "crates/hf-gguf",
     "crates/json-schema-gbnf",
     "crates/layerstream-core",
+    "crates/layerstream-ffi",
     "crates/layerstream-server",
     "crates/layerstream-plugin",
     "xtask",
