@@ -1002,3 +1002,31 @@ fn covers_nested_allof_anyof_implicit_types_and_value_equality() {
         );
     }
 }
+
+#[test]
+fn edge_case_gbnf_max_items_zero_const_enum_and_surrogates() {
+    // maxItems: 0 empty array rule (gbnf.rs:9)
+    let empty_arr = json_schema_to_gbnf(&json!({
+        "type": "array",
+        "items": {"type": "integer"},
+        "maxItems": 0
+    }))
+    .unwrap();
+    assert!(empty_arr.contains("\"[\" ws \"]\" ws"));
+    assert_all_gbnf_rules_defined(&empty_arr);
+
+    // const + enum mismatch produces empty intersection error (gbnf.rs:133-136)
+    assert!(json_schema_to_gbnf(&json!({"const": 3, "enum": [1, 2]})).is_err());
+
+    // Excluded key with non-BMP / surrogate-pair unicode characters (gbnf.rs UTF-16 surrogate branches)
+    let excl = json_schema_to_gbnf(&json!({
+        "type": "object",
+        "properties": {
+            "😀": {"type": "integer"},
+            "a\u{0001}b": {"type": "string"}
+        },
+        "additionalProperties": {"type": "boolean"}
+    }))
+    .unwrap();
+    assert_all_gbnf_rules_defined(&excl);
+}

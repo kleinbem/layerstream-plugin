@@ -292,3 +292,117 @@ fn large_layer_read_exercises_parallel_span_and_negative_cached_layer() {
         std::env::remove_var("LAYERSTREAM_PROFILE");
     }
 }
+
+#[test]
+fn gguf_index_scalar_types_overflow_and_vocab_error_paths() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Valid GGUF with every scalar metadata type (U8, I8, U16, I16, U64, I64, F64)
+    //    and U64 block_count.
+    let mut buf = Vec::new();
+    let write_str = |b: &mut Vec<u8>, s: &str| {
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b.extend_from_slice(s.as_bytes());
+    };
+    let mut kv = Vec::new();
+    let mut kv_n = 0u64;
+    // general.architecture = "llama" (STRING = 8)
+    write_str(&mut kv, "general.architecture");
+    kv.extend_from_slice(&8u32.to_le_bytes());
+    write_str(&mut kv, "llama");
+    kv_n += 1;
+    // llama.block_count as U64 (10)
+    write_str(&mut kv, "llama.block_count");
+    kv.extend_from_slice(&10u32.to_le_bytes());
+    kv.extend_from_slice(&2u64.to_le_bytes());
+    kv_n += 1;
+    // U8 (0), I8 (1), U16 (2), I16 (3), I64 (11), F64 (12), BOOL (7)
+    for (name, ty, bytes) in [
+        ("test.u8", 0u32, vec![7u8]),
+        ("test.i8", 1u32, vec![0xffu8]),
+        ("test.u16", 2u32, 42u16.to_le_bytes().to_vec()),
+        ("test.i16", 3u32, (-5i16).to_le_bytes().to_vec()),
+        ("test.bool", 7u32, vec![1u8]),
+        ("test.i64", 11u32, (-99i64).to_le_bytes().to_vec()),
+        ("test.f64", 12u32, 3.5f64.to_le_bytes().to_vec()),
+    ] {
+        write_str(&mut kv, name);
+        kv.extend_from_slice(&ty.to_le_bytes());
+        kv.extend_from_slice(&bytes);
+        kv_n += 1;
+    }
+    buf.extend_from_slice(b"GGUF");
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes()); // 0 tensors
+    buf.extend_from_slice(&kv_n.to_le_bytes());
+    buf.extend_from_slice(&kv);
+    buf.resize((buf.len() + 31) & !31, 0);
+    let ok_path = dir.path().join("scalars.gguf");
+    std::fs::write(&ok_path, &buf).unwrap();
+    let idx = GgufIndex::open(&ok_path).unwrap();
+    assert_eq!(idx.meta.n_layers, 2);
+
+    // 2. U64 block_count exceeding u32::MAX fails cleanly.
+    let mut bad_bc = Vec::new();
+    let mut kv2 = Vec::new();
+    write_str(&mut kv2, "general.architecture");
+    kv2.extend_from_slice(&8u32.to_le_bytes());
+    write_str(&mut kv2, "llama");
+    write_str(&mut kv2, "llama.block_count");
+    kv2.extend_from_slice(&10u32.to_le_bytes());
+    kv2.extend_from_slice(&(u64::from(u32::MAX) + 1).to_le_bytes());
+    bad_bc.extend_from_slice(b"GGUF");
+    bad_bc.extend_from_slice(&3u32.to_le_bytes());
+    bad_bc.extend_from_slice(&0u64.to_le_bytes());
+    bad_bc.extend_from_slice(&2u64.to_le_bytes());
+    bad_bc.extend_from_slice(&kv2);
+    let bad_bc_path = dir.path().join("bad_bc.gguf");
+    std::fs::write(&bad_bc_path, &bad_bc).unwrap();
+    // U64 block_count > u32::MAX returns None from as_u32() and falls back to tensor inference (0 layers).
+    assert_eq!(GgufIndex::open(&bad_bc_path).unwrap().meta.n_layers, 0);
+
+    // 3. Array length exceeding MAX_GGUF_ARRAY_LEN fails cleanly.
+    let mut bad_arr = Vec::new();
+    let mut kv3 = Vec::new();
+    write_str(&mut kv3, "test.huge_arr");
+    kv3.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+    kv3.extend_from_slice(&0u32.to_le_bytes()); // U8
+    kv3.extend_from_slice(&(100_000_000u64).to_le_bytes());
+    bad_arr.extend_from_slice(b"GGUF");
+    bad_arr.extend_from_slice(&3u32.to_le_bytes());
+    bad_arr.extend_from_slice(&0u64.to_le_bytes());
+    bad_arr.extend_from_slice(&1u64.to_le_bytes());
+    bad_arr.extend_from_slice(&kv3);
+    let bad_arr_path = dir.path().join("bad_arr.gguf");
+    std::fs::write(&bad_arr_path, &bad_arr).unwrap();
+    assert!(matches!(
+        GgufIndex::open(&bad_arr_path),
+        Err(GgufIoError::InvalidFormat(_))
+    ));
+
+    // 4. Truncated array (skip past EOF) fails cleanly.
+    let mut eof_arr = Vec::new();
+    let mut kv4 = Vec::new();
+    write_str(&mut kv4, "test.eof_arr");
+    kv4.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+    kv4.extend_from_slice(&10u32.to_le_bytes()); // U64 (8 bytes each)
+    kv4.extend_from_slice(&500u64.to_le_bytes());
+    eof_arr.extend_from_slice(b"GGUF");
+    eof_arr.extend_from_slice(&3u32.to_le_bytes());
+    eof_arr.extend_from_slice(&0u64.to_le_bytes());
+    eof_arr.extend_from_slice(&1u64.to_le_bytes());
+    eof_arr.extend_from_slice(&kv4);
+    let eof_arr_path = dir.path().join("eof_arr.gguf");
+    std::fs::write(&eof_arr_path, &eof_arr).unwrap();
+    assert!(matches!(
+        GgufIndex::open(&eof_arr_path),
+        Err(GgufIoError::InvalidFormat(_))
+    ));
+
+    // 5. check_gguf_draft_compatible error paths (missing file + corrupt header).
+    let missing = dir.path().join("does_not_exist.gguf");
+    assert!(gguf_direct_io::check_gguf_draft_compatible(&missing, &ok_path).is_err());
+    let corrupt = dir.path().join("corrupt.gguf");
+    std::fs::write(&corrupt, b"NOT_GGUF_DATA").unwrap();
+    assert!(gguf_direct_io::check_gguf_draft_compatible(&corrupt, &ok_path).is_err());
+}
