@@ -213,4 +213,65 @@ fn large_layer_read_exercises_parallel_span_and_negative_cached_layer() {
         &dst[tensor_bytes - 4096..],
         &payload[4096 + tensor_bytes - 4096..4096 + tensor_bytes]
     );
+
+    // Exercise env-configured parallel O_DIRECT reads (`LAYERSTREAM_IO_THREADS=2`),
+    // `LAYERSTREAM_MOE_IO_THREADS`, `LAYERSTREAM_SPARSE_DIRECT_IO=1`,
+    // `LAYERSTREAM_IO_CHUNK_MB=4`, `LAYERSTREAM_EXPERT_CACHE_MB=4`, and
+    // `LAYERSTREAM_PROFILE=1` (drop profile summary).
+    // SAFETY: Tests run with `--test-threads 1` so env mutation is serialized.
+    unsafe {
+        std::env::set_var("LAYERSTREAM_IO_THREADS", "2");
+        std::env::set_var("LAYERSTREAM_MOE_IO_THREADS", "2");
+        std::env::set_var("LAYERSTREAM_SPARSE_DIRECT_IO", "1");
+        std::env::set_var("LAYERSTREAM_IO_CHUNK_MB", "4");
+        std::env::set_var("LAYERSTREAM_EXPERT_CACHE_MB", "4");
+        std::env::set_var("LAYERSTREAM_PROFILE", "1");
+    }
+    let mut tensors2 = HashMap::new();
+    tensors2.insert(
+        "blk.0.big".to_string(),
+        TensorLocation {
+            name: "blk.0.big".to_string(),
+            shard_idx: 0,
+            abs_offset: 4096,
+            ggml_type: 0,
+            dims: vec![(tensor_bytes / 4) as u64],
+        },
+    );
+    let index2 = GgufIndex {
+        meta: ModelMeta {
+            architecture: "llama".to_string(),
+            name: None,
+            n_layers: 1,
+            context_length: None,
+            total_file_bytes: payload.len() as u64,
+        },
+        shards: vec![dir.path().join("big_layer.gguf")],
+        shard_sizes: vec![payload.len() as u64],
+        tensors: tensors2,
+    };
+    {
+        let pool2 = LayerIoPool::new(index2, true).unwrap();
+        let mut dst2 = vec![0u8; tensor_bytes];
+        pool2
+            .load_layer_tensors_into(0, &[("blk.0.big", 0, tensor_bytes)], &mut dst2)
+            .unwrap();
+        assert_eq!(dst2, dst);
+        // Also exercise sparse O_DIRECT path and expert cache hit/miss counters before drop.
+        let mut slice_dst = vec![0u8; 4096];
+        pool2
+            .load_slices_into(&[("blk.0.big", 0, 0, 4096, 0)], &mut slice_dst)
+            .unwrap();
+        assert_eq!(&slice_dst[..], &payload[4096..8192]);
+        // Drop prints `[layerstream-io-profile]` summary.
+    }
+    // SAFETY: Tests run with `--test-threads 1` so env mutation is serialized.
+    unsafe {
+        std::env::remove_var("LAYERSTREAM_IO_THREADS");
+        std::env::remove_var("LAYERSTREAM_MOE_IO_THREADS");
+        std::env::remove_var("LAYERSTREAM_SPARSE_DIRECT_IO");
+        std::env::remove_var("LAYERSTREAM_IO_CHUNK_MB");
+        std::env::remove_var("LAYERSTREAM_EXPERT_CACHE_MB");
+        std::env::remove_var("LAYERSTREAM_PROFILE");
+    }
 }

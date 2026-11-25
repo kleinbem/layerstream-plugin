@@ -861,3 +861,144 @@ fn covers_array_string_object_ref_and_validation_edge_cases() {
         );
     }
 }
+
+#[test]
+fn covers_gbnf_array_shapes_char_escapes_type_intersections_and_literal_disjointness() {
+    // Homogeneous array shapes: (0, Some(1)), (1, Some(1)), (0, None), (0, Some(0)).
+    for schema in [
+        json!({"type": "array", "items": {"type": "integer"}, "minItems": 0, "maxItems": 1}),
+        json!({"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 1}),
+        json!({"type": "array", "items": {"type": "integer"}}),
+        // `const` + `enum` together (consistent) + duplicate `required` keys.
+        json!({"const": "ok", "enum": ["ok", "other"]}),
+        json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "required": ["a", "a"]
+        }),
+        // `allOf` intersecting `number` with `integer` (both orders) + untyped + typed.
+        json!({"allOf": [{"type": "number"}, {"type": "integer"}]}),
+        json!({"allOf": [{"type": "integer"}, {"type": "number"}]}),
+        json!({"allOf": [{"minLength": 1}, {"type": "string"}]}),
+        json!({"allOf": [{"type": "string"}, {"maxLength": 4}]}),
+        // `oneOf` with `enum` covering all canonical literal types (null, bool, array, object, int, float)
+        // vs a disjoint `type` array, exercising `inferred_canonical_types` and `canonical_types_for_literal`.
+        json!({
+            "oneOf": [
+                {"enum": [null, true, [1], {"k": 1}, 7, 1.5]},
+                {"type": "string"}
+            ]
+        }),
+        json!({
+            "oneOf": [
+                {"type": ["string", "integer"]},
+                {"type": ["boolean", "null"]}
+            ]
+        }),
+        // Excluded object keys containing every short JSON escape (`/`, `\b`, `\f`, `\n`, `\r`, `\t`)
+        // and GBNF char-class metacharacters (`]`, `-`, `^`), exercising `gbnf_json_char_matching`
+        // and `gbnf_json_char_excluding`.
+        json!({
+            "type": "object",
+            "properties": {
+                "/": {"type": "integer"},
+                "\u{0008}": {"type": "integer"},
+                "\u{000C}": {"type": "integer"},
+                "\n": {"type": "integer"},
+                "\r": {"type": "integer"},
+                "\t": {"type": "integer"},
+                "]-^": {"type": "integer"}
+            },
+            "additionalProperties": {"type": "string"}
+        }),
+    ] {
+        let g = json_schema_to_gbnf(&schema).unwrap();
+        assert_all_gbnf_rules_defined(&g);
+    }
+
+    // `gbnf_literal` control-char escaping directly.
+    let lit = gbnf_literal("a\nb\rc\td\x01\"\\");
+    assert!(lit.contains("\\n"));
+    assert!(lit.contains("\\r"));
+    assert!(lit.contains("\\t"));
+    assert!(lit.contains("\\x01"));
+
+    // Error arms in `gbnf.rs`: non-array `required`, non-array `enum`, contradictory `const` + `enum`,
+    // `allOf` with invalid `type` array / non-string type / empty `enum`.
+    for bad in [
+        json!({"type": "object", "required": "a"}),
+        json!({"enum": "not-an-array"}),
+        json!({"const": "x", "enum": ["y", "z"]}),
+        json!({"allOf": [{"type": []}, {"type": "string"}]}),
+        json!({"allOf": [{"type": [42]}, {"type": "string"}]}),
+        json!({"allOf": [{"type": 42}, {"type": "string"}]}),
+        json!({"allOf": [{"enum": "bad"}, {"type": "string"}]}),
+        json!({"allOf": [{"enum": []}, {"type": "string"}]}),
+        json!({"oneOf": [{"const": "a", "anyOf": [{"type": "string"}]}, {"type": "string"}]}),
+    ] {
+        assert!(
+            json_schema_to_gbnf(&bad).is_err(),
+            "expected error for {bad}"
+        );
+    }
+}
+
+#[test]
+fn covers_nested_allof_anyof_implicit_types_and_value_equality() {
+    // Nested `allOf` on both left and right sides of an outer `allOf`, plus `anyOf` on right side.
+    for schema in [
+        json!({
+            "allOf": [
+                {"allOf": [{"type": "string", "minLength": 1}, {"maxLength": 6}]},
+                {"allOf": [{"minLength": 2}, {"maxLength": 4}]}
+            ]
+        }),
+        json!({
+            "allOf": [
+                {"type": "string", "minLength": 2},
+                {"anyOf": [{"type": "string", "maxLength": 5}, {"type": "integer"}]}
+            ]
+        }),
+        // `type: ["number", "integer"]` collapses integer into number.
+        json!({"type": ["number", "integer"]}),
+        // Implicit object, array, and string without explicit `"type"`.
+        json!({"properties": {"a": {"type": "integer"}}, "required": ["a"]}),
+        json!({"items": {"type": "boolean"}, "minItems": 1}),
+        json!({"minLength": 1, "maxLength": 3}),
+        // Value equality across nested arrays, objects, bools, nulls in `allOf` enum intersection.
+        json!({
+            "allOf": [
+                {"enum": [null, true, [1, 2], {"a": 1, "b": 2}, "x"]},
+                {"enum": [null, true, [1.0, 2], {"b": 2, "a": 1.0}, "y"]}
+            ]
+        }),
+        // `enum` with sibling `type` matching object, array, number, boolean, null.
+        json!({
+            "type": ["object", "array", "number", "boolean", "null"],
+            "enum": [{"k": 1}, [1], 2.5, true, null, "filtered_out"]
+        }),
+        // Empty `properties` with `additionalProperties: {"type": "integer"}`.
+        json!({"type": "object", "properties": {}, "additionalProperties": {"type": "integer"}}),
+    ] {
+        let g = json_schema_to_gbnf(&schema).unwrap();
+        assert_all_gbnf_rules_defined(&g);
+    }
+
+    // Invalid `type` array edge cases + empty nested allOf/anyOf/oneOf.
+    for bad in [
+        json!({"type": []}),
+        json!({"type": [123]}),
+        json!({"allOf": [{"allOf": []}, {"type": "string"}]}),
+        json!({"allOf": [{"type": "string"}, {"allOf": []}]}),
+        json!({"allOf": [{"anyOf": []}, {"type": "string"}]}),
+        json!({"allOf": [{"type": "string"}, {"anyOf": []}]}),
+        json!({"allOf": [{"oneOf": []}, {"type": "string"}]}),
+        json!({"allOf": [{"type": "string"}, {"oneOf": []}]}),
+        json!({"allOf": [{"type": "string"}, 42]}),
+    ] {
+        assert!(
+            json_schema_to_gbnf(&bad).is_err(),
+            "expected error for {bad}"
+        );
+    }
+}

@@ -77,6 +77,7 @@ unsafe impl Sync for AlignedBuf {}
 impl AlignedBuf {
     pub fn new(min_bytes: usize) -> Result<Self> {
         let base = min_bytes.max(DIRECT_IO_ALIGN as usize) as u64;
+        // coverage: 64-bit alignment overflow and OOM `alloc_zeroed() == null` are unreachable in normal unit tests.
         let rounded = base
             .checked_add(DIRECT_IO_ALIGN - 1)
             .map(|v| v & !(DIRECT_IO_ALIGN - 1))
@@ -1734,5 +1735,11 @@ mod tests {
         let (mib_s, _direct) = probe_storage_mib_per_s(&shard_path, false).unwrap();
         assert!(mib_s >= 0.0);
         assert!(probe_dir_storage_mib_per_s(dir.path()).is_some());
+
+        // `record_io_sample` triggers one-time slow-storage warning at >=128 MiB and <150 MiB/s.
+        assert!(!pool.slow_storage_warned.load(Ordering::Relaxed));
+        pool.record_io_sample(128 * 1024 * 1024, 2_000_000); // 64 MiB/s
+        assert!(pool.slow_storage_warned.load(Ordering::Relaxed));
+        pool.record_io_sample(128 * 1024 * 1024, 2_000_000); // idempotent second call
     }
 }

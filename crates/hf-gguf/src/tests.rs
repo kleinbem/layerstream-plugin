@@ -1408,6 +1408,212 @@ fn covers_env_cache_dirs_hub_cache_hit_tokens_reentry_and_resume_edge_cases() {
     }
 }
 
+#[test]
+fn covers_resolve_url_form_auto_draft_fallbacks_and_link_edge_cases() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // `hf://org/repo/resolve/<rev>/file.gguf` form extracts revision automatically.
+    let parsed = HfSpec::parse("hf://Org/Repo/resolve/v2/sub/model.gguf").unwrap();
+    assert_eq!(parsed.repo_id, "Org/Repo");
+    assert_eq!(parsed.revision, "v2");
+    assert_eq!(parsed.filename, "sub/model.gguf");
+
+    // `extract_expected_sha256` never trusts a redirected CDN's ETag without hub_sha256.
+    let mut cdn_hdrs = ureq::http::HeaderMap::new();
+    cdn_hdrs.insert("etag", format!("\"{}\"", "b".repeat(64)).parse().unwrap());
+    assert_eq!(extract_expected_sha256(&cdn_hdrs, true, None), None);
+    assert!(extract_expected_sha256(&cdn_hdrs, false, None).is_some());
+
+    // Mock server testing:
+    // 1. `resolve_auto_draft_model_with_probe` fallback when `Q4_K_M` is absent (retries `quant: None`)
+    //    AND draft has incompatible vocabulary -> returns `Ok(None)` cleanly!
+    // 2. `resolve_auto_draft_model_with_probe` when draft repo returns 404 -> returns `Ok(None)` cleanly!
+    // 3. `resolve_pretrained_model_with_probe` with `use_gpu: false` and `vram_budget_bytes: None`.
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let target_p = tmp.path().join("big-qwen2.gguf");
+    make_sparse_gguf(&target_p, "qwen2", &["a", "b", "c"], 3 * 1024 * 1024 * 1024);
+    let target = ResolvedModel {
+        local_path: target_p,
+        source_uri: None,
+        resolved_repo: None,
+        selected_quant: None,
+    };
+
+    let bad_draft_src = tmp.path().join("bad_draft_src.gguf");
+    make_sparse_gguf(&bad_draft_src, "qwen2", &["X", "Y", "Z"], 1024);
+    let bad_draft_bytes = fs::read(&bad_draft_src).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bad_srv = bad_draft_bytes.clone();
+    let server = std::thread::spawn(move || {
+        for stream_res in listener.incoming() {
+            let Ok(mut stream) = stream_res else { break };
+            let mut req_buf = [0u8; 4096];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let req = String::from_utf8_lossy(&req_buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("");
+            if path.ends_with("/__stop") {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                break;
+            } else if path.contains("/api/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/tree/") {
+                // Only Q8_0 available (no Q4_K_M -> triggers quant=None retry!).
+                let body = r#"[{"type":"file","path":"Qwen2.5-0.5B-Q8_0.gguf","size":500000000}]"#;
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nLink: <http://{addr}/prev>; rel=\"prev\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            } else if path.ends_with("Qwen2.5-0.5B-Q8_0.gguf") {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bad_srv.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(&bad_srv);
+            } else {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        }
+    });
+
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe {
+        std::env::set_var("HF_ENDPOINT", format!("http://{addr}"));
+    }
+    let cache = tmp.path().join("cache");
+
+    // 1. Q4_K_M missing -> retries quant=None -> downloads Q8_0 -> vocab incompatible -> Ok(None).
+    assert!(
+        resolve_auto_draft_model_with_probe(
+            &target,
+            Some(cache.clone()),
+            Some(2 * 1024 * 1024 * 1024),
+            false,
+            None,
+            || None,
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // 2. Draft repo 404 -> falls back cleanly to Ok(None).
+    let gemma_p = tmp.path().join("big-gemma3.gguf");
+    make_sparse_gguf(&gemma_p, "gemma3", &["a", "b"], 3 * 1024 * 1024 * 1024);
+    let gemma_target = ResolvedModel {
+        local_path: gemma_p,
+        source_uri: None,
+        resolved_repo: None,
+        selected_quant: None,
+    };
+    assert!(
+        resolve_auto_draft_model_with_probe(
+            &gemma_target,
+            Some(cache.clone()),
+            None,
+            false,
+            None,
+            || None,
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // 3. `resolve_pretrained_model_with_probe` with `use_gpu: false` & `vram_budget_bytes: None`.
+    let cpu_opts = PretrainedResolveOptions {
+        cache_dir: Some(cache),
+        use_gpu: false,
+        vram_budget_bytes: None,
+        ..Default::default()
+    };
+    let cpu_res =
+        resolve_pretrained_model_with_probe("Qwen/Qwen2.5-0.5B-Instruct-GGUF", &cpu_opts, || None)
+            .unwrap();
+    assert_eq!(cpu_res.selected_quant.as_deref(), Some("Q8_0"));
+
+    let _ = ureq::get(&format!("http://{addr}/__stop")).call();
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe { std::env::remove_var("HF_ENDPOINT") };
+    server.join().unwrap();
+}
+
+#[test]
+fn covers_flock_race_emit_download_progress_and_link_parser_edge_cases() {
+    use crate::hub::parse_next_link_url;
+
+    // 1. `emit_download_progress` for both TTY and non-TTY, with and without `total_bytes`.
+    let mut ev = DownloadProgress {
+        repo_id: "o/r".into(),
+        filename: "m.gguf".into(),
+        shard_index: 1,
+        shard_count: 1,
+        downloaded_bytes: 512,
+        total_bytes: Some(1024),
+        mib_per_s: 25.0,
+        cached: false,
+        done: false,
+    };
+    emit_download_progress(&ev, true);
+    emit_download_progress(&ev, false);
+    ev.total_bytes = None;
+    emit_download_progress(&ev, true);
+    emit_download_progress(&ev, false);
+
+    // 2. Concurrent flock race: thread 1 holds `PartLock`, thread 2 enters `download_with_resume`,
+    //    thread 1 writes the completed file and drops the lock -> thread 2 observes cache hit!
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = HfSpec::parse("hf://Org/Race:model.gguf").unwrap();
+    let dest = spec.cache_path(tmp.path());
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let lock = PartLock::acquire(&lock_path_for(&dest)).unwrap();
+
+    let cache_dir = tmp.path().to_path_buf();
+    let saw_cached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = saw_cached.clone();
+    let t2 = std::thread::spawn(move || {
+        let cb: ProgressCallback = Arc::new(move |p| {
+            if p.cached && p.done {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        ensure_hf_downloaded_with_progress("hf://Org/Race:model.gguf", &cache_dir, Some(&cb))
+    });
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    fs::write(&dest, b"COMPLETED_BY_OTHER_PROCESS").unwrap();
+    drop(lock);
+    let resolved = t2.join().unwrap().unwrap();
+    assert_eq!(resolved, dest);
+    assert!(saw_cached.load(std::sync::atomic::Ordering::SeqCst));
+
+    // 3. `parse_next_link_url` edge cases: relative next URL, comma-separated links, missing rel.
+    let mut h1 = ureq::http::HeaderMap::new();
+    h1.insert(
+        "link",
+        "</api/page?cursor=3>; rel=\"next\", </prev>; rel=\"prev\""
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(
+        parse_next_link_url(&h1, "https://huggingface.co/api/page").as_deref(),
+        Some("https://huggingface.co/api/page?cursor=3")
+    );
+    let mut h2 = ureq::http::HeaderMap::new();
+    h2.insert("link", "malformed; rel=\"next\"".parse().unwrap());
+    assert_eq!(parse_next_link_url(&h2, "https://huggingface.co/api"), None);
+}
+
 fn make_sparse_gguf(path: &Path, arch: &str, tokens: &[&str], sparse_size: u64) {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"GGUF");
@@ -1661,4 +1867,72 @@ fn resolve_auto_draft_model_with_probe_covers_guards_matching_and_incompatibilit
     // SAFETY: Serialized by `ENV_LOCK` so no concurrent test thread reads or mutates process env vars.
     unsafe { std::env::remove_var("HF_ENDPOINT") };
     server.join().unwrap();
+}
+
+#[test]
+fn group_gguf_tree_entries_covers_directories_subdirs_and_bad_shard_suffixes() {
+    let entries = vec![
+        HfTreeEntry {
+            entry_type: Some("directory".into()),
+            path: "Q4_K_M".into(),
+            size: 0,
+            lfs: None,
+        },
+        HfTreeEntry {
+            entry_type: Some("file".into()),
+            path: "README.md".into(),
+            size: 100,
+            lfs: None,
+        },
+        HfTreeEntry {
+            entry_type: Some("file".into()),
+            path: "mmproj-F16.gguf".into(),
+            size: 500,
+            lfs: None,
+        },
+        // Subdirectory multi-part shards (out-of-order shard 2 before shard 1).
+        HfTreeEntry {
+            entry_type: Some("file".into()),
+            path: "Q4_K_M/Model-Q4_K_M-00002-of-00002.gguf".into(),
+            size: 1000,
+            lfs: Some(HfLfsInfo { size: 2000 }),
+        },
+        HfTreeEntry {
+            entry_type: Some("file".into()),
+            path: "Q4_K_M/Model-Q4_K_M-00001-of-00002.gguf".into(),
+            size: 1000,
+            lfs: Some(HfLfsInfo { size: 3000 }),
+        },
+        // Non-shard filenames that look similar to shard suffixes (tests strip_shard_suffix guards).
+        HfTreeEntry {
+            entry_type: Some("file".into()),
+            path: "Model-00001-of-999.gguf".into(),
+            size: 111,
+            lfs: None,
+        },
+        HfTreeEntry {
+            entry_type: Some("file".into()),
+            path: "Model-00001-of-00001.gguf".into(),
+            size: 222,
+            lfs: None,
+        },
+        HfTreeEntry {
+            entry_type: Some("file".into()),
+            path: "Model-12-of-00002.gguf".into(),
+            size: 333,
+            lfs: None,
+        },
+    ];
+
+    let cands = group_gguf_tree_entries(&entries);
+    assert_eq!(cands.len(), 4);
+    let multi = cands
+        .iter()
+        .find(|c| c.shard_count == 2)
+        .expect("multi-shard candidate");
+    assert_eq!(
+        multi.primary_file,
+        "Q4_K_M/Model-Q4_K_M-00001-of-00002.gguf"
+    );
+    assert_eq!(multi.total_bytes, 5000);
 }
