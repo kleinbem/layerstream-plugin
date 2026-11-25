@@ -1593,8 +1593,9 @@ pub fn parse_assistant_output(raw: String) -> ParsedAssistantOutputJs {
 mod openai_bridge;
 mod worker;
 pub use openai_bridge::{
-    build_chat_completion_json, build_chat_delta_chunks_json, build_text_completion_json,
-    normalize_chat_messages_json,
+    build_chat_completion_json, build_chat_delta_chunks_json, build_chat_final_chunk_json,
+    build_text_completion_json, build_text_stream_chunk_json, normalize_chat_messages_json,
+    normalize_gen_options_json, normalize_open_options_json,
 };
 use worker::map_worker_err;
 pub use worker::{NativeWorkerClient, NativeWorkerStream};
