@@ -229,9 +229,10 @@ jobs:
 
       - name: Pure-Rust crate coverage (json-schema-gbnf, gguf-direct-io, hf-gguf)
         run: |
+          set -o pipefail
           {
             echo "### Rust Crate Coverage"
             echo '```'
-            cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --summary-only -- --test-threads 1 | tee /dev/stderr
+            cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --summary-only --fail-under-lines 85 -- --test-threads 1 | tee /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

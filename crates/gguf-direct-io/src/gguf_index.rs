@@ -1134,5 +1134,158 @@ mod tests {
         assert!(check_gguf_draft_compatible(&target_p, &draft_ok).is_ok());
         let err = check_gguf_draft_compatible(&target_p, &draft_bad).unwrap_err();
         assert!(matches!(err, GgufIoError::IncompatibleDraft(_)));
+
+        // Missing tokenizer.ggml.tokens array fails with InvalidFormat.
+        let no_vocab = dir.path().join("no_vocab.gguf");
+        std::fs::write(&no_vocab, build_minimal_gguf("llama", 1, None, &[], 64)).unwrap();
+        let err_nv = check_gguf_draft_compatible(&target_p, &no_vocab).unwrap_err();
+        assert!(matches!(err_nv, GgufIoError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn parses_all_kv_types_infers_layers_and_checks_alignment_and_quant_layouts() {
+        // Cover all known ggml_type block layouts + unknown type + empty dims.
+        for ty in [
+            0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30,
+        ] {
+            let loc = TensorLocation {
+                name: "w".to_string(),
+                shard_idx: 0,
+                abs_offset: 0,
+                ggml_type: ty,
+                dims: vec![256, 2],
+            };
+            assert!(
+                loc.encoded_byte_len().is_some(),
+                "expected layout for ggml_type={ty}"
+            );
+        }
+        let unknown = TensorLocation {
+            name: "u".to_string(),
+            shard_idx: 0,
+            abs_offset: 0,
+            ggml_type: 999,
+            dims: vec![64],
+        };
+        assert_eq!(unknown.encoded_byte_len(), None);
+
+        // Build a GGUF v2 header exercising every KV type (0..=12), custom alignment=64,
+        // and omitted `block_count` so `infer_layer_count` derives `n_layers = 4` from `blk.3.*`.
+        let mut buf = gguf_header(2, 1, 14);
+        // 0: UINT8
+        write_gguf_string(&mut buf, "k.u8");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.push(7);
+        // 1: INT8
+        write_gguf_string(&mut buf, "k.i8");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.push(0xFE);
+        // 2: UINT16
+        write_gguf_string(&mut buf, "k.u16");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&12u16.to_le_bytes());
+        // 3: INT16
+        write_gguf_string(&mut buf, "k.i16");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&(-12i16).to_le_bytes());
+        // 4: UINT32 (general.alignment = 64)
+        write_gguf_string(&mut buf, "general.alignment");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&64u32.to_le_bytes());
+        // 5: INT32 (llama.context_length = 2048)
+        write_gguf_string(&mut buf, "llama.context_length");
+        buf.extend_from_slice(&5u32.to_le_bytes());
+        buf.extend_from_slice(&2048i32.to_le_bytes());
+        // 6: FLOAT32
+        write_gguf_string(&mut buf, "k.f32");
+        buf.extend_from_slice(&6u32.to_le_bytes());
+        buf.extend_from_slice(&1.5f32.to_le_bytes());
+        // 7: BOOL
+        write_gguf_string(&mut buf, "k.bool");
+        buf.extend_from_slice(&7u32.to_le_bytes());
+        buf.push(1);
+        // 8: STRING (general.architecture = "llama")
+        write_gguf_string(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        write_gguf_string(&mut buf, "llama");
+        // 9a: ARRAY of fixed UINT32
+        write_gguf_string(&mut buf, "k.arr_u32");
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(&20u32.to_le_bytes());
+        // 9b: ARRAY of STRING
+        write_gguf_string(&mut buf, "k.arr_str");
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        write_gguf_string(&mut buf, "hello");
+        // 10: UINT64
+        write_gguf_string(&mut buf, "k.u64");
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(&99u64.to_le_bytes());
+        // 11: INT64
+        write_gguf_string(&mut buf, "k.i64");
+        buf.extend_from_slice(&11u32.to_le_bytes());
+        buf.extend_from_slice(&(-99i64).to_le_bytes());
+        // 12: FLOAT64
+        write_gguf_string(&mut buf, "k.f64");
+        buf.extend_from_slice(&12u32.to_le_bytes());
+        buf.extend_from_slice(&2.25f64.to_le_bytes());
+
+        // Single tensor `blk.3.attn_q.weight` -> inferred n_layers = 4.
+        write_gguf_string(&mut buf, "blk.3.attn_q.weight");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&16u64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+
+        let aligned = align_up(buf.len() as u64, 64) as usize;
+        buf.resize(aligned + 256, 0x55);
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("all_kv.gguf");
+        std::fs::write(&p, &buf).unwrap();
+
+        let idx = GgufIndex::open(&p).unwrap();
+        assert_eq!(idx.meta.architecture, "llama");
+        assert_eq!(idx.meta.n_layers, 4);
+        assert_eq!(idx.meta.context_length, Some(2048));
+        assert_eq!(
+            idx.tensors["blk.3.attn_q.weight"].abs_offset,
+            aligned as u64
+        );
+
+        // Invalid non-power-of-2 alignment (3) fails closed.
+        let mut bad_align = gguf_header(3, 0, 1);
+        write_gguf_string(&mut bad_align, "general.alignment");
+        bad_align.extend_from_slice(&4u32.to_le_bytes());
+        bad_align.extend_from_slice(&3u32.to_le_bytes());
+        let len = bad_align.len() as u64;
+        let mut cur = Cursor::new(bad_align);
+        assert!(matches!(
+            parse_single_header(&mut cur, 0, len, false),
+            Err(GgufIoError::InvalidFormat(_))
+        ));
+
+        // Unknown KV type id (99) fails closed.
+        let mut bad_kv = gguf_header(3, 0, 1);
+        write_gguf_string(&mut bad_kv, "bad");
+        bad_kv.extend_from_slice(&99u32.to_le_bytes());
+        let len2 = bad_kv.len() as u64;
+        let mut cur2 = Cursor::new(bad_kv);
+        assert!(matches!(
+            parse_single_header(&mut cur2, 0, len2, false),
+            Err(GgufIoError::InvalidFormat(_))
+        ));
+
+        // Opening a missing file returns GgufIoError::Io; `From<io::Error>` works too.
+        assert!(matches!(
+            GgufIndex::open(dir.path().join("does_not_exist.gguf")).unwrap_err(),
+            GgufIoError::Io { .. }
+        ));
+        let io_err: GgufIoError = std::io::Error::other("boom").into();
+        assert!(matches!(io_err, GgufIoError::Io { .. }));
     }
 }
