@@ -363,8 +363,6 @@ def _coerce_value_for_type(val: Any, tp: Any) -> Any:
     args = get_args(tp)
     if origin in (Union, types.UnionType):
         for branch in args:
-            if branch is types.NoneType and val is None:
-                return None
             try:
                 return _coerce_value_for_type(val, branch)
             except TypeError, ValueError, KeyError:
@@ -582,8 +580,6 @@ class ChatCompletionStream(AsyncStreamMixin[ChatCompletionChunk]):
             else:
                 self._enqueue_deltas(self._tag_parser.push(piece))
 
-        if not self._pending:
-            raise StopIteration
         return self._pending.popleft()
 
 

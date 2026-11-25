@@ -174,8 +174,10 @@ def test_configure_native_backends_env_cuda_plugin_local_and_windows(
     env_dir1 = tmp_path / "env1"
     env_dir2 = tmp_path / "env2"
     cuda_dir = tmp_path / "cuda_backends"
-    for d in (env_dir1, env_dir2, cuda_dir):
+    nix_ld_dir = tmp_path / "nix_ld"
+    for d in (env_dir1, env_dir2, cuda_dir, nix_ld_dir):
         d.mkdir()
+    (nix_ld_dir / "libstdc++.so.6").write_bytes(b"\x7fELF")
 
     fake_cuda = types.ModuleType("layerstream_cuda13")
     preloaded: list[bool] = []
@@ -187,7 +189,7 @@ def test_configure_native_backends_env_cuda_plugin_local_and_windows(
     monkeypatch.setenv("LAYERSTREAM_BACKEND_DIRS", f"{env_dir1}{os.pathsep}{env_dir1}")
     monkeypatch.setenv("LAYERSTREAM_BACKEND_DIR", str(env_dir2))
     monkeypatch.delenv("MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR", raising=False)
-    monkeypatch.delenv("NIX_LD_LIBRARY_PATH", raising=False)
+    monkeypatch.setenv("NIX_LD_LIBRARY_PATH", str(nix_ld_dir))
 
     cdll_calls: list[str] = []
 
@@ -656,9 +658,12 @@ def test_openai_schema_coercion_response_format_and_extra_body(
     class _Color(enum.StrEnum):
         RED = "red"
 
+    class _Size(enum.StrEnum):
+        SMALL = "small"
+
     assert ls_openai._coerce_value_for_type(None, int) is None
     assert ls_openai._coerce_value_for_type("raw", "ForwardRef") == "raw"
-    assert ls_openai._coerce_value_for_type("not-a-color", _Color | int) == "not-a-color"
+    assert ls_openai._coerce_value_for_type("not-a-color", _Color | _Size) == "not-a-color"
     assert ls_openai._coerce_value_for_type([1, 2], tuple[int, ...]) == (1, 2)
     assert ls_openai._coerce_value_for_type([1, 2, 3], tuple[int, int]) == (1, 2, 3)
     assert ls_openai._coerce_value_for_type({"k": "red"}, dict[str, _Color]) == {"k": _Color.RED}
@@ -736,7 +741,7 @@ async def test_openai_streams_model_manager_and_fallback_engines(
     assert any(c.choices[0].delta.content == '{"ok": true}' for c in chunks2)
     assert chunks2[-1].choices[0].finish_reason == "stop"
 
-    # AsyncStreamMixin.__anext__ cancellation closes stream
+    # AsyncStreamMixin.__anext__ cancellation closes stream (including double-CancelledError during close)
     cancel_inner = _FakeTokenStream(["x"])
     cancel_stream = ls_openai.CompletionStream(cancel_inner, "id3", 100, "m")
 
@@ -749,6 +754,17 @@ async def test_openai_streams_model_manager_and_fallback_engines(
     with pytest.raises(asyncio.CancelledError):
         await anext(cancel_stream)
     assert cancel_inner.closed is True
+
+    cancel_inner2 = _FakeTokenStream(["x"])
+    cancel_stream2 = ls_openai.CompletionStream(cancel_inner2, "id3b", 100, "m")
+
+    async def _always_cancelled_to_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(ls_openai.asyncio, "to_thread", _always_cancelled_to_thread)
+    with pytest.raises(asyncio.CancelledError):
+        await anext(cancel_stream2)
+    assert cancel_inner2.closed is True
     monkeypatch.undo()
 
     # _ModelManager: invalid model type, empty resolve, existing AutoModel instance, lazy load
@@ -802,8 +818,14 @@ async def test_openai_streams_model_manager_and_fallback_engines(
         bad_client.chat.completions.create(messages=[{"role": "user", "content": "hi"}])
     with pytest.raises(TypeError, match="expected string completion"):
         bad_client.completions.create(prompt="hi")
+    monkeypatch.setattr(bad_client.chat.completions, "_create_impl", lambda **kw: "not-a-chat-cmpl")
+    with pytest.raises(TypeError, match="expected non-streaming ChatCompletion"):
+        bad_client.chat.completions.parse(
+            messages=[{"role": "user", "content": "hi"}],
+            response_format={"type": "json_object"},
+        )
 
-    # Lazy resolve path + AsyncOpenAI.models.list()
+    # Lazy resolve path + single-default-model alias by model_path + AsyncOpenAI.models.list()
     lazy_backend = _FakeBackend(model_path="/lazy/m.gguf")
     monkeypatch.setattr(
         AutoModel,
@@ -816,6 +838,8 @@ async def test_openai_streams_model_manager_and_fallback_engines(
             messages=[{"role": "user", "content": "hi"}],
         )
         assert c_out.choices[0].finish_reason == "stop"
+        alias_out = await aclient.completions.create(model="/lazy/m.gguf", prompt="hi")
+        assert alias_out.model == "lazy-spec"
         models_page = await aclient.models.list()
         assert [m.id for m in models_page] == ["lazy-spec"]
     assert lazy_backend.unloaded is True

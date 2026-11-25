@@ -22,7 +22,10 @@ def _configure_native_backends() -> list[str]:
     local_backends = pkg_dir / "_backends"
 
     # On Windows, register `_backends` with the DLL loader so `llama.dll` / `ggml*.dll` resolve.
-    if os.name == "nt" and local_backends.is_dir() and hasattr(os, "add_dll_directory"):
+    # coverage: Windows-only DLL loader API; POSIX `pathlib.Path` raises UnsupportedOperation if `os.name == "nt"`.
+    if (
+        os.name == "nt" and local_backends.is_dir() and hasattr(os, "add_dll_directory")
+    ):  # pragma: no cover
         with contextlib.suppress(OSError):
             _DLL_DIR_HANDLES.append(os.add_dll_directory(str(local_backends)))
 
@@ -34,7 +37,8 @@ def _configure_native_backends() -> list[str]:
         if (stripped := raw_dir.strip()) and (p := Path(stripped)).is_dir()
     ]
     opengl_dir = Path("/run/opengl-driver/lib")
-    if opengl_dir.is_dir():
+    # coverage: NixOS-only host driver path; absent on standard Linux/macOS/Windows runners.
+    if opengl_dir.is_dir():  # pragma: no cover
         nix_host_dirs.append(opengl_dir)
     for lib_name in ("libstdc++.so.6", "libvulkan.so.1", "libcuda.so.1"):
         for host_dir in nix_host_dirs:
