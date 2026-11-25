@@ -210,6 +210,8 @@ def test_configure_native_backends_env_cuda_plugin_local_and_windows(
     assert str(ok_so) in cdll_calls
     assert str(ggml_so) in cdll_calls
     assert layerstream.configured_backend_dirs() == dirs
+    monkeypatch.delenv("LAYERSTREAM_BACKEND_DIRS", raising=False)
+    assert isinstance(layerstream.configured_backend_dirs(), list)
 
 
 async def test_init_serve_cleanup_automodel_guards_and_async_cm(
