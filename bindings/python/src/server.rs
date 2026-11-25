@@ -127,6 +127,20 @@ impl ServerHandle {
     }
 }
 
+impl ServerHandle {
+    pub(crate) fn base_url_str(&self) -> String {
+        self.base_url()
+    }
+
+    pub(crate) fn wait_py(&self, py: Python<'_>) -> PyResult<()> {
+        self.wait(py)
+    }
+
+    pub(crate) fn stop_py(&self, py: Python<'_>) -> PyResult<()> {
+        self.stop(py)
+    }
+}
+
 /// Start `layerstream-server` (native Rust `axum` + `tokio` OpenAI HTTP/SSE server) on a background
 /// runtime thread and return a `ServerHandle` immediately once the TCP socket is bound.
 #[pyfunction]
