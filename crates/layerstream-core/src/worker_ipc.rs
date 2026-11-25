@@ -1437,4 +1437,461 @@ mod tests {
         let rt = anyhow!("engine exploded");
         assert_eq!(classify_error(&rt).0, "RuntimeError");
     }
+
+    fn write_tiny_llama_gguf(path: &std::path::Path) {
+        const N_VOCAB: u64 = 64;
+        const N_EMBD: u64 = 64;
+        const N_HEAD: u32 = 2;
+        const N_FF: u64 = 128;
+        const N_LAYERS: u32 = 2;
+        const ALIGN: usize = 32;
+
+        let write_str = |buf: &mut Vec<u8>, s: &str| {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        };
+        let kv_str = |buf: &mut Vec<u8>, k: &str, v: &str| {
+            write_str(buf, k);
+            buf.extend_from_slice(&8u32.to_le_bytes());
+            write_str(buf, v);
+        };
+        let kv_u32 = |buf: &mut Vec<u8>, k: &str, v: u32| {
+            write_str(buf, k);
+            buf.extend_from_slice(&4u32.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        };
+        let kv_f32 = |buf: &mut Vec<u8>, k: &str, v: f32| {
+            write_str(buf, k);
+            buf.extend_from_slice(&6u32.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        };
+        let kv_bool = |buf: &mut Vec<u8>, k: &str, v: bool| {
+            write_str(buf, k);
+            buf.extend_from_slice(&7u32.to_le_bytes());
+            buf.push(u8::from(v));
+        };
+
+        let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next_f32 = |scale: f32| -> f32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let u = ((seed >> 40) as f32) / ((1u32 << 24) as f32);
+            (u * 2.0 - 1.0) * scale
+        };
+
+        struct TSpec {
+            name: String,
+            dims: Vec<u64>,
+            bytes: Vec<u8>,
+            rel_offset: u64,
+        }
+        let mut tensors: Vec<TSpec> = Vec::new();
+        let mut push_t = |name: String, dims: Vec<u64>, is_norm: bool| {
+            let nelems: usize = dims.iter().map(|&d| d as usize).product();
+            let mut bytes = Vec::with_capacity(nelems * 4);
+            for _ in 0..nelems {
+                let v = if is_norm {
+                    1.0 + next_f32(0.05)
+                } else {
+                    next_f32(0.15)
+                };
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            tensors.push(TSpec {
+                name,
+                dims,
+                bytes,
+                rel_offset: 0,
+            });
+        };
+
+        push_t("token_embd.weight".into(), vec![N_EMBD, N_VOCAB], false);
+        push_t("output_norm.weight".into(), vec![N_EMBD], true);
+        push_t("output.weight".into(), vec![N_EMBD, N_VOCAB], false);
+        for il in 0..N_LAYERS {
+            push_t(format!("blk.{il}.attn_norm.weight"), vec![N_EMBD], true);
+            push_t(
+                format!("blk.{il}.attn_q.weight"),
+                vec![N_EMBD, N_EMBD],
+                false,
+            );
+            push_t(
+                format!("blk.{il}.attn_k.weight"),
+                vec![N_EMBD, N_EMBD],
+                false,
+            );
+            push_t(
+                format!("blk.{il}.attn_v.weight"),
+                vec![N_EMBD, N_EMBD],
+                false,
+            );
+            push_t(
+                format!("blk.{il}.attn_output.weight"),
+                vec![N_EMBD, N_EMBD],
+                false,
+            );
+            push_t(format!("blk.{il}.ffn_norm.weight"), vec![N_EMBD], true);
+            push_t(
+                format!("blk.{il}.ffn_gate.weight"),
+                vec![N_EMBD, N_FF],
+                false,
+            );
+            push_t(format!("blk.{il}.ffn_up.weight"), vec![N_EMBD, N_FF], false);
+            push_t(
+                format!("blk.{il}.ffn_down.weight"),
+                vec![N_FF, N_EMBD],
+                false,
+            );
+        }
+
+        let mut cur_off = 0usize;
+        for t in &mut tensors {
+            cur_off = (cur_off + ALIGN - 1) & !(ALIGN - 1);
+            t.rel_offset = cur_off as u64;
+            cur_off += t.bytes.len();
+        }
+
+        let mut kv = Vec::new();
+        let mut kv_n = 0u64;
+        kv_str(&mut kv, "general.architecture", "llama");
+        kv_n += 1;
+        kv_str(&mut kv, "general.name", "tiny-ipc-test");
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.block_count", N_LAYERS);
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.context_length", 128);
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.embedding_length", N_EMBD as u32);
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.feed_forward_length", N_FF as u32);
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.attention.head_count", N_HEAD);
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.attention.head_count_kv", N_HEAD);
+        kv_n += 1;
+        kv_f32(&mut kv, "llama.attention.layer_norm_rms_epsilon", 1e-5);
+        kv_n += 1;
+        kv_f32(&mut kv, "llama.rope.freq_base", 10_000.0);
+        kv_n += 1;
+        kv_str(&mut kv, "tokenizer.ggml.model", "gpt2");
+        kv_n += 1;
+        kv_str(&mut kv, "tokenizer.ggml.pre", "default");
+        kv_n += 1;
+        write_str(&mut kv, "tokenizer.ggml.merges");
+        kv.extend_from_slice(&9u32.to_le_bytes());
+        kv.extend_from_slice(&8u32.to_le_bytes());
+        kv.extend_from_slice(&0u64.to_le_bytes());
+        kv_n += 1;
+        write_str(&mut kv, "tokenizer.ggml.tokens");
+        kv.extend_from_slice(&9u32.to_le_bytes());
+        kv.extend_from_slice(&8u32.to_le_bytes());
+        kv.extend_from_slice(&N_VOCAB.to_le_bytes());
+        for i in 0..N_VOCAB {
+            let tok = match i {
+                0 => "<bos>".to_string(),
+                1 => "<eos>".to_string(),
+                2 => " ".to_string(),
+                _ => {
+                    let ch = (b'a' + ((i - 3) % 26) as u8) as char;
+                    if i < 29 {
+                        ch.to_string()
+                    } else {
+                        format!("{ch}{i}")
+                    }
+                }
+            };
+            write_str(&mut kv, &tok);
+        }
+        kv_n += 1;
+        write_str(&mut kv, "tokenizer.ggml.token_type");
+        kv.extend_from_slice(&9u32.to_le_bytes());
+        kv.extend_from_slice(&5u32.to_le_bytes());
+        kv.extend_from_slice(&N_VOCAB.to_le_bytes());
+        for i in 0..N_VOCAB {
+            let tt: i32 = if i < 2 { 3 } else { 1 };
+            kv.extend_from_slice(&tt.to_le_bytes());
+        }
+        kv_n += 1;
+        kv_u32(&mut kv, "tokenizer.ggml.bos_token_id", 0);
+        kv_n += 1;
+        kv_u32(&mut kv, "tokenizer.ggml.eos_token_id", 1);
+        kv_n += 1;
+        kv_bool(&mut kv, "tokenizer.ggml.add_bos_token", true);
+        kv_n += 1;
+
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(b"GGUF");
+        hdr.extend_from_slice(&3u32.to_le_bytes());
+        hdr.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        hdr.extend_from_slice(&kv_n.to_le_bytes());
+        hdr.extend_from_slice(&kv);
+        for t in &tensors {
+            write_str(&mut hdr, &t.name);
+            hdr.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+            for &d in &t.dims {
+                hdr.extend_from_slice(&d.to_le_bytes());
+            }
+            hdr.extend_from_slice(&0u32.to_le_bytes());
+            hdr.extend_from_slice(&t.rel_offset.to_le_bytes());
+        }
+        let aligned = (hdr.len() + ALIGN - 1) & !(ALIGN - 1);
+        hdr.resize(aligned, 0);
+
+        let mut f = std::fs::File::create(path).expect("create temp gguf");
+        f.write_all(&hdr).expect("write hdr");
+        let mut written = 0usize;
+        for t in &tensors {
+            let pad = (t.rel_offset as usize).saturating_sub(written);
+            if pad > 0 {
+                f.write_all(&vec![0u8; pad]).expect("write pad");
+                written += pad;
+            }
+            f.write_all(&t.bytes).expect("write tensor");
+            written += t.bytes.len();
+        }
+        f.flush().expect("flush");
+    }
+
+    fn spawn_in_process_worker_pair() -> (WorkerClient, JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let srv_handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let writer = Arc::new(Mutex::new(stream.try_clone().expect("clone")));
+            let cancel_state: CancelState = Arc::new(Mutex::new((HashSet::new(), HashMap::new())));
+            let (work_tx, work_rx) = mpsc::channel::<Option<Value>>();
+            let eng_w = Arc::clone(&writer);
+            let eng_c = Arc::clone(&cancel_state);
+            let eng = thread::spawn(move || worker_engine_loop(work_rx, eng_w, eng_c));
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let op = msg.get("op").and_then(Value::as_str).unwrap_or("");
+                if op == "shutdown" {
+                    break;
+                }
+                if op == "cancel" {
+                    if let Some(tid) = msg
+                        .get("params")
+                        .and_then(|p| p.get("target_id"))
+                        .and_then(Value::as_u64)
+                    {
+                        let mut cs = cancel_state.lock();
+                        cs.0.insert(tid);
+                        if let Some(flag) = cs.1.get(&tid) {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    continue;
+                }
+                if work_tx.send(Some(msg)).is_err() {
+                    break;
+                }
+            }
+            let _ = work_tx.send(None);
+            let _ = eng.join();
+        });
+
+        let stream = TcpStream::connect(addr).expect("connect");
+        let reader = BufReader::new(stream.try_clone().expect("clone"));
+        let state = Arc::new(Mutex::new(WorkerState {
+            child: None,
+            child_stdin: None,
+            sock_writer: Some(stream),
+            reader_thread: None,
+            loaded: true,
+            model_path: None,
+            last_summary: None,
+            next_id: 1,
+            pending_rpc: HashMap::new(),
+            active_streams: HashMap::new(),
+        }));
+        let rs = Arc::clone(&state);
+        let rt = thread::spawn(move || reader_loop(reader, rs));
+        state.lock().reader_thread = Some(rt);
+        let client = WorkerClient {
+            state,
+            send_lock: Arc::new(Mutex::new(())),
+        };
+        (client, srv_handle)
+    }
+
+    #[test]
+    fn worker_ipc_in_process_full_rpc_and_streaming_lifecycle() {
+        let dir = std::env::temp_dir().join(format!("ls-worker-ipc-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let gguf = dir.join("tiny.gguf");
+        let kv_state = dir.join("kv.state");
+        write_tiny_llama_gguf(&gguf);
+
+        let (client, srv) = spawn_in_process_worker_pair();
+        assert!(!client.is_loaded()); // no Child handle in in-process harness
+        assert!(client.worker_pid().is_none());
+        assert!(client.model_path().is_none());
+        assert!(client.last_summary().is_none());
+
+        // Calling stats before open returns an error from worker_engine_loop.
+        let before_open = client.stats();
+        assert!(before_open.is_err());
+
+        // Open with missing file -> FileNotFoundError.
+        let bad_open = serde_json::to_value(WorkerOpenParams {
+            model: dir
+                .join("does-not-exist.gguf")
+                .to_string_lossy()
+                .into_owned(),
+            draft_model: None,
+            quant: None,
+            revision: None,
+            cache_dir: None,
+            vram_budget_auto: false,
+            vram_budget_bytes: 0,
+            resident_layers: Some(0),
+            ctx_size: 128,
+            batch_size: 32,
+            threads: Some(2),
+            kv_cache_type: KvCacheType::F16,
+            use_gpu: false,
+            prefer_direct_io: false,
+            cpu_embeddings: false,
+            cpu_head: false,
+            stream_head: false,
+            moe_active_streaming: true,
+            max_draft_tokens: 2,
+            verbose: false,
+            stream_progress: true,
+        })
+        .expect("serialize bad open");
+        let err = client.rpc_internal("open", bad_open, None).unwrap_err();
+        let we = err.downcast_ref::<WorkerError>().expect("WorkerError");
+        assert_eq!(we.kind, "FileNotFoundError");
+        assert!(!format!("{we}").is_empty());
+
+        // Open valid synthetic GGUF.
+        let good_open = serde_json::to_value(WorkerOpenParams {
+            model: gguf.to_string_lossy().into_owned(),
+            draft_model: None,
+            quant: None,
+            revision: None,
+            cache_dir: None,
+            vram_budget_auto: false,
+            vram_budget_bytes: 0,
+            resident_layers: Some(0),
+            ctx_size: 128,
+            batch_size: 32,
+            threads: Some(2),
+            kv_cache_type: KvCacheType::F16,
+            use_gpu: false,
+            prefer_direct_io: false,
+            cpu_embeddings: false,
+            cpu_head: false,
+            stream_head: false,
+            moe_active_streaming: true,
+            max_draft_tokens: 2,
+            verbose: false,
+            stream_progress: false,
+        })
+        .expect("serialize good open");
+        let (open_res, _) = client.rpc_internal("open", good_open, None).expect("open");
+        assert!(open_res["model_path"].as_str().is_some());
+
+        // Stats, tokenize, detokenize, apply_chat_template.
+        let snap = client.stats().expect("stats");
+        assert!(snap.isolated_worker);
+        assert_eq!(snap.n_layers, 2);
+        let toks = client.tokenize("abc", true, false).expect("tokenize");
+        assert!(!toks.is_empty());
+        let detok = client.detokenize(&toks).expect("detokenize");
+        assert!(!detok.is_empty());
+
+        let msgs = vec![IncomingChatMessage {
+            role: "user".to_string(),
+            content: json!("abc"),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "get_weather", "description": "desc", "parameters": {"type": "object"}}
+        })];
+        let tmpl = client
+            .apply_chat_template(&msgs, true, Some(&tools))
+            .expect("apply_chat_template");
+        assert!(!tmpl.is_empty());
+
+        // Generate + chat (with parse_output) + invalid sampling params error.
+        let gp = WorkerGenParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            parse_output: true,
+            tools: Some(tools.clone()),
+            ..WorkerGenParams::default()
+        };
+        let (gen_txt, gen_sum) = client.generate("abc", &gp).expect("generate");
+        assert!(!gen_txt.is_empty());
+        assert!(gen_sum.is_some());
+        assert!(client.last_summary().is_some());
+
+        let (chat_txt, parsed, chat_sum) = client.chat(&msgs, &gp).expect("chat");
+        assert!(!chat_txt.is_empty());
+        assert!(parsed.is_some());
+        assert!(chat_sum.is_some());
+
+        let bad_gp = WorkerGenParams {
+            temperature: -1.0,
+            ..WorkerGenParams::default()
+        };
+        assert!(client.generate("abc", &bad_gp).is_err());
+
+        // Streaming generate + streaming chat with cancel & close.
+        let mut gs = client.generate_stream("abc", &gp).expect("generate_stream");
+        let mut chunks = Vec::new();
+        while let Some(c) = gs.next_chunk().expect("next_chunk") {
+            chunks.push(c);
+        }
+        assert!(!chunks.is_empty());
+        assert!(gs.summary().is_some());
+        assert!(gs.next_chunk().expect("done next").is_none());
+
+        let long_gp = WorkerGenParams {
+            max_tokens: 16,
+            ..gp.clone()
+        };
+        let mut cs = client.chat_stream(&msgs, &long_gp).expect("chat_stream");
+        let cancel_h = cs.cancel_handle();
+        let _ = cs.next_chunk();
+        assert!(cancel_h.cancel());
+        cs.close();
+
+        // Repopulate KV after cancelled stream, then exercise save_state / kv_trim / kv_clear / load_state.
+        let _ = client.generate("abc", &gp).expect("repopulate kv");
+        let saved = client
+            .save_state(&kv_state.to_string_lossy())
+            .expect("save_state");
+        assert!(saved > 0);
+        let _ = client.kv_trim(1).expect("kv_trim");
+        client.kv_clear().expect("kv_clear");
+        let loaded = client
+            .load_state(&kv_state.to_string_lossy())
+            .expect("load_state");
+        assert_eq!(loaded, saved);
+        assert!(client.rpc_internal("bogus_op", json!({}), None).is_err());
+
+        // Unload cleanly and verify post-unload calls fail.
+        client.unload();
+        assert!(client.stats().is_err());
+        assert!(client.generate_stream("abc", &gp).is_err());
+        let _ = srv.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
