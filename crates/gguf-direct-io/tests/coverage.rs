@@ -213,13 +213,29 @@ fn large_layer_read_exercises_parallel_span_and_negative_cached_layer() {
         &dst[tensor_bytes - 4096..],
         &payload[4096 + tensor_bytes - 4096..4096 + tensor_bytes]
     );
+    // Exercise multi-span sparse io_uring batch path (2 distant slices > gap threshold).
+    let mut sparse_dst = vec![0u8; 8192];
+    pool.load_slices_into(
+        &[
+            ("blk.0.big", 0, 0, 4096, 0),
+            ("blk.0.big", 2 * 1024 * 1024, 4096, 4096, 1),
+        ],
+        &mut sparse_dst,
+    )
+    .unwrap();
+    assert_eq!(&sparse_dst[..4096], &payload[4096..8192]);
+    assert_eq!(
+        &sparse_dst[4096..],
+        &payload[4096 + 2 * 1024 * 1024..4096 + 2 * 1024 * 1024 + 4096]
+    );
 
-    // Exercise env-configured parallel O_DIRECT reads (`LAYERSTREAM_IO_THREADS=2`),
-    // `LAYERSTREAM_MOE_IO_THREADS`, `LAYERSTREAM_SPARSE_DIRECT_IO=1`,
+    // Exercise env-configured parallel O_DIRECT pread fallback (`LAYERSTREAM_IO_URING=0`,
+    // `LAYERSTREAM_IO_THREADS=2`), `LAYERSTREAM_MOE_IO_THREADS`, `LAYERSTREAM_SPARSE_DIRECT_IO=1`,
     // `LAYERSTREAM_IO_CHUNK_MB=4`, `LAYERSTREAM_EXPERT_CACHE_MB=4`, and
     // `LAYERSTREAM_PROFILE=1` (drop profile summary).
     // SAFETY: Tests run with `--test-threads 1` so env mutation is serialized.
     unsafe {
+        std::env::set_var("LAYERSTREAM_IO_URING", "0");
         std::env::set_var("LAYERSTREAM_IO_THREADS", "2");
         std::env::set_var("LAYERSTREAM_MOE_IO_THREADS", "2");
         std::env::set_var("LAYERSTREAM_SPARSE_DIRECT_IO", "1");
@@ -267,6 +283,7 @@ fn large_layer_read_exercises_parallel_span_and_negative_cached_layer() {
     }
     // SAFETY: Tests run with `--test-threads 1` so env mutation is serialized.
     unsafe {
+        std::env::remove_var("LAYERSTREAM_IO_URING");
         std::env::remove_var("LAYERSTREAM_IO_THREADS");
         std::env::remove_var("LAYERSTREAM_MOE_IO_THREADS");
         std::env::remove_var("LAYERSTREAM_SPARSE_DIRECT_IO");
