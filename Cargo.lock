@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "gguf-direct-io"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -594,7 +594,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hf-gguf"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "gguf-direct-io",
  "serde",
@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "json-schema-gbnf"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-plugin"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-server"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2432,7 +2432,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.4.1"
+version = "0.5.0"
 
 [[package]]
 name = "yoke"

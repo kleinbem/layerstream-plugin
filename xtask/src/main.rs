@@ -232,6 +232,20 @@ fn cmd_bump(root: &Path, ver: &str) -> Result<(), String> {
         fs::write(&p, updated).map_err(|e| format!("write {rel}: {e}"))?;
     }
 
+    // Update internal path-dependency version in crates/hf-gguf/Cargo.toml
+    {
+        let rel = "crates/hf-gguf/Cargo.toml";
+        let p = root.join(rel);
+        let text = fs::read_to_string(&p).map_err(|e| format!("read {rel}: {e}"))?;
+        let updated = replace_substring_delimited(
+            &text,
+            "gguf-direct-io = { path = \"../gguf-direct-io\", version = \"",
+            ver,
+        )
+        .ok_or_else(|| format!("gguf-direct-io path-dep version not found in {rel}"))?;
+        fs::write(&p, updated).map_err(|e| format!("write {rel}: {e}"))?;
+    }
+
     // Update `__version__ = "<ver>"` in python-cuda13
     {
         let rel = "bindings/python-cuda13/python/layerstream_cuda13/__init__.py";

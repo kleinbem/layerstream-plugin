@@ -2,7 +2,7 @@
 
 [package]
 name = "layerstream-py"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
