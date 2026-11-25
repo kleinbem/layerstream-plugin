@@ -531,3 +531,50 @@ jobs:
           packages-dir: pypi-dist-cuda13
           skip-existing: true
           attestations: true
+
+  publish-npm:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+      - build-node
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check npm opt-in variable
+        if: vars.NPM_PUBLISH != 'true'
+        run: |
+          echo "Skipping npm upload because vars.NPM_PUBLISH is not set to 'true' in repository, org, or npm environment."
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: vars.NPM_PUBLISH == 'true'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: vars.NPM_PUBLISH == 'true'
+        with:
+          pattern: layerstream-node-release-*
+          path: npm-dist
+          merge-multiple: true
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: vars.NPM_PUBLISH == 'true'
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Stage native addons and verify npm tarball
+        if: vars.NPM_PUBLISH == 'true'
+        working-directory: bindings/node
+        run: |
+          shopt -s nullglob
+          addons=(../../npm-dist/layerstream.*.node)
+          test "${#addons[@]}" -gt 0
+          cp "${addons[@]}" .
+          npm pack --dry-run
+
+      - name: Publish layerstream to npm via Trusted Publishing (OIDC + provenance)
+        if: vars.NPM_PUBLISH == 'true'
+        working-directory: bindings/node
+        run: npm publish --provenance --access public
