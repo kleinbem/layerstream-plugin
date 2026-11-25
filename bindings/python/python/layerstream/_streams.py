@@ -7,7 +7,7 @@ from types import TracebackType
 from typing import Any, override
 lazy import asyncio
 
-from ._layerstream import StreamTagParser
+from ._layerstream import StreamTagParser, normalize_finish_reason
 from ._openai_types import (
     ChatCompletionChunk,
     ChoiceDelta,
@@ -166,12 +166,10 @@ class ChatCompletionStream(AsyncStreamMixin[ChatCompletionChunk]):
                     self._enqueue_deltas(self._tag_parser.flush())
                 summary = getattr(self._stream, "summary", None)
                 raw_reason = summary["finish_reason"] if summary else "stop"
-                if self._tag_parser is not None and self._tag_parser.has_tool_calls:
-                    finish_reason = "tool_calls"
-                elif raw_reason == "length":
-                    finish_reason = "length"
-                else:
-                    finish_reason = "stop"
+                finish_reason = normalize_finish_reason(
+                    raw_reason,
+                    bool(self._tag_parser is not None and self._tag_parser.has_tool_calls),
+                )
                 self._pending.append(
                     ChatCompletionChunk(
                         id=self._id,

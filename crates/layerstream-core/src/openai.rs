@@ -3,8 +3,9 @@
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use crate::chat_parse::parse_assistant_output;
 use crate::engine::GenerateSummary;
 use crate::grammar::{json_object_gbnf, json_schema_to_gbnf};
 
@@ -234,6 +235,257 @@ pub fn compile_response_format(
             expects_json: true,
         }),
     }
+}
+
+/// Extract canonical OpenAI usage JSON (`prompt_tokens`, `completion_tokens`, `total_tokens`)
+/// from a summary JSON object (accepting both camelCase and snake_case keys).
+pub fn usage_value_from_summary(summary: Option<&Value>) -> Value {
+    let Some(obj) = summary.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let p = obj
+        .get("promptTokens")
+        .or_else(|| obj.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let c = obj
+        .get("completionTokens")
+        .or_else(|| obj.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({
+        "prompt_tokens": p,
+        "completion_tokens": c,
+        "total_tokens": p + c,
+    })
+}
+
+/// Extract raw `finishReason` / `finish_reason` from a summary JSON object (defaulting to `"stop"`).
+pub fn summary_finish_reason(summary: Option<&Value>) -> &str {
+    summary
+        .and_then(Value::as_object)
+        .and_then(|o| o.get("finishReason").or_else(|| o.get("finish_reason")))
+        .and_then(Value::as_str)
+        .unwrap_or("stop")
+}
+
+/// Assemble a canonical OpenAI `chat.completion` response JSON object from raw model output.
+pub fn build_chat_completion_value(
+    req_id: &str,
+    created: i64,
+    model_id: &str,
+    raw: &str,
+    structured_json: bool,
+    summary: Option<&Value>,
+) -> Value {
+    let raw_reason = summary_finish_reason(summary);
+
+    let (message, finish_reason) = if structured_json {
+        let msg = json!({
+            "role": "assistant",
+            "content": raw,
+            "reasoning_content": Value::Null,
+            "tool_calls": Value::Null,
+            "parsed": Value::Null,
+        });
+        (msg, normalize_finish_reason(raw_reason, false))
+    } else {
+        let parsed = parse_assistant_output(raw);
+        let tcs: Vec<Value> = parsed
+            .tool_calls
+            .into_iter()
+            .map(|tc| {
+                json!({
+                    "id": tc.id,
+                    "type": tc.kind,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                })
+            })
+            .collect();
+        let has_tcs = !tcs.is_empty();
+        let content_val = if !parsed.content.is_empty() || !has_tcs {
+            Value::String(parsed.content)
+        } else {
+            Value::Null
+        };
+        let reasoning_val = parsed.reasoning_content.map_or(Value::Null, Value::String);
+        let tool_calls_val = if has_tcs {
+            Value::Array(tcs)
+        } else {
+            Value::Null
+        };
+        let msg = json!({
+            "role": "assistant",
+            "content": content_val,
+            "reasoning_content": reasoning_val,
+            "tool_calls": tool_calls_val,
+            "parsed": Value::Null,
+        });
+        (msg, normalize_finish_reason(raw_reason, has_tcs))
+    };
+
+    json!({
+        "id": req_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_id,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+            "logprobs": Value::Null,
+        }],
+        "usage": usage_value_from_summary(summary),
+    })
+}
+
+/// Assemble a canonical OpenAI `text_completion` response JSON object.
+pub fn build_text_completion_value(
+    req_id: &str,
+    created: i64,
+    model_id: &str,
+    text: &str,
+    summary: Option<&Value>,
+) -> Value {
+    let reason = summary_finish_reason(summary);
+    json!({
+        "id": req_id,
+        "object": "text_completion",
+        "created": created,
+        "model": model_id,
+        "choices": [{
+            "text": text,
+            "index": 0,
+            "finish_reason": reason,
+            "logprobs": Value::Null,
+        }],
+        "usage": usage_value_from_summary(summary),
+    })
+}
+
+/// Assemble OpenAI `chat.completion.chunk` delta objects from parsed `StreamTagParser` events.
+pub fn build_chat_delta_chunks_value(
+    req_id: &str,
+    created: i64,
+    model_id: &str,
+    deltas: &[Value],
+) -> Value {
+    let mut chunks = Vec::with_capacity(deltas.len());
+    for ev in deltas {
+        let Some(obj) = ev.as_object() else {
+            continue;
+        };
+        let delta = match obj.get("type").and_then(Value::as_str) {
+            Some("content") => {
+                let text = obj.get("text").and_then(Value::as_str).unwrap_or("");
+                json!({ "content": text })
+            }
+            Some("reasoning") => {
+                let text = obj.get("text").and_then(Value::as_str).unwrap_or("");
+                json!({ "reasoning_content": text })
+            }
+            Some("tool_call") => {
+                let idx = obj.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let id = obj.get("id").and_then(Value::as_str).unwrap_or("call_ls_1");
+                let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
+                let arguments = obj.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                json!({
+                    "tool_calls": [{
+                        "index": idx,
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        },
+                    }]
+                })
+            }
+            _ => continue,
+        };
+        chunks.push(json!({
+            "id": req_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_id,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": Value::Null,
+                "logprobs": Value::Null,
+            }],
+            "usage": Value::Null,
+        }));
+    }
+    Value::Array(chunks)
+}
+
+/// Assemble the terminal OpenAI `chat.completion.chunk` with `finish_reason` and `usage`.
+pub fn build_chat_final_chunk_value(
+    req_id: &str,
+    created: i64,
+    model_id: &str,
+    has_tool_calls: bool,
+    summary: Option<&Value>,
+) -> Value {
+    let raw_reason = summary_finish_reason(summary);
+    let finish_reason = normalize_finish_reason(raw_reason, has_tool_calls);
+    json!({
+        "id": req_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_id,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": finish_reason,
+            "logprobs": Value::Null,
+        }],
+        "usage": usage_value_from_summary(summary),
+    })
+}
+
+/// Assemble a streaming OpenAI `text_completion` chunk (intermediate or terminal).
+pub fn build_text_stream_chunk_value(
+    req_id: &str,
+    created: i64,
+    model_id: &str,
+    text: &str,
+    final_chunk: bool,
+    summary: Option<&Value>,
+) -> Value {
+    if final_chunk {
+        let reason = summary_finish_reason(summary);
+        return json!({
+            "id": req_id,
+            "object": "text_completion",
+            "created": created,
+            "model": model_id,
+            "choices": [{
+                "text": "",
+                "index": 0,
+                "finish_reason": reason,
+                "logprobs": Value::Null,
+            }],
+            "usage": usage_value_from_summary(summary),
+        });
+    }
+    json!({
+        "id": req_id,
+        "object": "text_completion",
+        "created": created,
+        "model": model_id,
+        "choices": [{
+            "text": text,
+            "index": 0,
+            "finish_reason": Value::Null,
+            "logprobs": Value::Null,
+        }],
+        "usage": Value::Null,
+    })
 }
 
 #[cfg(test)]

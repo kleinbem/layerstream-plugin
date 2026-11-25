@@ -343,3 +343,12 @@ def run_cli(
     argv: Sequence[str],
     input_fn: Callable[[str], str] | None = None,
 ) -> int: ...
+def normalize_finish_reason(raw: str, has_tool_calls: bool) -> str: ...
+def build_chat_completion_dict(
+    req_id: str,
+    created: int,
+    model_id: str,
+    raw: str,
+    structured_json: bool,
+    summary: Mapping[str, Any] | None = None,
+) -> dict[str, Any]: ...
