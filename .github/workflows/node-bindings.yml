@@ -38,7 +38,7 @@ jobs:
 
       - name: TypeScript strict declaration check (tsc)
         working-directory: bindings/node
-        run: npx --yes typescript@5.9 --project tsconfig.json --noEmit
+        run: npx --yes --package typescript@5.9 -- tsc -p tsconfig.json --noEmit
 
   build-node:
     strategy:
