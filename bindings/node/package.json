@@ -37,6 +37,7 @@
     }
   },
   "files": [
+    "_shared.js",
     "index.js",
     "index.d.ts",
     "openai.js",
@@ -53,6 +54,7 @@
     "build": "node scripts/build-native.mjs --release",
     "build:debug": "node scripts/build-native.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test test/layerstream.test.js test/esm-and-native.test.mjs"
+    "test": "node --test test/layerstream.test.js test/esm-and-native.test.mjs test/coverage.unit.test.js",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-exclude=\"test/**\" --test-coverage-exclude=\"scripts/**\" --test-coverage-lines=100 test/layerstream.test.js test/esm-and-native.test.mjs test/coverage.unit.test.js"
   }
 }

@@ -1,20 +1,10 @@
 import path from "node:path";
+import { ASYNC_DISPOSE, createAbortError, isPlainObject, throwIfAborted } from "./_shared.js";
 import native from "./native.js";
 import { OpenAI } from "./openai.js";
-import { IsolatedWorkerClient } from "./worker.js";
+import { spawnWorker } from "./worker.js";
 
-const ASYNC_DISPOSE = Symbol.asyncDispose;
 const MAX_I32 = 2147483647;
-
-function createAbortError(signal) {
-  if (signal && signal.reason instanceof Error) {
-    return signal.reason;
-  }
-  const err = new Error("The operation was aborted");
-  err.name = "AbortError";
-  err.code = "ABORT_ERR";
-  return err;
-}
 
 function mapNativeError(err, signal = undefined) {
   if (signal?.aborted) {
@@ -31,10 +21,6 @@ function mapNativeError(err, signal = undefined) {
     }
   }
   return err;
-}
-
-function isPlainObject(val) {
-  return val !== null && typeof val === "object" && !Array.isArray(val);
 }
 
 function extractJsonSchemaString(schema) {
@@ -238,6 +224,25 @@ function normalizeOpenOptions(opts = {}) {
   };
 }
 
+async function withCancelToken(signal, fn) {
+  const cancelTok = signal ? new native.NativeCancelToken() : undefined;
+  const onAbort = cancelTok ? () => cancelTok.cancel() : null;
+  if (signal && onAbort) {
+    signal.addEventListener("abort", onAbort, { once: true });
+  }
+  try {
+    const out = await fn(cancelTok);
+    throwIfAborted(signal);
+    return out;
+  } catch (err) {
+    throw mapNativeError(err, signal);
+  } finally {
+    if (signal && onAbort) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+}
+
 class TokenStream {
   constructor(inner, signal = undefined) {
     this._inner = inner;
@@ -336,7 +341,7 @@ class AutoModel {
         const backend = await native.NativeAutoModel.open(model, JSON.stringify(wire));
         return new AutoModel(backend, false);
       }
-      const worker = await IsolatedWorkerClient.create(model, wire);
+      const worker = await spawnWorker(model, wire);
       return new AutoModel(worker, true);
     } catch (err) {
       throw mapNativeError(err);
@@ -435,13 +440,9 @@ class AutoModel {
     if (stream) {
       const wire = this._buildGenWire(opts, false);
       const wireJson = JSON.stringify(wire);
-      if (signal?.aborted) {
-        throw createAbortError(signal);
-      }
+      throwIfAborted(signal);
       try {
-        const inner = this._isolated
-          ? this._backend.startStream("generate_stream", { prompt, wire })
-          : this._backend.generateStream(prompt, wireJson);
+        const inner = this._backend.generateStream(prompt, wireJson);
         return new TokenStream(inner, signal);
       } catch (err) {
         throw mapNativeError(err, signal);
@@ -460,50 +461,25 @@ class AutoModel {
       throw new TypeError("generation options must be an object");
     }
     const signal = opts.signal;
-    if (signal?.aborted) {
-      throw createAbortError(signal);
-    }
+    throwIfAborted(signal);
     const wire = this._buildGenWire(opts, false);
     const wireJson = JSON.stringify(wire);
-    if (signal?.aborted) {
-      throw createAbortError(signal);
-    }
+    throwIfAborted(signal);
 
     if (this._isolated) {
-      const { result, summary } = await this._backend.rpcWithSummary(
-        "generate",
-        { prompt, wire },
-        signal,
-      );
-      if (signal?.aborted) {
-        throw createAbortError(signal);
+      try {
+        const out = await this._backend.generateWithSummary(prompt, wireJson);
+        throwIfAborted(signal);
+        return { text: String(out.text ?? ""), summary: out.summary ?? null };
+      } catch (err) {
+        throw mapNativeError(err, signal);
       }
-      return { text: String(result.text ?? ""), summary };
     }
 
-    const cancelTok = signal ? new native.NativeCancelToken() : undefined;
-    const onAbort = cancelTok ? () => cancelTok.cancel() : null;
-    if (signal && onAbort) {
-      signal.addEventListener("abort", onAbort, { once: true });
-      if (signal.aborted) {
-        signal.removeEventListener("abort", onAbort);
-        cancelTok.cancel();
-        throw createAbortError(signal);
-      }
-    }
-    try {
-      const out = await this._backend.generateWithSummary(prompt, wireJson, cancelTok);
-      if (signal?.aborted) {
-        throw createAbortError(signal);
-      }
-      return { text: out.text, summary: out.summary };
-    } catch (err) {
-      throw mapNativeError(err, signal);
-    } finally {
-      if (signal && onAbort) {
-        signal.removeEventListener("abort", onAbort);
-      }
-    }
+    const out = await withCancelToken(signal, (cancelTok) =>
+      this._backend.generateWithSummary(prompt, wireJson, cancelTok),
+    );
+    return { text: out.text, summary: out.summary };
   }
 
   async chat(messages, opts = {}) {
@@ -512,9 +488,7 @@ class AutoModel {
       throw new TypeError("generation options must be an object");
     }
     const signal = opts.signal;
-    if (signal?.aborted) {
-      throw createAbortError(signal);
-    }
+    throwIfAborted(signal);
     const stream = Boolean(opts.stream ?? false);
 
     if (stream) {
@@ -526,16 +500,10 @@ class AutoModel {
       }
       const messagesJson = JSON.stringify(cleanMessages);
       const wireJson = JSON.stringify(wire);
-      if (signal?.aborted) {
-        throw createAbortError(signal);
-      }
 
       if (this._isolated) {
         try {
-          const inner = this._backend.startStream("chat_stream", {
-            messages: cleanMessages,
-            wire,
-          });
+          const inner = this._backend.chatStream(messagesJson, wireJson);
           return new TokenStream(inner, signal);
         } catch (err) {
           throw mapNativeError(err, signal);
@@ -555,10 +523,6 @@ class AutoModel {
           ? new Promise((_resolve, reject) => {
               abortReject = reject;
               signal.addEventListener("abort", onAbort, { once: true });
-              if (signal.aborted) {
-                if (cancelTok) cancelTok.cancel();
-                reject(createAbortError(signal));
-              }
             })
           : null;
 
@@ -577,10 +541,6 @@ class AutoModel {
           inner = await Promise.race([startPromise, abortPromise]);
         } else {
           inner = await startPromise;
-        }
-        if (signal?.aborted) {
-          await inner.close();
-          throw createAbortError(signal);
         }
         return new TokenStream(inner, signal);
       } catch (err) {
@@ -602,53 +562,27 @@ class AutoModel {
       throw new TypeError("generation options must be an object");
     }
     const signal = opts.signal;
-    if (signal?.aborted) {
-      throw createAbortError(signal);
-    }
+    throwIfAborted(signal);
     const wire = this._buildGenWire(opts, true);
     const messagesJson = JSON.stringify(cleanMessages);
     const wireJson = JSON.stringify(wire);
-    if (signal?.aborted) {
-      throw createAbortError(signal);
-    }
 
     if (this._isolated) {
-      const { result, summary } = await this._backend.rpcWithSummary(
-        "chat",
-        { messages: cleanMessages, wire },
-        signal,
-      );
-      if (signal?.aborted) {
-        throw createAbortError(signal);
+      try {
+        const out = await this._backend.chatWithSummary(messagesJson, wireJson);
+        throwIfAborted(signal);
+        const payload = wire.parseOutput ? (out.parsed ?? null) : String(out.text ?? "");
+        return { payload, summary: out.summary ?? null };
+      } catch (err) {
+        throw mapNativeError(err, signal);
       }
-      const payload = wire.parseOutput ? result.parsed : String(result.text ?? "");
-      return { payload, summary };
     }
 
-    const cancelTok = signal ? new native.NativeCancelToken() : undefined;
-    const onAbort = cancelTok ? () => cancelTok.cancel() : null;
-    if (signal && onAbort) {
-      signal.addEventListener("abort", onAbort, { once: true });
-      if (signal.aborted) {
-        signal.removeEventListener("abort", onAbort);
-        cancelTok.cancel();
-        throw createAbortError(signal);
-      }
-    }
-    try {
-      const out = await this._backend.chatWithSummary(messagesJson, wireJson, cancelTok);
-      if (signal?.aborted) {
-        throw createAbortError(signal);
-      }
-      const payload = wire.parseOutput ? out.parsed : out.text;
-      return { payload, summary: out.summary };
-    } catch (err) {
-      throw mapNativeError(err, signal);
-    } finally {
-      if (signal && onAbort) {
-        signal.removeEventListener("abort", onAbort);
-      }
-    }
+    const out = await withCancelToken(signal, (cancelTok) =>
+      this._backend.chatWithSummary(messagesJson, wireJson, cancelTok),
+    );
+    const payload = wire.parseOutput ? out.parsed : out.text;
+    return { payload, summary: out.summary };
   }
 
   async tokenize(text, opts = {}) {
@@ -658,14 +592,6 @@ class AutoModel {
     const addSpecial = Boolean(opts.addSpecial ?? opts.add_special ?? false);
     const parseSpecial = Boolean(opts.parseSpecial ?? opts.parse_special ?? false);
     try {
-      if (this._isolated) {
-        const res = await this._backend.rpc("tokenize", {
-          text,
-          addSpecial,
-          parseSpecial,
-        });
-        return res.tokens;
-      }
       return await this._backend.tokenize(text, addSpecial, parseSpecial);
     } catch (err) {
       throw mapNativeError(err);
@@ -677,10 +603,6 @@ class AutoModel {
       throw new TypeError("tokens must be an array of integer token IDs");
     }
     try {
-      if (this._isolated) {
-        const res = await this._backend.rpc("detokenize", { tokens });
-        return res.text;
-      }
       return await this._backend.detokenize(tokens);
     } catch (err) {
       throw mapNativeError(err);
@@ -692,14 +614,6 @@ class AutoModel {
     const addGen = Boolean(opts.addGenerationPrompt ?? opts.add_generation_prompt ?? true);
     const tools = validateTools(opts.tools);
     try {
-      if (this._isolated) {
-        const res = await this._backend.rpc("apply_chat_template", {
-          messages: cleanMessages,
-          addGenerationPrompt: addGen,
-          tools: tools ?? null,
-        });
-        return res.prompt;
-      }
       return await this._backend.applyChatTemplate(
         JSON.stringify(cleanMessages),
         addGen,
@@ -712,10 +626,6 @@ class AutoModel {
 
   async kvClear() {
     try {
-      if (this._isolated) {
-        await this._backend.rpc("kv_clear", {});
-        return;
-      }
       await this._backend.kvClear();
     } catch (err) {
       throw mapNativeError(err);
@@ -727,10 +637,6 @@ class AutoModel {
       throw new RangeError("posMin must be a non-negative 32-bit integer");
     }
     try {
-      if (this._isolated) {
-        const res = await this._backend.rpc("kv_trim", { posMin });
-        return Boolean(res.trimmed);
-      }
       return await this._backend.kvTrim(posMin);
     } catch (err) {
       throw mapNativeError(err);
@@ -743,10 +649,6 @@ class AutoModel {
     }
     const resolvedPath = path.resolve(statePath);
     try {
-      if (this._isolated) {
-        const res = await this._backend.rpc("save_state", { path: resolvedPath });
-        return Number(res.tokens ?? 0);
-      }
       return await this._backend.saveState(resolvedPath);
     } catch (err) {
       throw mapNativeError(err);
@@ -759,10 +661,6 @@ class AutoModel {
     }
     const resolvedPath = path.resolve(statePath);
     try {
-      if (this._isolated) {
-        const res = await this._backend.rpc("load_state", { path: resolvedPath });
-        return Number(res.tokens ?? 0);
-      }
       return await this._backend.loadState(resolvedPath);
     } catch (err) {
       throw mapNativeError(err);

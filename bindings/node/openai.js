@@ -1,28 +1,7 @@
 import crypto from "node:crypto";
+import { ASYNC_DISPOSE, isPlainObject, throwIfAborted } from "./_shared.js";
 import { AutoModel } from "./index.js";
 import native from "./native.js";
-
-const ASYNC_DISPOSE = Symbol.asyncDispose;
-
-function isPlainObject(val) {
-  return val !== null && typeof val === "object" && !Array.isArray(val);
-}
-
-function createAbortError(signal) {
-  if (signal && signal.reason instanceof Error) {
-    return signal.reason;
-  }
-  const err = new Error("The operation was aborted");
-  err.name = "AbortError";
-  err.code = "ABORT_ERR";
-  return err;
-}
-
-function throwIfAborted(signal) {
-  if (signal?.aborted) {
-    throw createAbortError(signal);
-  }
-}
 
 function usageFromSummary(summary) {
   if (!summary) return null;
@@ -243,9 +222,6 @@ class ChatCompletionStream {
               this._enqueueDeltas(this._tagParser.push(piece));
             }
           }
-          if (this._closed || this._pending.length === 0) {
-            return { done: true, value: undefined };
-          }
           return { done: false, value: this._pending.shift() };
         } catch (err) {
           await this.close();
@@ -442,11 +418,15 @@ class ModelManager {
     return { object: "list", data };
   }
 
-  async unloadAll() {
+  async _drainInFlight() {
     while (this._initPromise || this._loadingModels.size > 0) {
       const pending = [this._initPromise, ...this._loadingModels.values()].filter(Boolean);
       await Promise.allSettled(pending);
     }
+  }
+
+  async unloadAll() {
+    await this._drainInFlight();
 
     let firstError = null;
     while (this._owned.size > 0) {
@@ -468,10 +448,7 @@ class ModelManager {
           firstError ??= err;
         }
       }
-      while (this._initPromise || this._loadingModels.size > 0) {
-        const pending = [this._initPromise, ...this._loadingModels.values()].filter(Boolean);
-        await Promise.allSettled(pending);
-      }
+      await this._drainInFlight();
     }
     if (firstError) {
       throw firstError;
