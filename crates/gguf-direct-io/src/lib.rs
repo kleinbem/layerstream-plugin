@@ -3,6 +3,8 @@
 
 pub mod gguf_index;
 pub mod io_reader;
+#[cfg(target_os = "linux")]
+mod uring;
 
 /// Error returned by GGUF indexing and direct I/O operations.
 #[derive(Debug, thiserror::Error)]

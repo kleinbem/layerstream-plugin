@@ -255,6 +255,7 @@ dependencies = [
 name = "gguf-direct-io"
 version = "0.4.1"
 dependencies = [
+ "io-uring",
  "libc",
  "parking_lot",
  "quick_cache",
@@ -305,6 +306,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878c26bc5e45fe089ce2ca25689260c152a87ce1d7de2ca86101efeea6973932"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
