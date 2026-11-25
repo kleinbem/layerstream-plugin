@@ -313,7 +313,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Rust Bundle B coverage (layerstream-core, server, ffi, plugin; gate >= 80%)
+      - name: Rust Bundle B coverage (layerstream-core, server, ffi, plugin; gate >= 82%)
         env:
           LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
         run: |
@@ -321,6 +321,6 @@ jobs:
           {
             echo "### Rust Bundle B Coverage (core, server, ffi, plugin)"
             echo '```'
-            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 80 -- --test-threads 1 | tee /dev/stderr
+            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 82 -- --test-threads 1 | tee /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
