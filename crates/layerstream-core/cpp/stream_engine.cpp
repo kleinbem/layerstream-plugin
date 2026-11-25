@@ -1219,40 +1219,157 @@ int ls_engine_load_state(
 }
 
 
-namespace ls_internal {
+extern "C" {
 
-llama_context * engine_ctx(const ls_engine * eng) {
-    return eng ? eng->ctx : nullptr;
+int ls_engine_run_decode_batch(
+    ls_engine * eng,
+    const int32_t * tokens,
+    int32_t n_tokens,
+    int32_t pos_start,
+    bool logits_all,
+    const char * prefetch_err_msg,
+    const char * decode_err_msg,
+    char * err_buf,
+    size_t err_cap
+) {
+    if (!eng || !eng->ctx || !tokens || n_tokens <= 0) {
+        ls_internal::set_error(err_buf, err_cap, "invalid arguments to ls_engine_run_decode_batch");
+        return -1;
+    }
+
+    auto report_failure = [&](int rc, const char * fallback_msg) -> int {
+        if (eng->is_cancelled()) {
+            ls_internal::set_error(err_buf, err_cap, "request cancelled");
+            return -100;
+        }
+        if (!eng->eval_error_msg.empty()) {
+            ls_internal::set_error(err_buf, err_cap, eng->eval_error_msg);
+        } else {
+            ls_internal::set_error(err_buf, err_cap, fallback_msg);
+        }
+        return rc != 0 ? rc : -3;
+    };
+
+    struct BatchExtGuard {
+        llama_batch_ext * batch = nullptr;
+        explicit BatchExtGuard(llama_context * c) : batch(llama_batch_ext_init(c)) {}
+        BatchExtGuard(const BatchExtGuard &) = delete;
+        BatchExtGuard & operator=(const BatchExtGuard &) = delete;
+        ~BatchExtGuard() {
+            if (batch) {
+                llama_batch_ext_free(batch);
+            }
+        }
+    } guard(eng->ctx);
+
+    if (!guard.batch) {
+        ls_internal::set_error(err_buf, err_cap, "llama_batch_ext_init returned null");
+        return -2;
+    }
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const int32_t idx = llama_batch_ext_add_token(guard.batch, 0, tokens[i]);
+        if (idx < 0) {
+            ls_internal::set_error(err_buf, err_cap, "llama_batch_ext_add_token failed");
+            return -2;
+        }
+        const llama_pos pos = pos_start + i;
+        llama_batch_ext_set_pos(guard.batch, idx, &pos);
+        llama_batch_ext_set_output_logits(guard.batch, idx, logits_all || (i == n_tokens - 1));
+    }
+
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = eng->profile_enabled ? Clock::now() : Clock::time_point{};
+    eng->prepare_decode_pass();
+    if (eng->eval_failed) {
+        return report_failure(-2, prefetch_err_msg);
+    }
+
+    const int rc = llama_process(eng->ctx, LLAMA_PROCESS_TYPE_DECODE, guard.batch);
+    if (eng->profile_enabled) {
+        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count();
+        eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
+        eng->prof_decode_total_us.fetch_add(static_cast<uint64_t>(dt), std::memory_order_relaxed);
+    }
+    if (rc != 0 || eng->eval_failed) {
+        return report_failure(rc, decode_err_msg);
+    }
+    return 0;
 }
 
-const llama_vocab * engine_vocab(const ls_engine * eng) {
+const float * ls_engine_get_logits_ith(const ls_engine * eng, int32_t idx) {
+    if (!eng || !eng->ctx) {
+        return nullptr;
+    }
+    return llama_get_logits_ith(eng->ctx, idx);
+}
+
+const llama_vocab * ls_engine_vocab_ptr(const ls_engine * eng) {
     return eng ? eng->vocab : nullptr;
 }
 
-void engine_prepare_decode_pass(ls_engine * eng) {
-    eng->prepare_decode_pass();
+llama_sampler * ls_llama_grammar_init_nothrow(
+    const llama_vocab * vocab,
+    const char * grammar_str,
+    const char * root,
+    char * err_buf,
+    size_t err_cap
+) {
+    try {
+        llama_sampler * smpl = llama_sampler_init_grammar(vocab, grammar_str, root);
+        if (!smpl) {
+            ls_internal::set_error(err_buf, err_cap, "failed to parse GBNF grammar");
+        }
+        return smpl;
+    } catch (const std::exception & e) {
+        ls_internal::set_error(err_buf, err_cap, std::string("GBNF grammar init exception: ") + e.what());
+        return nullptr;
+    } catch (...) {
+        ls_internal::set_error(err_buf, err_cap, "unknown GBNF grammar init exception");
+        return nullptr;
+    }
 }
 
-bool engine_is_cancelled(const ls_engine * eng) {
-    return eng->is_cancelled();
+int ls_llama_grammar_accept_nothrow(
+    llama_sampler * smpl,
+    int32_t token,
+    char * err_buf,
+    size_t err_cap
+) {
+    if (!smpl) {
+        return 0;
+    }
+    try {
+        llama_sampler_accept(smpl, token);
+        return 0;
+    } catch (const std::exception & e) {
+        ls_internal::set_error(err_buf, err_cap, std::string("grammar accept failed: ") + e.what());
+        return -1;
+    } catch (...) {
+        ls_internal::set_error(err_buf, err_cap, "unknown grammar accept exception");
+        return -1;
+    }
 }
 
-bool engine_eval_failed(const ls_engine * eng) {
-    return eng->eval_failed;
+int ls_llama_sampler_apply_nothrow(
+    llama_sampler * smpl,
+    llama_token_data_array * cur_p,
+    char * err_buf,
+    size_t err_cap
+) {
+    if (!smpl || !cur_p) {
+        return 0;
+    }
+    try {
+        llama_sampler_apply(smpl, cur_p);
+        return 0;
+    } catch (const std::exception & e) {
+        ls_internal::set_error(err_buf, err_cap, std::string("sampler apply failed: ") + e.what());
+        return -6;
+    } catch (...) {
+        ls_internal::set_error(err_buf, err_cap, "unknown sampler apply exception");
+        return -6;
+    }
 }
 
-std::string engine_eval_error_msg(const ls_engine * eng) {
-    return eng->eval_error_msg;
-}
-
-bool engine_profile_enabled(const ls_engine * eng) {
-    return eng->profile_enabled;
-}
-
-void engine_record_decode_pass_us(ls_engine * eng, uint64_t elapsed_us) {
-    eng->prof_pass_count.fetch_add(1, std::memory_order_relaxed);
-    eng->prof_decode_total_us.fetch_add(elapsed_us, std::memory_order_relaxed);
-}
-
-}  // namespace ls_internal
+}  // extern "C"
 

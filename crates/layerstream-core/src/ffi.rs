@@ -5,10 +5,13 @@ pub struct LsEngine {
     _private: [u8; 0],
 }
 
-#[repr(C)]
-pub struct LsGrammar {
-    _private: [u8; 0],
-}
+pub use crate::sampler::{
+    LsGrammar, ls_engine_eval_greedy, ls_engine_eval_sample, ls_engine_eval_verify_greedy,
+    ls_engine_eval_verify_sample, ls_engine_eval_verify_with_grammar, ls_engine_eval_with_grammar,
+    ls_grammar_accept, ls_grammar_create, ls_grammar_free, ls_sample_from_logits,
+    ls_sample_from_logits_with_history, ls_verify_sample_from_logits,
+    ls_verify_sample_from_logits_with_history,
+};
 
 pub type LsLoadTensorsCb = unsafe extern "C" fn(
     user_data: *mut c_void,
@@ -239,42 +242,6 @@ unsafe extern "C" {
 
     pub fn ls_set_log_verbose(verbose: bool);
 
-    pub fn ls_sample_from_logits(
-        logits: *const f32,
-        n_vocab: i32,
-        sample_params: *const LsSampleParams,
-    ) -> i32;
-
-    pub fn ls_sample_from_logits_with_history(
-        logits: *const f32,
-        n_vocab: i32,
-        sample_params: *const LsSampleParams,
-        penalty_tokens: *const i32,
-        n_penalty_tokens: i32,
-    ) -> i32;
-
-    pub fn ls_verify_sample_from_logits(
-        logits_per_pos: *const *const f32,
-        n_vocab: i32,
-        draft_tokens: *const i32,
-        k: i32,
-        sample_params: *const LsSampleParams,
-        out_accepted_count: *mut i32,
-        out_next_token: *mut i32,
-    );
-
-    pub fn ls_verify_sample_from_logits_with_history(
-        logits_per_pos: *const *const f32,
-        n_vocab: i32,
-        draft_tokens: *const i32,
-        k: i32,
-        sample_params: *const LsSampleParams,
-        penalty_tokens: *const i32,
-        n_penalty_tokens: i32,
-        out_accepted_count: *mut i32,
-        out_next_token: *mut i32,
-    );
-
     pub fn ls_engine_apply_chat_template(
         eng: *const LsEngine,
         messages: *const LsChatMessage,
@@ -322,99 +289,6 @@ unsafe extern "C" {
         out_tokens: *mut i32,
         cap_tokens: usize,
         out_n_tokens: *mut usize,
-        err_buf: *mut c_char,
-        err_cap: usize,
-    ) -> c_int;
-
-    pub fn ls_engine_eval_greedy(
-        eng: *mut LsEngine,
-        tokens: *const i32,
-        n_tokens: i32,
-        pos_start: i32,
-        out_next_token: *mut i32,
-        err_buf: *mut c_char,
-        err_cap: usize,
-    ) -> c_int;
-
-    pub fn ls_engine_eval_sample(
-        eng: *mut LsEngine,
-        tokens: *const i32,
-        n_tokens: i32,
-        pos_start: i32,
-        sample_params: *const LsSampleParams,
-        penalty_tokens: *const i32,
-        n_penalty_tokens: i32,
-        out_next_token: *mut i32,
-        err_buf: *mut c_char,
-        err_cap: usize,
-    ) -> c_int;
-
-    pub fn ls_engine_eval_verify_greedy(
-        eng: *mut LsEngine,
-        tokens: *const i32,
-        n_tokens: i32,
-        pos_start: i32,
-        out_argmax_tokens: *mut i32,
-        err_buf: *mut c_char,
-        err_cap: usize,
-    ) -> c_int;
-
-    pub fn ls_engine_eval_verify_sample(
-        eng: *mut LsEngine,
-        tokens: *const i32,
-        n_tokens: i32,
-        pos_start: i32,
-        sample_params: *const LsSampleParams,
-        penalty_tokens: *const i32,
-        n_penalty_tokens: i32,
-        out_accepted_count: *mut i32,
-        out_next_token: *mut i32,
-        err_buf: *mut c_char,
-        err_cap: usize,
-    ) -> c_int;
-
-    pub fn ls_grammar_create(
-        eng: *const LsEngine,
-        grammar_str: *const c_char,
-        root_rule: *const c_char,
-        err_buf: *mut c_char,
-        err_cap: usize,
-    ) -> *mut LsGrammar;
-
-    pub fn ls_grammar_free(grammar: *mut LsGrammar);
-
-    pub fn ls_grammar_accept(
-        grammar: *mut LsGrammar,
-        token: i32,
-        err_buf: *mut c_char,
-        err_cap: usize,
-    ) -> c_int;
-
-    pub fn ls_engine_eval_with_grammar(
-        eng: *mut LsEngine,
-        tokens: *const i32,
-        n_tokens: i32,
-        pos_start: i32,
-        sample_params: *const LsSampleParams,
-        penalty_tokens: *const i32,
-        n_penalty_tokens: i32,
-        grammar: *mut LsGrammar,
-        out_next_token: *mut i32,
-        err_buf: *mut c_char,
-        err_cap: usize,
-    ) -> c_int;
-
-    pub fn ls_engine_eval_verify_with_grammar(
-        eng: *mut LsEngine,
-        tokens: *const i32,
-        n_tokens: i32,
-        pos_start: i32,
-        sample_params: *const LsSampleParams,
-        penalty_tokens: *const i32,
-        n_penalty_tokens: i32,
-        grammar: *mut LsGrammar,
-        out_accepted_count: *mut i32,
-        out_next_token: *mut i32,
         err_buf: *mut c_char,
         err_cap: usize,
     ) -> c_int;

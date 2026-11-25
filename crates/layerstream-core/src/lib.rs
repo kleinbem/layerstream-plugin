@@ -8,6 +8,7 @@ pub mod hf;
 pub use gguf_direct_io::io_reader;
 pub mod openai;
 pub mod residency;
+pub mod sampler;
 #[cfg(feature = "hf")]
 pub mod sdk;
 pub mod speculator;
