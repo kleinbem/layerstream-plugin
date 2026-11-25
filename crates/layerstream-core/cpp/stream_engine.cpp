@@ -368,6 +368,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             probed_safe_cap_valid = true;
             probed_safe_cap = safe_cap;
 
+            constexpr uint64_t kMiB = 1024ULL * 1024ULL;
             if (cfg->resident_layers < 0) {
                 if (cfg->vram_budget_auto) {
                     // When auto=true, cfg->vram_budget_bytes carries optional draft reserve.
@@ -377,9 +378,9 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                     std::fprintf(
                         stderr,
                         "[layerstream-guard] auto VRAM budget: %llu MiB (probed %llu / %llu MiB free, unified=%s)\n",
-                        static_cast<unsigned long long>(effective_budget / (1024 * 1024)),
-                        static_cast<unsigned long long>(free_vram / (1024 * 1024)),
-                        static_cast<unsigned long long>(total_vram / (1024 * 1024)),
+                        static_cast<unsigned long long>(effective_budget / kMiB),
+                        static_cast<unsigned long long>(free_vram / kMiB),
+                        static_cast<unsigned long long>(total_vram / kMiB),
                         eng->is_unified_memory ? "true" : "false"
                     );
                 } else if (effective_budget > safe_cap) {
@@ -387,10 +388,10 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                         stderr,
                         "[layerstream-guard] requested --vram-budget-mb (%llu MiB) exceeds safe free GPU memory "
                         "(%llu MiB free / %llu MiB total); clamping to %llu MiB to prevent OOM/swap thrashing\n",
-                        static_cast<unsigned long long>(effective_budget / (1024 * 1024)),
-                        static_cast<unsigned long long>(free_vram / (1024 * 1024)),
-                        static_cast<unsigned long long>(total_vram / (1024 * 1024)),
-                        static_cast<unsigned long long>(safe_cap / (1024 * 1024))
+                        static_cast<unsigned long long>(effective_budget / kMiB),
+                        static_cast<unsigned long long>(free_vram / kMiB),
+                        static_cast<unsigned long long>(total_vram / kMiB),
+                        static_cast<unsigned long long>(safe_cap / kMiB)
                     );
                     effective_budget = safe_cap;
                 }
@@ -441,11 +442,12 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
                     ++clamped_r;
                 }
                 if (clamped_r < R) {
+                    constexpr uint64_t kMiB = 1024ULL * 1024ULL;
                     std::fprintf(
                         stderr,
                         "[layerstream-guard] requested resident_layers=%u exceeds safe GPU cap (%llu MiB); clamping to %u\n",
                         R,
-                        static_cast<unsigned long long>(max_allowed / (1024 * 1024)),
+                        static_cast<unsigned long long>(max_allowed / kMiB),
                         clamped_r
                     );
                     R = clamped_r;
@@ -454,13 +456,14 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         }
     } else if (effective_budget > 0) {
         if (kv_bytes * 2 > effective_budget && cfg->kv_cache_type == 0) {
+            constexpr uint64_t kMiB = 1024ULL * 1024ULL;
             std::fprintf(
                 stderr,
                 "[layerstream-guard] warning: F16 KV cache (~%llu MiB at ctx=%u) exceeds 50%% of VRAM budget (%llu MiB); "
                 "consider --kv-cache-type q8_0 or q4_0\n",
-                static_cast<unsigned long long>(kv_bytes / (1024 * 1024)),
+                static_cast<unsigned long long>(kv_bytes / kMiB),
                 n_ctx,
-                static_cast<unsigned long long>(effective_budget / (1024 * 1024))
+                static_cast<unsigned long long>(effective_budget / kMiB)
             );
         }
         uint64_t used = base_resident_bytes + reserve;

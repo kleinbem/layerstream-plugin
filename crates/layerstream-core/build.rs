@@ -199,8 +199,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_COMPILER");
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_HOST_COMPILER");
+    println!("cargo:rerun-if-env-changed=LAYERSTREAM_CPP_COVERAGE");
     for cpp_file in [
         "cpp/stream_engine.h",
+        "cpp/stream_engine_state.hpp",
         "cpp/llama_compat.hpp",
         "cpp/cuda_shim.hpp",
         "cpp/engine_internal.hpp",
@@ -324,11 +326,43 @@ fn main() {
         .file("cpp/stream_engine.cpp")
         .file("cpp/sampler_eval.cpp")
         .include("cpp")
-        .include(llama_dir.join("include"))
-        .include(llama_dir.join("src"))
-        .include(llama_dir.join("ggml/include"))
-        .include(llama_dir.join("ggml/src"))
-        .warnings(false);
+        .warnings(true)
+        .extra_warnings(true);
+
+    let compiler = cc_build.get_compiler();
+    let llama_includes = [
+        llama_dir.join("include"),
+        llama_dir.join("src"),
+        llama_dir.join("ggml/include"),
+        llama_dir.join("ggml/src"),
+    ];
+    if compiler.is_like_msvc() {
+        for dir in &llama_includes {
+            cc_build.include(dir);
+        }
+    } else {
+        // Mark third-party llama.cpp headers as system headers so strict warnings apply to our cpp/ files only.
+        for dir in &llama_includes {
+            cc_build.flag("-isystem").flag(dir);
+        }
+        cc_build
+            .flag_if_supported("-Wshadow")
+            .flag_if_supported("-Wformat=2")
+            .flag_if_supported("-Wnull-dereference")
+            .flag_if_supported("-Wnon-virtual-dtor");
+        if env::var("LAYERSTREAM_CPP_COVERAGE").ok().as_deref() == Some("1") {
+            cc_build
+                .flag("--coverage")
+                .flag("-U_FORTIFY_SOURCE")
+                .opt_level(0)
+                .debug(true);
+            if compiler.is_like_gnu() {
+                println!("cargo:rustc-link-lib=gcov");
+            } else {
+                println!("cargo:rustc-link-arg=--coverage");
+            }
+        }
+    }
 
     if dynamic_backends {
         cc_build.define("LAYERSTREAM_DYNAMIC_BACKENDS", None);
