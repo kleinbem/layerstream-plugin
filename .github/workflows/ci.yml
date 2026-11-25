@@ -233,6 +233,6 @@ jobs:
           {
             echo "### Rust Crate Coverage"
             echo '```'
-            cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --summary-only --fail-under-lines 85 -- --test-threads 1 | tee /dev/stderr
+            cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --summary-only --show-missing-lines --fail-under-lines 85 -- --test-threads 1 | tee /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
