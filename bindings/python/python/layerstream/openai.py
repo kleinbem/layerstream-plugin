@@ -8,7 +8,7 @@ lazy import asyncio
 lazy import time
 lazy import uuid
 
-from ._layerstream import parse_assistant_output
+from ._layerstream import build_chat_completion_dict
 from ._openai_types import (
     ChatCompletion,
     ChatCompletionChunk,
@@ -315,14 +315,14 @@ class _ChatCompletionsResource:
 
         if not isinstance(raw, str):
             raise TypeError("expected string chat completion")
-        raw_reason = summary["finish_reason"] if summary else "stop"
-
-        if grammar is not None:
-            msg: ChatCompletionMessage[Any] = ChatCompletionMessage(role="assistant", content=raw)
-            finish_reason = "length" if raw_reason == "length" else "stop"
-        else:
-            parsed_dict = parse_assistant_output(raw)
-            tcs = [
+        built = build_chat_completion_dict(
+            req_id, created, model_id, raw, grammar is not None, summary
+        )
+        choice0 = built["choices"][0]
+        msg_d = choice0["message"]
+        raw_tcs = msg_d["tool_calls"]
+        tcs = (
+            [
                 ChatCompletionMessageToolCall(
                     id=tc["id"],
                     type=tc["type"],
@@ -331,26 +331,22 @@ class _ChatCompletionsResource:
                         arguments=tc["function"]["arguments"],
                     ),
                 )
-                for tc in parsed_dict["tool_calls"]
+                for tc in raw_tcs
             ]
-            msg = ChatCompletionMessage(
-                role="assistant",
-                content=parsed_dict["content"] if parsed_dict["content"] or not tcs else None,
-                reasoning_content=parsed_dict["reasoning_content"],
-                tool_calls=tcs or None,
-            )
-            if tcs:
-                finish_reason = "tool_calls"
-            elif raw_reason == "length":
-                finish_reason = "length"
-            else:
-                finish_reason = "stop"
-
+            if raw_tcs
+            else None
+        )
+        msg: ChatCompletionMessage[Any] = ChatCompletionMessage(
+            role="assistant",
+            content=msg_d["content"],
+            reasoning_content=msg_d["reasoning_content"],
+            tool_calls=tcs,
+        )
         return ChatCompletion(
             id=req_id,
             created=created,
             model=model_id,
-            choices=[Choice(index=0, message=msg, finish_reason=finish_reason)],
+            choices=[Choice(index=0, message=msg, finish_reason=choice0["finish_reason"])],
             usage=usage_from_summary(summary),
         )
 

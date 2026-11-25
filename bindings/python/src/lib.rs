@@ -1425,6 +1425,39 @@ fn py_format_tools_system_prompt(tools: &Bound<'_, PyAny>) -> PyResult<String> {
     Ok(format_tools_system_prompt(&parsed))
 }
 
+#[pyfunction(name = "normalize_finish_reason")]
+fn py_normalize_finish_reason(raw: &str, has_tool_calls: bool) -> &'static str {
+    layerstream_core::normalize_finish_reason(raw, has_tool_calls)
+}
+
+#[pyfunction(name = "build_chat_completion_dict")]
+#[pyo3(signature = (req_id, created, model_id, raw, structured_json, summary=None))]
+fn py_build_chat_completion_dict<'py>(
+    py: Python<'py>,
+    req_id: &str,
+    created: i64,
+    model_id: &str,
+    raw: &str,
+    structured_json: bool,
+    summary: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let summary_val = match summary {
+        Some(obj) if !obj.is_none() => Some(pyany_to_json_value(obj, 0)?),
+        _ => None,
+    };
+    let val = layerstream_core::openai::build_chat_completion_value(
+        req_id,
+        created,
+        model_id,
+        raw,
+        structured_json,
+        summary_val.as_ref(),
+    );
+    json_to_py(py, &val)?
+        .cast_into::<PyDict>()
+        .map_err(|_| PyRuntimeError::new_err("expected dict from build_chat_completion_value"))
+}
+
 mod cli;
 mod worker;
 use worker::{PyWorkerClient, PyWorkerStream, map_worker_err};
@@ -1471,5 +1504,7 @@ fn _layerstream(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_compile_response_format, m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_assistant_output, m)?)?;
     m.add_function(wrap_pyfunction!(py_format_tools_system_prompt, m)?)?;
+    m.add_function(wrap_pyfunction!(py_normalize_finish_reason, m)?)?;
+    m.add_function(wrap_pyfunction!(py_build_chat_completion_dict, m)?)?;
     Ok(())
 }
