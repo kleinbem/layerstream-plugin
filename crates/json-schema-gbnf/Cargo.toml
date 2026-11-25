@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "Pure-Rust JSON Schema and RFC 8259 JSON-object to llama.cpp GBNF grammar compiler"
 repository = "https://github.com/kleinbem/layerstream-plugin"
-homepage = "https://github.com/kleinbem/layerstream-plugin"
 readme = "README.md"
 keywords = ["gbnf", "json-schema", "llama-cpp", "grammar", "llm"]
 categories = ["parsing", "text-processing"]

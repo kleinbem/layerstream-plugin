@@ -11,7 +11,7 @@ workspace = true
 
 [features]
 default = []
-hf = ["dep:hf-gguf"]
+hf = ["dep:hf-gguf", "dep:getrandom"]
 vulkan = []
 cuda = []
 metal = []
@@ -20,7 +20,7 @@ python-stage-backends = []
 
 [dependencies]
 anyhow.workspace = true
-getrandom.workspace = true
+getrandom = { workspace = true, optional = true }
 gguf-direct-io = { path = "../gguf-direct-io" }
 hf-gguf = { path = "../hf-gguf", optional = true }
 json-schema-gbnf = { path = "../json-schema-gbnf" }

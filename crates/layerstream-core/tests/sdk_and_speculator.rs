@@ -406,3 +406,172 @@ fn sdk_loaded_session_inspect_and_check_model_end_to_end() {
     // recommend_repo with invalid repo spec fails cleanly before network
     assert!(recommend_repo("not-a-valid-repo", RecommendOptions::default()).is_err());
 }
+
+#[cfg(feature = "hf")]
+#[test]
+fn sdk_pull_model_recommend_repo_and_worker_spawn_edges() {
+    use layerstream_core::sdk::pull_model;
+    use layerstream_core::worker_ipc::{WorkerClient, WorkerOpenParams};
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::net::TcpListener;
+
+    // Exercise WorkerOpenParams serde defaults (`default_true`, `default_ctx_size`, etc.)
+    let open_p: WorkerOpenParams =
+        serde_json::from_value(serde_json::json!({"model": "m.gguf"})).unwrap();
+    assert!(open_p.vram_budget_auto);
+    assert_eq!(open_p.ctx_size, 4096);
+    assert_eq!(open_p.batch_size, 512);
+    assert_eq!(open_p.max_draft_tokens, 5);
+    assert!(open_p.use_gpu);
+
+    // WorkerClient::spawn error paths: nonexistent binary + early-exiting child (`/bin/true` or `false`)
+    assert!(
+        WorkerClient::spawn(
+            "/nonexistent/layerstream-worker-bin",
+            &[],
+            open_p.clone(),
+            None
+        )
+        .is_err()
+    );
+    #[cfg(unix)]
+    assert!(WorkerClient::spawn("true", &[], open_p, None).is_err());
+
+    // Local mock Hugging Face Hub HTTP server for `pull_model` & `recommend_repo`
+    let tiny = write_tiny_llama_gguf(64, false);
+    let gguf_bytes = std::fs::read(tiny.path()).unwrap();
+    let gguf_len = gguf_bytes.len();
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let payload = gguf_bytes.clone();
+    let srv = std::thread::spawn(move || {
+        // Serve up to 16 requests then exit.
+        for _ in 0..16 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                continue;
+            }
+            // Drain headers
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" || h == "\n" {
+                    break;
+                }
+            }
+            let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+            if path.starts_with("/api/models/org/demo-GGUF/tree/") {
+                let body =
+                    format!(r#"[{{"type":"file","path":"demo-Q4_K_M.gguf","size":{gguf_len}}}]"#);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else if path.starts_with("/api/models/org/demo/tree/")
+                || path.starts_with("/api/models/org/empty")
+            {
+                let body = "[]";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else if path.contains("/resolve/") && path.ends_with(".gguf") {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(&payload);
+            } else {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+
+    let cache_dir = tempfile::tempdir().unwrap();
+    let prev_ep = std::env::var_os("HF_ENDPOINT");
+    // SAFETY: test runs with `--test-threads 1` in CI and local xtask.
+    unsafe {
+        std::env::set_var("HF_ENDPOINT", format!("http://{addr}"));
+    }
+
+    // 1. recommend_repo sibling `-GGUF` fallback
+    let (resolved_repo, recs) = recommend_repo(
+        "org/demo",
+        RecommendOptions {
+            free_ram_gb: Some(8.0),
+            nvme_mib_s: Some(2500.0),
+            cache_dir: Some(cache_dir.path().to_path_buf()),
+            use_gpu: false,
+            ..RecommendOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(resolved_repo, "org/demo-GGUF");
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].quant, "Q4_K_M");
+
+    // 2. recommend_repo empty repo error
+    assert!(
+        recommend_repo(
+            "org/empty",
+            RecommendOptions {
+                free_ram_gb: Some(4.0),
+                nvme_mib_s: Some(1000.0),
+                ..RecommendOptions::default()
+            }
+        )
+        .is_err()
+    );
+
+    // 3. pull_model via `hf://org/demo-GGUF:demo-Q4_K_M.gguf` (main + explicit revision)
+    let p1 = pull_model(
+        "hf://org/demo-GGUF:demo-Q4_K_M.gguf",
+        Some(cache_dir.path().to_path_buf()),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(p1.is_file());
+
+    let p2 = pull_model(
+        "hf://org/demo-GGUF:demo-Q4_K_M.gguf",
+        Some(cache_dir.path().to_path_buf()),
+        None,
+        Some("v1".to_string()),
+        None,
+    )
+    .unwrap();
+    assert!(p2.is_file());
+
+    // 4. pull_model via `org/demo-GGUF` shorthand
+    let p3 = pull_model(
+        "org/demo-GGUF",
+        Some(cache_dir.path().to_path_buf()),
+        Some("Q4_K_M".to_string()),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(p3.is_file());
+
+    // Restore HF_ENDPOINT
+    // SAFETY: test runs with `--test-threads 1`.
+    unsafe {
+        if let Some(v) = prev_ep {
+            std::env::set_var("HF_ENDPOINT", v);
+        } else {
+            std::env::remove_var("HF_ENDPOINT");
+        }
+    }
+    drop(srv);
+}
