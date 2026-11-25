@@ -8,7 +8,7 @@ version = "0.4.1"
 description = "Out-of-core GGUF layer-streaming LLM inference engine with O_DIRECT GPU streaming"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.14"
+requires-python = ">=3.15"
 keywords = [
     "llm",
     "gguf",
@@ -25,7 +25,6 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: 3.15",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -82,7 +81,7 @@ exclude_also = [
 ]
 
 [tool.ruff]
-target-version = "py314"
+target-version = "py315"
 line-length = 100
 src = ["python", "tests", "scripts"]
 
@@ -98,7 +97,7 @@ combine-as-imports = true
 "**/scripts/**" = ["S108", "S603", "S607"]
 
 [tool.pyright]
-pythonVersion = "3.14"
+pythonVersion = "3.15"
 extraPaths = ["python"]
 include = ["python/layerstream", "tests"]
 strict = ["python/layerstream"]

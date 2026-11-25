@@ -2,7 +2,7 @@
 
 Native Python SDK (`PyO3` + `maturin`) for [`layerstream-core`](https://github.com/kleinbem/layerstream-plugin/tree/main/crates/layerstream-core): an out-of-core GGUF layer-streaming inference engine backed by unpatched `llama.cpp`, `O_DIRECT` / `F_NOCACHE` async ping-pong GPU streaming, auto-sized hybrid residency, sparse MoE TinyLFU expert caching, and speculative decoding.
 
-## Installation (Python 3.14+, Zero Compile Required)
+## Installation (Python 3.15+, Zero Compile Required)
 
 ```bash
 # Apple Silicon (Metal), AMD, Intel, NVIDIA (Vulkan), or CPU fallback:

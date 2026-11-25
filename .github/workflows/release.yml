@@ -242,7 +242,7 @@ jobs:
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
@@ -321,9 +321,9 @@ jobs:
               export CXX="$(command -v g++)"
               export CUDAHOSTCXX="$CXX"
               export CMAKE_CUDA_HOST_COMPILER="$CXX"
-              PY_BIN=$(ls -1d /opt/python/cp314-cp314/bin/python /opt/python/cp315-cp315/bin/python 2>/dev/null | head -n 1)
+              PY_BIN=$(ls -1d /opt/python/cp315-cp315/bin/python 2>/dev/null | head -n 1)
               PY_DIR=$(dirname "$PY_BIN")
-              "$PY_BIN" -m pip install --upgrade pip "setuptools>=77" wheel "cmake>=3.31" ninja
+              "$PY_BIN" -m pip install --upgrade pip "setuptools>=77" "cmake>=3.31" ninja
               export PATH="$PY_DIR:/usr/local/cuda-13.5/bin:$PATH"
               export CUDAToolkit_ROOT="/usr/local/cuda-13.5"
               export LLAMA_CPP_DIR="/io/third_party/llama.cpp"
@@ -335,7 +335,7 @@ jobs:
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       - name: Verify layerstream-cuda13 metadata and record SHA-256
         working-directory: bindings/python-cuda13
@@ -505,7 +505,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: vars.PYPI_PUBLISH == 'true'
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       - name: Verify wheel metadata and split PyPI distributions
         if: vars.PYPI_PUBLISH == 'true'

@@ -96,12 +96,6 @@ impl PyWorkerStream {
     }
 }
 
-type WorkerChatResult<'py> = (
-    String,
-    Option<Bound<'py, PyDict>>,
-    Option<Bound<'py, PyDict>>,
-);
-
 #[pyclass(name = "NativeWorkerClient")]
 pub(crate) struct PyWorkerClient {
     inner: Arc<WorkerClient>,
@@ -110,31 +104,93 @@ pub(crate) struct PyWorkerClient {
 #[pymethods]
 impl PyWorkerClient {
     #[staticmethod]
-    #[pyo3(signature = (program, args, open_json, on_progress=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        program,
+        args,
+        model,
+        *,
+        draft_model=None,
+        quant=None,
+        revision=None,
+        cache_dir=None,
+        vram_budget_mb=VramBudgetArg::Auto,
+        resident_layers=None,
+        ctx_size=4096,
+        batch_size=512,
+        threads=None,
+        kv_cache_type="q8_0",
+        use_gpu=true,
+        prefer_direct_io=true,
+        cpu_embeddings=false,
+        cpu_head=false,
+        stream_head=false,
+        moe_active_streaming=true,
+        max_draft_tokens=5,
+        verbose=false,
+        on_progress=None,
+    ))]
     fn spawn(
         py: Python<'_>,
         program: String,
         args: Vec<String>,
-        open_json: String,
-        on_progress: Option<Py<PyAny>>,
+        model: String,
+        draft_model: Option<String>,
+        quant: Option<String>,
+        revision: Option<String>,
+        cache_dir: Option<PathBuf>,
+        vram_budget_mb: VramBudgetArg,
+        resident_layers: Option<u32>,
+        ctx_size: u32,
+        batch_size: u32,
+        threads: Option<u32>,
+        kv_cache_type: &str,
+        use_gpu: bool,
+        prefer_direct_io: bool,
+        cpu_embeddings: bool,
+        cpu_head: bool,
+        stream_head: bool,
+        moe_active_streaming: bool,
+        max_draft_tokens: usize,
+        verbose: bool,
+        on_progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let open: WorkerOpenParams = serde_json::from_str(&open_json)
-            .map_err(|e| PyValueError::new_err(format!("invalid worker open params: {e}")))?;
-        let progress_cb: Option<ProgressCallback> = on_progress.map(|cb| {
-            let cb = Arc::new(cb);
-            let f: ProgressCallback = Arc::new(move |ev: &DownloadProgress| {
-                Python::attach(|py| {
-                    let dict = serialize_to_pydict(py, ev)?;
-                    cb.bind(py).call1((dict,))?;
-                    Ok::<(), PyErr>(())
-                })
-                .map_err(|e| layerstream_core::hf::HfError::Cancelled(e.to_string()))
-            });
-            f
-        });
-        let client = py
-            .detach(move || WorkerClient::spawn(&program, &args, open, progress_cb))
-            .map_err(map_worker_err)?;
+        let kv_type = kv_cache_type
+            .parse::<KvCacheType>()
+            .map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+        let (vram_budget_auto, vram_budget_bytes) = match vram_budget_mb {
+            VramBudgetArg::Auto => (true, 0),
+            VramBudgetArg::Bytes(b) => (false, b),
+        };
+        let (progress_cb, err_slot) = build_progress_callback(on_progress)?;
+        let open = WorkerOpenParams {
+            model,
+            draft_model,
+            quant,
+            revision,
+            cache_dir,
+            vram_budget_auto,
+            vram_budget_bytes,
+            resident_layers,
+            ctx_size,
+            batch_size,
+            threads,
+            kv_cache_type: kv_type,
+            use_gpu,
+            prefer_direct_io,
+            cpu_embeddings,
+            cpu_head,
+            stream_head,
+            moe_active_streaming,
+            max_draft_tokens,
+            verbose,
+            stream_progress: progress_cb.is_some(),
+        };
+        let res = py.detach(move || WorkerClient::spawn(&program, &args, open, progress_cb));
+        if let Some(py_err) = err_slot.lock().take() {
+            return Err(py_err);
+        }
+        let client = res.map_err(map_worker_err)?;
         Ok(Self {
             inner: Arc::new(client),
         })
@@ -179,6 +235,7 @@ impl PyWorkerClient {
         Ok(d)
     }
 
+    #[pyo3(signature = (text, *, add_special=false, parse_special=false))]
     fn tokenize(
         &self,
         py: Python<'_>,
@@ -197,23 +254,20 @@ impl PyWorkerClient {
             .map_err(map_worker_err)
     }
 
-    #[pyo3(signature = (messages_json, add_generation_prompt=true, tools_json=None))]
+    #[pyo3(signature = (messages, *, add_generation_prompt=true, tools=None))]
     fn apply_chat_template(
         &self,
         py: Python<'_>,
-        messages_json: String,
+        messages: &Bound<'_, PyAny>,
         add_generation_prompt: bool,
-        tools_json: Option<String>,
+        tools: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<String> {
-        let msgs: Vec<IncomingChatMessage> = serde_json::from_str(&messages_json)
-            .map_err(|e| PyValueError::new_err(format!("invalid messages JSON: {e}")))?;
-        let tools: Option<Vec<JsonValue>> = tools_json
-            .map(|raw| serde_json::from_str(&raw))
-            .transpose()
-            .map_err(|e| PyValueError::new_err(format!("invalid tools JSON: {e}")))?;
+        let msgs = parse_incoming_chat_messages(messages)?;
+        let tools_vec = parse_tools_arg(tools)?;
+        let tools_opt = (!tools_vec.is_empty()).then_some(tools_vec);
         let client = Arc::clone(&self.inner);
         py.detach(move || {
-            client.apply_chat_template(&msgs, add_generation_prompt, tools.as_deref())
+            client.apply_chat_template(&msgs, add_generation_prompt, tools_opt.as_deref())
         })
         .map_err(map_worker_err)
     }
@@ -241,81 +295,229 @@ impl PyWorkerClient {
             .map_err(map_worker_err)
     }
 
-    fn generate<'py>(
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        prompt,
+        *,
+        max_tokens=256,
+        temperature=0.0,
+        top_p=0.95,
+        min_p=0.0,
+        top_k=40,
+        repeat_penalty=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        penalty_last_n=64,
+        seed=42,
+        stop=None,
+        stream=false,
+        ngram_speculation=true,
+        max_draft_tokens=None,
+        grammar=None,
+        json_schema=None,
+        return_summary=false,
+    ))]
+    fn generate(
         &self,
-        py: Python<'py>,
+        py: Python<'_>,
         prompt: String,
-        params_json: String,
-    ) -> PyResult<(String, Option<Bound<'py, PyDict>>)> {
-        let params: WorkerGenParams = serde_json::from_str(&params_json)
-            .map_err(|e| PyValueError::new_err(format!("invalid generate params: {e}")))?;
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        min_p: f32,
+        top_k: i32,
+        repeat_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        penalty_last_n: i32,
+        seed: u32,
+        stop: Option<&Bound<'_, PyAny>>,
+        stream: bool,
+        ngram_speculation: bool,
+        max_draft_tokens: Option<usize>,
+        grammar: Option<&str>,
+        json_schema: Option<&Bound<'_, PyAny>>,
+        return_summary: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let sample = build_sample_params(
+            temperature,
+            top_p,
+            min_p,
+            top_k,
+            repeat_penalty,
+            frequency_penalty,
+            presence_penalty,
+            penalty_last_n,
+            seed,
+        )?;
+        let stop_vec = parse_stop_sequences(stop)?;
+        let eff_grammar = resolve_grammar_arg(grammar, json_schema)?;
+        let params = WorkerGenParams {
+            max_tokens,
+            temperature: sample.temperature,
+            top_p: sample.top_p,
+            min_p: sample.min_p,
+            top_k: sample.top_k,
+            repeat_penalty: sample.repeat_penalty,
+            frequency_penalty: sample.frequency_penalty,
+            presence_penalty: sample.presence_penalty,
+            penalty_last_n: sample.penalty_last_n,
+            seed: sample.seed,
+            stop: stop_vec,
+            add_generation_prompt: true,
+            ngram_speculation,
+            max_draft_tokens,
+            tools: None,
+            grammar: eff_grammar,
+            parse_output: false,
+        };
         let client = Arc::clone(&self.inner);
+        if stream {
+            let ws = py
+                .detach(move || client.generate_stream(&prompt, &params))
+                .map_err(map_worker_err)?;
+            let cancel_handle = ws.cancel_handle();
+            let py_stream = Py::new(
+                py,
+                PyWorkerStream {
+                    inner: Mutex::new(Some(ws)),
+                    cancel_handle,
+                    closed: AtomicBool::new(false),
+                },
+            )?;
+            return Ok(py_stream.into_any());
+        }
         let (text, sum) = py
             .detach(move || client.generate(&prompt, &params))
             .map_err(map_worker_err)?;
-        let py_sum = sum.map(|s| serialize_to_pydict(py, &s)).transpose()?;
-        Ok((text, py_sum))
+        if return_summary {
+            let py_sum = sum.map(|s| serialize_to_pydict(py, &s)).transpose()?;
+            return Ok((text, py_sum).into_pyobject(py)?.into_any().unbind());
+        }
+        Ok(text.into_pyobject(py)?.into_any().unbind())
     }
 
-    fn chat<'py>(
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        messages,
+        *,
+        max_tokens=256,
+        temperature=0.0,
+        top_p=0.95,
+        min_p=0.0,
+        top_k=40,
+        repeat_penalty=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        penalty_last_n=64,
+        seed=42,
+        stop=None,
+        stream=false,
+        add_generation_prompt=true,
+        ngram_speculation=true,
+        max_draft_tokens=None,
+        tools=None,
+        grammar=None,
+        json_schema=None,
+        parse_output=false,
+        return_summary=false,
+    ))]
+    fn chat(
         &self,
-        py: Python<'py>,
-        messages_json: String,
-        params_json: String,
-    ) -> PyResult<WorkerChatResult<'py>> {
-        let msgs: Vec<IncomingChatMessage> = serde_json::from_str(&messages_json)
-            .map_err(|e| PyValueError::new_err(format!("invalid messages JSON: {e}")))?;
-        let params: WorkerGenParams = serde_json::from_str(&params_json)
-            .map_err(|e| PyValueError::new_err(format!("invalid chat params: {e}")))?;
+        py: Python<'_>,
+        messages: &Bound<'_, PyAny>,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        min_p: f32,
+        top_k: i32,
+        repeat_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        penalty_last_n: i32,
+        seed: u32,
+        stop: Option<&Bound<'_, PyAny>>,
+        stream: bool,
+        add_generation_prompt: bool,
+        ngram_speculation: bool,
+        max_draft_tokens: Option<usize>,
+        tools: Option<&Bound<'_, PyAny>>,
+        grammar: Option<&str>,
+        json_schema: Option<&Bound<'_, PyAny>>,
+        parse_output: bool,
+        return_summary: bool,
+    ) -> PyResult<Py<PyAny>> {
+        if stream && parse_output {
+            return Err(PyValueError::new_err(
+                "parse_output=True cannot be combined with stream=True (use StreamTagParser or layerstream.OpenAI)",
+            ));
+        }
+        let sample = build_sample_params(
+            temperature,
+            top_p,
+            min_p,
+            top_k,
+            repeat_penalty,
+            frequency_penalty,
+            presence_penalty,
+            penalty_last_n,
+            seed,
+        )?;
+        let stop_vec = parse_stop_sequences(stop)?;
+        let eff_grammar = resolve_grammar_arg(grammar, json_schema)?;
+        let msgs = parse_incoming_chat_messages(messages)?;
+        let tools_vec = parse_tools_arg(tools)?;
+        let params = WorkerGenParams {
+            max_tokens,
+            temperature: sample.temperature,
+            top_p: sample.top_p,
+            min_p: sample.min_p,
+            top_k: sample.top_k,
+            repeat_penalty: sample.repeat_penalty,
+            frequency_penalty: sample.frequency_penalty,
+            presence_penalty: sample.presence_penalty,
+            penalty_last_n: sample.penalty_last_n,
+            seed: sample.seed,
+            stop: stop_vec,
+            add_generation_prompt,
+            ngram_speculation,
+            max_draft_tokens,
+            tools: (!tools_vec.is_empty()).then_some(tools_vec),
+            grammar: eff_grammar,
+            parse_output,
+        };
         let client = Arc::clone(&self.inner);
+        if stream {
+            let ws = py
+                .detach(move || client.chat_stream(&msgs, &params))
+                .map_err(map_worker_err)?;
+            let cancel_handle = ws.cancel_handle();
+            let py_stream = Py::new(
+                py,
+                PyWorkerStream {
+                    inner: Mutex::new(Some(ws)),
+                    cancel_handle,
+                    closed: AtomicBool::new(false),
+                },
+            )?;
+            return Ok(py_stream.into_any());
+        }
         let (text, parsed, sum) = py
             .detach(move || client.chat(&msgs, &params))
             .map_err(map_worker_err)?;
-        let py_parsed = parsed.map(|p| serialize_to_pydict(py, &p)).transpose()?;
-        let py_sum = sum.map(|s| serialize_to_pydict(py, &s)).transpose()?;
-        Ok((text, py_parsed, py_sum))
-    }
-
-    fn generate_stream(
-        &self,
-        py: Python<'_>,
-        prompt: String,
-        params_json: String,
-    ) -> PyResult<PyWorkerStream> {
-        let params: WorkerGenParams = serde_json::from_str(&params_json)
-            .map_err(|e| PyValueError::new_err(format!("invalid generate params: {e}")))?;
-        let client = Arc::clone(&self.inner);
-        let stream = py
-            .detach(move || client.generate_stream(&prompt, &params))
-            .map_err(map_worker_err)?;
-        let cancel_handle = stream.cancel_handle();
-        Ok(PyWorkerStream {
-            inner: Mutex::new(Some(stream)),
-            cancel_handle,
-            closed: AtomicBool::new(false),
-        })
-    }
-
-    fn chat_stream(
-        &self,
-        py: Python<'_>,
-        messages_json: String,
-        params_json: String,
-    ) -> PyResult<PyWorkerStream> {
-        let msgs: Vec<IncomingChatMessage> = serde_json::from_str(&messages_json)
-            .map_err(|e| PyValueError::new_err(format!("invalid messages JSON: {e}")))?;
-        let params: WorkerGenParams = serde_json::from_str(&params_json)
-            .map_err(|e| PyValueError::new_err(format!("invalid chat params: {e}")))?;
-        let client = Arc::clone(&self.inner);
-        let stream = py
-            .detach(move || client.chat_stream(&msgs, &params))
-            .map_err(map_worker_err)?;
-        let cancel_handle = stream.cancel_handle();
-        Ok(PyWorkerStream {
-            inner: Mutex::new(Some(stream)),
-            cancel_handle,
-            closed: AtomicBool::new(false),
-        })
+        let payload: Py<PyAny> = if parse_output {
+            match parsed {
+                Some(p) => serialize_to_pydict(py, &p)?.into_any().unbind(),
+                None => py.None(),
+            }
+        } else {
+            text.into_pyobject(py)?.into_any().unbind()
+        };
+        if return_summary {
+            let py_sum = sum.map(|s| serialize_to_pydict(py, &s)).transpose()?;
+            return Ok((payload, py_sum).into_pyobject(py)?.into_any().unbind());
+        }
+        Ok(payload)
     }
 
     fn unload(&self, py: Python<'_>) {

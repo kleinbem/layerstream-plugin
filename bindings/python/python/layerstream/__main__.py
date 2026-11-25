@@ -5,13 +5,13 @@ and model diagnostics / downloads / inference to `layerstream-core`.
 """
 
 import argparse
-import json
 import os
-import subprocess
 import sys
-import time
 from collections.abc import Mapping
 from typing import Any, Literal
+lazy import json
+lazy import subprocess
+lazy import time
 
 from . import (
     AutoModel,

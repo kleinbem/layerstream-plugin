@@ -24,7 +24,16 @@ from typing import Any, Literal
 import pytest
 
 import layerstream
-from layerstream import AutoModel, TokenStream, __main__ as cli, _worker, openai as ls_openai
+from layerstream import (
+    AutoModel,
+    LayerStreamError,
+    TokenStream,
+    __main__ as cli,
+    _schema,
+    _streams,
+    _worker,
+    openai as ls_openai,
+)
 
 _LS: Any = layerstream
 
@@ -490,94 +499,9 @@ def test_cli_chat_repl_edge_cases_and_non_stream_guards(
 # ---------------------------------------------------------------------------
 
 
-def test_worker_validation_helpers_client_adapter_and_main(
+def test_worker_main_argument_handling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # _gen_params_json stop forms
-    p_str = json.loads(_worker._gen_params_json({"stop": "END"}))
-    assert p_str["stop"] == ["END"]
-    p_list = json.loads(_worker._gen_params_json({"stop": ("A", "B")}))
-    assert p_list["stop"] == ["A", "B"]
-
-    # serialize_schema_arg & _normalize_stop_and_grammar
-    gbnf = _worker.serialize_schema_arg({"type": "object", "properties": {"a": {"type": "string"}}})
-    assert gbnf is not None and "root ::=" in gbnf
-
-    with pytest.raises(ValueError, match="at most one"):
-        _worker._normalize_stop_and_grammar(None, 'root ::= "a"', {"type": "string"})
-    with pytest.raises(TypeError, match="stop must be"):
-        _worker._normalize_stop_and_grammar(123, None, None)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="stop must be"):
-        _worker._normalize_stop_and_grammar(["ok", 42], None, None)  # type: ignore[list-item]
-    with pytest.raises(ValueError, match="grammar must not be empty"):
-        _worker._normalize_stop_and_grammar(["a"], "   ", None)
-    assert _worker._normalize_stop_and_grammar(("x", "y"), None, None) == (["x", "y"], None)
-
-    # validate_tools_arg
-    with pytest.raises(TypeError, match="tools must be a sequence"):
-        _worker.validate_tools_arg("not-a-list")  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="each entry in 'tools'"):
-        _worker.validate_tools_arg(["bad"])  # type: ignore[list-item]
-    assert _worker.validate_tools_arg([{"type": "function"}]) == [{"type": "function"}]
-
-    # serialize_messages_arg
-    with pytest.raises(TypeError, match="messages must be an iterable"):
-        _worker.serialize_messages_arg("bad")  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="each message must be a mapping"):
-        _worker.serialize_messages_arg(["bad"])  # type: ignore[list-item]
-    with pytest.raises(ValueError, match="contain a 'role'"):
-        _worker.serialize_messages_arg([{"content": "hi"}])
-    with pytest.raises(TypeError, match="'role' must be a string"):
-        _worker.serialize_messages_arg([{"role": 1, "content": "hi"}])
-    with pytest.raises(ValueError, match="contain a 'content'"):
-        _worker.serialize_messages_arg([{"role": "user"}])
-    msgs = _worker.serialize_messages_arg(
-        [{"role": "assistant", "tool_calls": [{"id": "c1"}], "tool_call_id": "c1", "name": "fn"}]
-    )
-    assert msgs == [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": "c1"}],
-            "tool_call_id": "c1",
-            "name": "fn",
-        }
-    ]
-
-    # IsolatedWorkerClient adapter paths via fake NativeWorkerClient
-    class _FakeNativeWorker:
-        def __init__(self) -> None:
-            self.is_loaded = True
-            self.worker_pid = 4242
-            self.model_path = "/fake/w.gguf"
-            self.last_summary = {"finish_reason": "stop"}
-
-        def generate(self, prompt: str, params_json: str) -> tuple[str, dict[str, Any]]:
-            return "gen-text", {"finish_reason": "stop"}
-
-        def chat(
-            self, messages_json: str, params_json: str
-        ) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
-            return "chat-text", {"content": "chat-text"}, {"finish_reason": "stop"}
-
-        def chat_stream(self, messages_json: str, params_json: str) -> _FakeTokenStream:
-            return _FakeTokenStream(["a"])
-
-    client = object.__new__(_worker.IsolatedWorkerClient)
-    client._native = _FakeNativeWorker()  # type: ignore[assignment]
-    assert client.model_path == "/fake/w.gguf"
-    assert client.generate("hi", return_summary=True) == ("gen-text", {"finish_reason": "stop"})
-    with pytest.raises(ValueError, match="cannot be combined"):
-        client.chat([{"role": "user", "content": "hi"}], stream=True, parse_output=True)
-    assert isinstance(
-        client.chat([{"role": "user", "content": "hi"}], stream=True), _FakeTokenStream
-    )
-    assert client.chat([{"role": "user", "content": "hi"}], return_summary=True) == (
-        "chat-text",
-        {"finish_reason": "stop"},
-    )
-
-    # _worker._main() argument handling
     monkeypatch.setattr(sys, "argv", ["_worker.py"])
     with pytest.raises(SystemExit) as e1:
         _worker._main()
@@ -603,6 +527,7 @@ def test_worker_validation_helpers_client_adapter_and_main(
 def test_openai_schema_coercion_response_format_and_extra_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert issubclass(LayerStreamError, RuntimeError)
     # SyncPage iteration and default factory
     empty_page = ls_openai.SyncPage()
     assert list(empty_page) == []
@@ -621,40 +546,34 @@ def test_openai_schema_coercion_response_format_and_extra_body(
         def model_json_schema(cls) -> dict[str, Any]:
             return {"type": "object"}
 
-    class _V1Model:
         @classmethod
-        def schema(cls) -> dict[str, Any]:
-            return {"type": "object"}
+        def model_validate_json(cls, raw: str) -> dict[str, Any]:
+            return {"v2": json.loads(raw)}
 
-        @classmethod
-        def parse_raw(cls, raw: str) -> dict[str, Any]:
-            return {"v1": json.loads(raw)}
-
-    assert ls_openai._annotation_to_json_schema(Any, "f") == {}
-    assert ls_openai._annotation_to_json_schema(float, "f") == {"type": "number"}
-    assert ls_openai._annotation_to_json_schema(list, "f") == {"type": "array"}
-    assert ls_openai._annotation_to_json_schema(dict, "f") == {"type": "object"}
-    assert ls_openai._annotation_to_json_schema(_V2Model, "f") == {"type": "object"}
-    assert ls_openai._annotation_to_json_schema(_V1Model, "f") == {"type": "object"}
-    assert ls_openai._annotation_to_json_schema(tuple, "f") == {"type": "array"}
-    assert ls_openai._annotation_to_json_schema(typing.Tuple, "f") == {"type": "array"}  # noqa: UP006
-    assert ls_openai._annotation_to_json_schema(tuple[()], "f") == {"type": "array", "maxItems": 0}
-    assert ls_openai._annotation_to_json_schema(tuple[int, ...], "f") == {
+    assert _schema._annotation_to_json_schema(Any, "f") == {}
+    assert _schema._annotation_to_json_schema(float, "f") == {"type": "number"}
+    assert _schema._annotation_to_json_schema(list, "f") == {"type": "array"}
+    assert _schema._annotation_to_json_schema(dict, "f") == {"type": "object"}
+    assert _schema._annotation_to_json_schema(_V2Model, "f") == {"type": "object"}
+    assert _schema._annotation_to_json_schema(tuple, "f") == {"type": "array"}
+    assert _schema._annotation_to_json_schema(typing.Tuple, "f") == {"type": "array"}  # noqa: UP006
+    assert _schema._annotation_to_json_schema(tuple[()], "f") == {"type": "array", "maxItems": 0}
+    assert _schema._annotation_to_json_schema(tuple[int, ...], "f") == {
         "type": "array",
         "items": {"type": "integer"},
     }
-    assert ls_openai._annotation_to_json_schema(dict[str, int], "f") == {
+    assert _schema._annotation_to_json_schema(dict[str, int], "f") == {
         "type": "object",
         "additionalProperties": {"type": "integer"},
     }
-    assert ls_openai._annotation_to_json_schema(Mapping, "f") == {"type": "object"}
-    assert ls_openai._annotation_to_json_schema(typing.Dict, "f") == {"type": "object"}  # noqa: UP006
+    assert _schema._annotation_to_json_schema(Mapping, "f") == {"type": "object"}
+    assert _schema._annotation_to_json_schema(typing.Dict, "f") == {"type": "object"}  # noqa: UP006
     with pytest.raises(TypeError, match="unsupported Literal"):
-        ls_openai._annotation_to_json_schema(Literal[b"bytes"], "f")
+        _schema._annotation_to_json_schema(Literal[b"bytes"], "f")
     with pytest.raises(TypeError, match="must be 'str'"):
-        ls_openai._annotation_to_json_schema(dict[int, str], "f")
+        _schema._annotation_to_json_schema(dict[int, str], "f")
     with pytest.raises(TypeError, match="unsupported dataclass field annotation"):
-        ls_openai._annotation_to_json_schema(set[int], "f")
+        _schema._annotation_to_json_schema(set[int], "f")
 
     # _coerce_value_for_type edge cases
     class _Color(enum.StrEnum):
@@ -663,12 +582,12 @@ def test_openai_schema_coercion_response_format_and_extra_body(
     class _Size(enum.StrEnum):
         SMALL = "small"
 
-    assert ls_openai._coerce_value_for_type(None, int) is None
-    assert ls_openai._coerce_value_for_type("raw", "ForwardRef") == "raw"
-    assert ls_openai._coerce_value_for_type("not-a-color", _Color | _Size) == "not-a-color"
-    assert ls_openai._coerce_value_for_type([1, 2], tuple[int, ...]) == (1, 2)
-    assert ls_openai._coerce_value_for_type([1, 2, 3], tuple[int, int]) == (1, 2, 3)
-    assert ls_openai._coerce_value_for_type({"k": "red"}, dict[str, _Color]) == {"k": _Color.RED}
+    assert _schema._coerce_value_for_type(None, int) is None
+    assert _schema._coerce_value_for_type("raw", "ForwardRef") == "raw"
+    assert _schema._coerce_value_for_type("not-a-color", _Color | _Size) == "not-a-color"
+    assert _schema._coerce_value_for_type([1, 2], tuple[int, ...]) == (1, 2)
+    assert _schema._coerce_value_for_type([1, 2, 3], tuple[int, int]) == (1, 2, 3)
+    assert _schema._coerce_value_for_type({"k": "red"}, dict[str, _Color]) == {"k": _Color.RED}
 
     # Fake pydantic path in _dataclass_to_json_schema and _instantiate_dataclass
     @dataclasses.dataclass
@@ -686,22 +605,22 @@ def test_openai_schema_coercion_response_format_and_extra_body(
             return self._cls(**data)
 
     fake_pyd = types.SimpleNamespace(TypeAdapter=_FakeAdapter)
-    monkeypatch.setattr(ls_openai, "_get_pydantic", lambda: fake_pyd)
-    assert ls_openai._dataclass_to_json_schema(_SimpleDC)["type"] == "object"
-    assert ls_openai._instantiate_dataclass(_SimpleDC, {"x": 7}) == _SimpleDC(x=7)
-    monkeypatch.setattr(ls_openai, "_get_pydantic", lambda: None)
+    monkeypatch.setattr(_schema, "_get_pydantic", lambda: fake_pyd)
+    assert _schema._dataclass_to_json_schema(_SimpleDC)["type"] == "object"
+    assert _schema._instantiate_dataclass(_SimpleDC, {"x": 7}) == _SimpleDC(x=7)
+    monkeypatch.setattr(_schema, "_get_pydantic", lambda: None)
 
-    # _compile_response_format & _parse_structured_text & _usage_from_summary
+    # compile_response_format & parse_structured_text & usage_from_summary
     with pytest.raises(TypeError, match="unsupported response_format class"):
-        ls_openai._compile_response_format(int)
+        _schema.compile_response_format(int)
     with pytest.raises(TypeError, match="response_format must be"):
-        ls_openai._compile_response_format(123)
-    assert ls_openai._parse_structured_text("{}", None) is None
-    assert ls_openai._parse_structured_text('{"a": 1}', _V1Model) == {"v1": {"a": 1}}
-    assert ls_openai._parse_structured_text('{"a": 1}', dict) == {"a": 1}
+        _schema.compile_response_format(123)
+    assert _schema.parse_structured_text("{}", None) is None
+    assert _schema.parse_structured_text('{"a": 1}', _V2Model) == {"v2": {"a": 1}}
+    assert _schema.parse_structured_text('{"a": 1}', dict) == {"a": 1}
     with pytest.raises(ValueError, match="expected JSON object"):
-        ls_openai._parse_structured_text("[1, 2]", _SimpleDC)
-    assert ls_openai._usage_from_summary(None) is None
+        _schema.parse_structured_text("[1, 2]", _SimpleDC)
+    assert _streams.usage_from_summary(None) is None
 
     # _merge_extra_body remaining keys
     merged = ls_openai._merge_extra_body(
@@ -752,7 +671,7 @@ async def test_openai_streams_model_manager_and_fallback_engines(
             raise asyncio.CancelledError
         return fn(*args, **kwargs)
 
-    monkeypatch.setattr(ls_openai.asyncio, "to_thread", _cancelled_to_thread)
+    monkeypatch.setattr(_streams.asyncio, "to_thread", _cancelled_to_thread)
     with pytest.raises(asyncio.CancelledError):
         await anext(cancel_stream)
     assert cancel_inner.closed is True
@@ -763,7 +682,7 @@ async def test_openai_streams_model_manager_and_fallback_engines(
     async def _always_cancelled_to_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(ls_openai.asyncio, "to_thread", _always_cancelled_to_thread)
+    monkeypatch.setattr(_streams.asyncio, "to_thread", _always_cancelled_to_thread)
     with pytest.raises(asyncio.CancelledError):
         await anext(cancel_stream2)
     assert cancel_inner2.closed is True
