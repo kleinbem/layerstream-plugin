@@ -37,6 +37,7 @@
     }
   },
   "files": [
+    "_model.js",
     "_shared.js",
     "index.js",
     "index.d.ts",

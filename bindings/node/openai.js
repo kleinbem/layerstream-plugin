@@ -1,18 +1,7 @@
 import crypto from "node:crypto";
+import { AutoModel } from "./_model.js";
 import { ASYNC_DISPOSE, isPlainObject, throwIfAborted } from "./_shared.js";
-import { AutoModel } from "./index.js";
 import native from "./native.js";
-
-function usageFromSummary(summary) {
-  if (!summary) return null;
-  const p = Number(summary.promptTokens ?? summary.prompt_tokens ?? 0);
-  const c = Number(summary.completionTokens ?? summary.completion_tokens ?? 0);
-  return {
-    prompt_tokens: p,
-    completion_tokens: c,
-    total_tokens: p + c,
-  };
-}
 
 function compileResponseFormat(responseFormat) {
   if (responseFormat === undefined || responseFormat === null) {
@@ -141,21 +130,17 @@ class ChatCompletionStream {
                 this._enqueueDeltas(this._tagParser.flush());
               }
               const summary = this._stream.summary;
-              const rawReason = summary?.finishReason ?? "stop";
-              let finishReason = "stop";
-              if (this._tagParser?.hasToolCalls) {
-                finishReason = "tool_calls";
-              } else if (rawReason === "length") {
-                finishReason = "length";
-              }
-              this._pending.push({
-                id: this._id,
-                object: "chat.completion.chunk",
-                created: this._created,
-                model: this._modelId,
-                choices: [{ index: 0, delta: {}, finish_reason: finishReason, logprobs: null }],
-                usage: usageFromSummary(summary),
-              });
+              this._pending.push(
+                JSON.parse(
+                  native.buildChatFinalChunkJson(
+                    this._id,
+                    this._created,
+                    this._modelId,
+                    Boolean(this._tagParser?.hasToolCalls),
+                    summary ? JSON.stringify(summary) : null,
+                  ),
+                ),
+              );
               break;
             }
             const piece = step.value;
@@ -229,29 +214,32 @@ class CompletionStream {
           if (step.done) {
             this._finished = true;
             const summary = this._stream.summary;
-            const reason = summary?.finishReason ?? "stop";
             return {
               done: false,
-              value: {
-                id: this._id,
-                object: "text_completion",
-                created: this._created,
-                model: this._modelId,
-                choices: [{ text: "", index: 0, finish_reason: reason, logprobs: null }],
-                usage: usageFromSummary(summary),
-              },
+              value: JSON.parse(
+                native.buildTextStreamChunkJson(
+                  this._id,
+                  this._created,
+                  this._modelId,
+                  "",
+                  true,
+                  summary ? JSON.stringify(summary) : null,
+                ),
+              ),
             };
           }
           return {
             done: false,
-            value: {
-              id: this._id,
-              object: "text_completion",
-              created: this._created,
-              model: this._modelId,
-              choices: [{ text: step.value, index: 0, finish_reason: null, logprobs: null }],
-              usage: null,
-            },
+            value: JSON.parse(
+              native.buildTextStreamChunkJson(
+                this._id,
+                this._created,
+                this._modelId,
+                step.value,
+                false,
+                null,
+              ),
+            ),
           };
         } catch (err) {
           await this.close();
