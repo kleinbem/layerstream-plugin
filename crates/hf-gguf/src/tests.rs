@@ -1548,6 +1548,72 @@ fn covers_resolve_url_form_auto_draft_fallbacks_and_link_edge_cases() {
     server.join().unwrap();
 }
 
+#[test]
+fn covers_flock_race_emit_download_progress_and_link_parser_edge_cases() {
+    use crate::hub::parse_next_link_url;
+
+    // 1. `emit_download_progress` for both TTY and non-TTY, with and without `total_bytes`.
+    let mut ev = DownloadProgress {
+        repo_id: "o/r".into(),
+        filename: "m.gguf".into(),
+        shard_index: 1,
+        shard_count: 1,
+        downloaded_bytes: 512,
+        total_bytes: Some(1024),
+        mib_per_s: 25.0,
+        cached: false,
+        done: false,
+    };
+    emit_download_progress(&ev, true);
+    emit_download_progress(&ev, false);
+    ev.total_bytes = None;
+    emit_download_progress(&ev, true);
+    emit_download_progress(&ev, false);
+
+    // 2. Concurrent flock race: thread 1 holds `PartLock`, thread 2 enters `download_with_resume`,
+    //    thread 1 writes the completed file and drops the lock -> thread 2 observes cache hit!
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = HfSpec::parse("hf://Org/Race:model.gguf").unwrap();
+    let dest = spec.cache_path(tmp.path());
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let lock = PartLock::acquire(&lock_path_for(&dest)).unwrap();
+
+    let cache_dir = tmp.path().to_path_buf();
+    let saw_cached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = saw_cached.clone();
+    let t2 = std::thread::spawn(move || {
+        let cb: ProgressCallback = Arc::new(move |p| {
+            if p.cached && p.done {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        ensure_hf_downloaded_with_progress("hf://Org/Race:model.gguf", &cache_dir, Some(&cb))
+    });
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    fs::write(&dest, b"COMPLETED_BY_OTHER_PROCESS").unwrap();
+    drop(lock);
+    let resolved = t2.join().unwrap().unwrap();
+    assert_eq!(resolved, dest);
+    assert!(saw_cached.load(std::sync::atomic::Ordering::SeqCst));
+
+    // 3. `parse_next_link_url` edge cases: relative next URL, comma-separated links, missing rel.
+    let mut h1 = ureq::http::HeaderMap::new();
+    h1.insert(
+        "link",
+        "</api/page?cursor=3>; rel=\"next\", </prev>; rel=\"prev\""
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(
+        parse_next_link_url(&h1, "https://huggingface.co/api/page").as_deref(),
+        Some("https://huggingface.co/api/page?cursor=3")
+    );
+    let mut h2 = ureq::http::HeaderMap::new();
+    h2.insert("link", "malformed; rel=\"next\"".parse().unwrap());
+    assert_eq!(parse_next_link_url(&h2, "https://huggingface.co/api"), None);
+}
+
 fn make_sparse_gguf(path: &Path, arch: &str, tokens: &[&str], sparse_size: u64) {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"GGUF");

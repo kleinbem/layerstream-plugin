@@ -245,7 +245,10 @@ pub fn group_gguf_tree_entries(entries: &[HfTreeEntry]) -> Vec<HfGgufCandidate> 
 }
 
 /// Parses RFC 8288 `Link` header(s) and returns the `rel="next"` target URL, if present.
-fn parse_next_link_url(headers: &ureq::http::HeaderMap, base_url: &str) -> Option<String> {
+pub(crate) fn parse_next_link_url(
+    headers: &ureq::http::HeaderMap,
+    base_url: &str,
+) -> Option<String> {
     for val in headers.get_all("link") {
         let Ok(raw) = val.to_str() else {
             continue;

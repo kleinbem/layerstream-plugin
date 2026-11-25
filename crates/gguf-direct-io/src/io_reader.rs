@@ -545,7 +545,6 @@ impl LayerIoPool {
         let total_us = self.pread_us.fetch_add(elapsed_us, Ordering::Relaxed) + elapsed_us;
         // One-time slow-storage check after the first 128 MiB read: warns if running on
         // slow media (e.g., microSD, HDD, USB 2.0, or network share < 150 MiB/s).
-        // coverage: requires >=128 MiB read at <150 MiB/s (~850 ms stall); runtime diagnostic only.
         if total_bytes >= 128 * 1024 * 1024
             && total_us > 0
             && !self.slow_storage_warned.load(Ordering::Relaxed)
@@ -1736,5 +1735,11 @@ mod tests {
         let (mib_s, _direct) = probe_storage_mib_per_s(&shard_path, false).unwrap();
         assert!(mib_s >= 0.0);
         assert!(probe_dir_storage_mib_per_s(dir.path()).is_some());
+
+        // `record_io_sample` triggers one-time slow-storage warning at >=128 MiB and <150 MiB/s.
+        assert!(!pool.slow_storage_warned.load(Ordering::Relaxed));
+        pool.record_io_sample(128 * 1024 * 1024, 2_000_000); // 64 MiB/s
+        assert!(pool.slow_storage_warned.load(Ordering::Relaxed));
+        pool.record_io_sample(128 * 1024 * 1024, 2_000_000); // idempotent second call
     }
 }

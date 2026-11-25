@@ -833,6 +833,28 @@ fn render_tty_progress_bar(ev: &DownloadProgress) -> bool {
     err.write_all(line.as_bytes()).is_ok() && err.flush().is_ok()
 }
 
+fn emit_download_progress(ev: &DownloadProgress, tty_stderr: bool) {
+    if tty_stderr {
+        let _ = render_tty_progress_bar(ev);
+    } else if let Some(total) = ev.total_bytes {
+        let pct = (ev.downloaded_bytes as f64 / total.max(1) as f64) * 100.0;
+        eprintln!(
+            "[layerstream-hf] {}: {:.2} / {:.2} GiB ({pct:.1}%, {:.1} MiB/s)",
+            ev.filename,
+            ev.downloaded_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            total as f64 / (1024.0 * 1024.0 * 1024.0),
+            ev.mib_per_s,
+        );
+    } else {
+        eprintln!(
+            "[layerstream-hf] {}: {:.2} GiB ({:.1} MiB/s)",
+            ev.filename,
+            ev.downloaded_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            ev.mib_per_s,
+        );
+    }
+}
+
 fn download_with_resume(
     spec: &HfSpec,
     dest: &Path,
@@ -863,7 +885,6 @@ fn download_with_resume(
     let _lock = PartLock::acquire(&lock_path)?;
 
     // Another concurrent process may have completed the download while we waited for the lock.
-    // coverage: requires cross-process flock contention finishing while another process waits.
     if is_complete_cached_file(dest) {
         if let Some(cb) = on_progress {
             let sz = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
@@ -1154,6 +1175,11 @@ fn download_with_resume(
         downloaded += n as u64;
         session_bytes += n as u64;
 
+        let log_interval = if tty_stderr {
+            Duration::from_millis(120)
+        } else {
+            Duration::from_secs(2)
+        };
         if let Some(cb) = on_progress {
             if last_cb.elapsed() >= Duration::from_millis(100) {
                 let elapsed_s = start.elapsed().as_secs_f64().max(1e-3);
@@ -1171,13 +1197,11 @@ fn download_with_resume(
                 })?;
                 last_cb = Instant::now();
             }
-        // coverage: headless CI has `stderr().is_terminal() == false`, and unit-test downloads
-        // finish in <10 ms (below the 120 ms TTY / 2 s non-TTY progress log throttle).
-        } else if tty_stderr {
-            if last_log.elapsed() >= Duration::from_millis(120) {
-                let elapsed_s = start.elapsed().as_secs_f64().max(1e-3);
-                let mib_s = (session_bytes as f64 / (1024.0 * 1024.0)) / elapsed_s;
-                render_tty_progress_bar(&DownloadProgress {
+        } else if last_log.elapsed() >= log_interval {
+            let elapsed_s = start.elapsed().as_secs_f64().max(1e-3);
+            let mib_s = (session_bytes as f64 / (1024.0 * 1024.0)) / elapsed_s;
+            emit_download_progress(
+                &DownloadProgress {
                     repo_id: spec.repo_id.clone(),
                     filename: spec.filename.clone(),
                     shard_index,
@@ -1187,27 +1211,9 @@ fn download_with_resume(
                     mib_per_s: mib_s,
                     cached: false,
                     done: false,
-                });
-                last_log = Instant::now();
-            }
-        } else if last_log.elapsed() >= Duration::from_secs(2) {
-            let elapsed_s = start.elapsed().as_secs_f64().max(1e-3);
-            let mib_s = (session_bytes as f64 / (1024.0 * 1024.0)) / elapsed_s;
-            if let Some(total) = total_expected {
-                let pct = (downloaded as f64 / total.max(1) as f64) * 100.0;
-                eprintln!(
-                    "[layerstream-hf] {}: {:.2} / {:.2} GiB ({pct:.1}%, {mib_s:.1} MiB/s)",
-                    spec.filename,
-                    downloaded as f64 / (1024.0 * 1024.0 * 1024.0),
-                    total as f64 / (1024.0 * 1024.0 * 1024.0),
-                );
-            } else {
-                eprintln!(
-                    "[layerstream-hf] {}: {:.2} GiB ({mib_s:.1} MiB/s)",
-                    spec.filename,
-                    downloaded as f64 / (1024.0 * 1024.0 * 1024.0),
-                );
-            }
+                },
+                tty_stderr,
+            );
             last_log = Instant::now();
         }
     }
