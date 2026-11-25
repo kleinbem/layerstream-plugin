@@ -670,23 +670,46 @@ def test_isolated_worker_parity_and_process_reap(synthetic_gguf: Path) -> None:
     # Worker process must be completely terminated and reaped after context exit!
     assert not iso.is_loaded
     assert iso.worker_pid is None
-    # On Windows, process teardown after handle close can take a few milliseconds
-    # before `os.kill(pid, 0)` observes the exited PID.
-    deadline = time.monotonic() + (3.0 if os.name == "nt" else 0.5)
+    # On Windows, `os.kill(pid, 0)` can keep succeeding while the kernel holds the exited
+    # process object (or Defender inspects it); check `GetExitCodeProcess != STILL_ACTIVE`
+    # directly so Windows CI doesn't flake on slow teardown.
+    deadline = time.monotonic() + (10.0 if os.name == "nt" else 0.5)
+    exited = False
     last_err: OSError | None = None
-    while True:
-        try:
-            os.kill(pid, 0)
-        except OSError as exc:
-            last_err = exc
-            break
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(0.05)
-    assert last_err is not None, f"worker pid {pid} still alive after context exit"
-    assert isinstance(last_err, ProcessLookupError) or (
-        os.name == "nt" and getattr(last_err, "winerror", None) == 87
-    )
+    if os.name == "nt":
+        import ctypes
+
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        process_query_limited_info = 0x1000
+        still_active = 259
+        while True:
+            handle = k32.OpenProcess(process_query_limited_info, False, pid)
+            if not handle:
+                exited = True
+                break
+            code = ctypes.c_ulong(0)
+            ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
+            k32.CloseHandle(handle)
+            if not ok or code.value != still_active:
+                exited = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    else:
+        while True:
+            try:
+                os.kill(pid, 0)
+            except OSError as exc:
+                last_err = exc
+                exited = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    assert exited, f"worker pid {pid} still alive after context exit"
+    if os.name != "nt":
+        assert isinstance(last_err, ProcessLookupError)
 
 
 def test_grammar_and_json_schema_constrained_decoding(synthetic_json_gguf: Path) -> None:
