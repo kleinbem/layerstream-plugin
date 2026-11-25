@@ -69,6 +69,10 @@ test-python-fast:
 coverage-python:
     nix develop .#python -c bash -c 'cd bindings/python && PYTHONPATH=python pytest --cov=layerstream --cov-report=term-missing --cov-fail-under=100'
 
+# Measure Node.js SDK V8 line coverage (requires built `layerstream.*.node` addon in `bindings/node/`)
+coverage-node:
+    nix develop .#node -c bash -c 'cd bindings/node && npm run test:coverage'
+
 # Run real GPU parity smoke test (backend: vulkan or cuda) on local hardware (nixos-nvme / orin-nano)
 gpu-smoke backend="vulkan":
     @if [ "{{backend}}" = "cuda" ]; then \

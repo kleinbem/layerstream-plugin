@@ -26,11 +26,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
       - uses: biomejs/setup-biome@4c91541eaada48f67d7dbd7833600ce162b68f51 # v2.7.1
 
       - name: Lint and format check JS/TS (Biome)
         working-directory: bindings/node
         run: biome check .
+
+      - name: TypeScript strict declaration check (tsc)
+        working-directory: bindings/node
+        run: npx --yes --package typescript@5.9 -- tsc -p tsconfig.json --noEmit
 
   build-node:
     strategy:
@@ -104,10 +112,10 @@ jobs:
             codesign --verify --strict "layerstream.${{ matrix.napi_triple }}.node"
           fi
 
-      - name: Run Node.js & ESM integration test suite
+      - name: Run Node.js & ESM integration test suite with V8 coverage
         working-directory: bindings/node
         run: |
-          node --test test/layerstream.test.js
+          npm run test:coverage
           node --input-type=module -e 'import { AutoModel, OpenAI, version } from "./index.js"; if (!version || typeof AutoModel.fromPretrained !== "function" || typeof OpenAI !== "function") process.exit(1);'
           mkdir -p dist
           npm pack --pack-destination dist
