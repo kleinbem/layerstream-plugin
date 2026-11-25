@@ -588,4 +588,66 @@ mod tests {
         assert_eq!(normalize_kv_cache_type("q4_0").unwrap(), "q4_0");
         assert!(normalize_kv_cache_type("q2_k").is_err());
     }
+
+    #[test]
+    fn shared_openai_completion_and_stream_chunk_builders_cover_all_variants() {
+        let sum_camel = json!({"promptTokens": 4, "completionTokens": 6, "finishReason": "length"});
+        let sum_snake =
+            json!({"prompt_tokens": 2, "completion_tokens": 3, "finish_reason": "stop"});
+        assert_eq!(usage_value_from_summary(None), Value::Null);
+        assert_eq!(
+            usage_value_from_summary(Some(&sum_camel))["total_tokens"],
+            10
+        );
+        assert_eq!(
+            usage_value_from_summary(Some(&sum_snake))["total_tokens"],
+            5
+        );
+
+        // Structured JSON chat completion
+        let s_chat =
+            build_chat_completion_value("id1", 10, "m", r#"{"ok":true}"#, true, Some(&sum_camel));
+        assert_eq!(s_chat["choices"][0]["finish_reason"], "length");
+        assert_eq!(s_chat["choices"][0]["message"]["content"], r#"{"ok":true}"#);
+
+        // Unstructured chat completion with reasoning + tool_call
+        let raw =
+            r#"<think>plan</think><tool_call>{"name":"ping","arguments":{"a":1}}</tool_call>"#;
+        let t_chat = build_chat_completion_value("id2", 10, "m", raw, false, Some(&sum_snake));
+        assert_eq!(t_chat["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(t_chat["choices"][0]["message"]["reasoning_content"], "plan");
+        assert!(t_chat["choices"][0]["message"]["content"].is_null());
+
+        // Plain text chat completion
+        let p_chat = build_chat_completion_value("id3", 10, "m", "hello", false, None);
+        assert_eq!(p_chat["choices"][0]["finish_reason"], "stop");
+        assert_eq!(p_chat["choices"][0]["message"]["content"], "hello");
+
+        // Text completion + stream chunks
+        let tc = build_text_completion_value("c1", 10, "m", "hi", Some(&sum_snake));
+        assert_eq!(tc["choices"][0]["text"], "hi");
+        let mid = build_text_stream_chunk_value("c2", 10, "m", "tok", false, None);
+        assert_eq!(mid["choices"][0]["text"], "tok");
+        assert!(mid["usage"].is_null());
+        let fin = build_text_stream_chunk_value("c2", 10, "m", "", true, Some(&sum_camel));
+        assert_eq!(fin["choices"][0]["finish_reason"], "length");
+        assert_eq!(fin["usage"]["total_tokens"], 10);
+
+        // Delta chunks (content, reasoning, tool_call, unknown ignored)
+        let deltas = vec![
+            json!({"type": "content", "text": "hi"}),
+            json!({"type": "reasoning", "text": "hmm"}),
+            json!({"type": "tool_call", "index": 0, "id": "c1", "name": "fn", "arguments": "{}"}),
+            json!({"type": "ignored"}),
+            json!(42),
+        ];
+        let chunks = build_chat_delta_chunks_value("d1", 10, "m", &deltas);
+        assert_eq!(chunks.as_array().unwrap().len(), 3);
+
+        // Final chat chunk
+        let f_tc = build_chat_final_chunk_value("d1", 10, "m", true, Some(&sum_snake));
+        assert_eq!(f_tc["choices"][0]["finish_reason"], "tool_calls");
+        let f_len = build_chat_final_chunk_value("d1", 10, "m", false, Some(&sum_camel));
+        assert_eq!(f_len["choices"][0]["finish_reason"], "length");
+    }
 }

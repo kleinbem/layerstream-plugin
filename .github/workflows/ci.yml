@@ -264,12 +264,12 @@ jobs:
           LAYERSTREAM_CPP_COVERAGE: "1"
         run: |
           set -o pipefail
-          cargo test --locked -p layerstream-core -- --test-threads 1
+          cargo test --locked --target x86_64-unknown-linux-gnu -p layerstream-core -- --test-threads 1
           python3 - <<'PY' | tee /dev/stderr >> "$GITHUB_STEP_SUMMARY"
           import json, pathlib, subprocess, sys
           root = pathlib.Path("target")
-          gcdas = sorted(root.rglob("*-backend_loader.gcda")) + sorted(root.rglob("*-stream_engine.gcda"))
-          assert gcdas, "no .gcda files generated"
+          gcdas = sorted(root.rglob("*backend_loader.gcda")) + sorted(root.rglob("*stream_engine.gcda"))
+          assert gcdas, f"no .gcda files generated; all gcda: {list(root.rglob('*.gcda'))}"
           by_file = {}
           for g in gcdas:
               data = json.loads(subprocess.check_output(["gcov-14", "--json-format", "--stdout", g.name], cwd=g.parent, text=True))
@@ -323,7 +323,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Rust Bundle B coverage (layerstream-core, server, ffi, plugin)
+      - name: Rust Bundle B coverage (layerstream-core, server, ffi, plugin; gate >= 60%)
         env:
           LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
         run: |
@@ -331,6 +331,6 @@ jobs:
           {
             echo "### Rust Bundle B Coverage (core, server, ffi, plugin)"
             echo '```'
-            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines -- --test-threads 1 | tee /dev/stderr
+            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 60 -- --test-threads 1 | tee /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
