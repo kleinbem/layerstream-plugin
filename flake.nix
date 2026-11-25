@@ -107,6 +107,7 @@
                   ps: with ps; [
                     pytest
                     pytest-asyncio
+                    pytest-cov
                     pytest-timeout
                     hypothesis
                     pip

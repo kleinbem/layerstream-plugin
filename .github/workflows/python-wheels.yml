@@ -185,7 +185,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" dist python/layerstream/_backends || true
             python scripts/audit_wheel_elf.py dist/*.whl
           fi
-          uv pip install --system pytest pytest-asyncio pytest-timeout hypothesis twine
+          uv pip install --system pytest pytest-asyncio pytest-cov pytest-timeout hypothesis twine
           python -m twine check --strict dist/*.whl
           for whl in dist/*.whl; do
             echo "Built wheel: $whl"
@@ -198,7 +198,7 @@ jobs:
           done
           uv pip install --system --reinstall dist/*.whl
           layerstream --version
-          python -m pytest -v
+          python -m pytest -v --cov=layerstream --cov-report=term-missing --cov-fail-under=90
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: matrix.target == 'x86_64-unknown-linux-gnu'

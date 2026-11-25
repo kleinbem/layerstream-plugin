@@ -248,9 +248,9 @@ def _annotation_to_json_schema(
         return {"type": "number"}
     if tp is bool:
         return {"type": "boolean"}
-    if tp is list:
+    if tp in (list, tuple, Sequence):
         return {"type": "array"}
-    if tp is dict:
+    if tp in (dict, Mapping):
         return {"type": "object"}
 
     if isinstance(tp, type):
@@ -286,9 +286,9 @@ def _annotation_to_json_schema(
         )
     if origin is tuple:
         if not args:
+            if getattr(tp, "__args__", None) == ():
+                return {"type": "array", "maxItems": 0}
             return {"type": "array"}
-        if len(args) == 1 and args[0] == ():
-            return {"type": "array", "maxItems": 0}
         if len(args) == 2 and args[1] is Ellipsis:
             return {
                 "type": "array",

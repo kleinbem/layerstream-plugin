@@ -65,6 +65,10 @@ coverage:
 test-python-fast:
     nix develop .#python -c bash -c 'cd bindings/python && pytest -v tests/test_audit_wheel_elf.py tests/test_cuda13_plugin.py'
 
+# Measure Python SDK line coverage (requires built `_layerstream` extension in `bindings/python/python/layerstream/`)
+coverage-python:
+    nix develop .#python -c bash -c 'cd bindings/python && PYTHONPATH=python pytest --cov=layerstream --cov-report=term-missing --cov-fail-under=90'
+
 # Run real GPU parity smoke test (backend: vulkan or cuda) on local hardware (nixos-nvme / orin-nano)
 gpu-smoke backend="vulkan":
     @if [ "{{backend}}" = "cuda" ]; then \
