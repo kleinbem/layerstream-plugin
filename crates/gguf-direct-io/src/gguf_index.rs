@@ -1287,5 +1287,61 @@ mod tests {
         ));
         let io_err: GgufIoError = std::io::Error::other("boom").into();
         assert!(matches!(io_err, GgufIoError::Io { .. }));
+
+        // Remaining ggml_type block layouts (IQ1_S, IQ1_M, TQ1_0, TQ2_0, MXFP4, etc.).
+        for ty in [24, 25, 26, 27, 28, 34, 35, 39] {
+            let loc = TensorLocation {
+                name: "w".to_string(),
+                shard_idx: 0,
+                abs_offset: 0,
+                ggml_type: ty,
+                dims: vec![256],
+            };
+            let _ = loc.encoded_byte_len();
+        }
+
+        // `plan_coalesced_sub_slices_resolved` arithmetic overflow & shard-bounds errors.
+        let resolved_loc = idx.tensors["blk.3.attn_q.weight"].resolved();
+        assert!(matches!(
+            idx.plan_coalesced_sub_slices_resolved(&[(resolved_loc, u64::MAX, 0, 16, 0)]),
+            Err(GgufIoError::OutOfBounds(_))
+        ));
+        let unbounded_loc = ResolvedTensorLoc {
+            shard_idx: 0,
+            abs_offset: 64,
+            encoded_byte_len: None,
+        };
+        assert!(matches!(
+            idx.plan_coalesced_sub_slices_resolved(&[(unbounded_loc, u64::MAX, 0, 16, 0)]),
+            Err(GgufIoError::OutOfBounds(_))
+        ));
+        assert!(matches!(
+            idx.plan_coalesced_sub_slices_resolved(&[(unbounded_loc, 0, 0, 1_000_000, 0)]),
+            Err(GgufIoError::OutOfBounds(_))
+        ));
+
+        // Tensor with n_dims > MAX_GGUF_TENSOR_DIMS fails closed.
+        let mut bad_dims = gguf_header(3, 1, 0);
+        write_gguf_string(&mut bad_dims, "t");
+        bad_dims.extend_from_slice(&((MAX_GGUF_TENSOR_DIMS as u32) + 1).to_le_bytes());
+        let len_d = bad_dims.len() as u64;
+        let mut cur_d = Cursor::new(bad_dims);
+        assert!(matches!(
+            parse_single_header(&mut cur_d, 0, len_d, false),
+            Err(GgufIoError::InvalidFormat(_))
+        ));
+
+        // `tokenizer.ggml.tokens` with wrong element type (UINT32 instead of STRING) fails closed.
+        let mut bad_tok = gguf_header(3, 0, 1);
+        write_gguf_string(&mut bad_tok, "tokenizer.ggml.tokens");
+        bad_tok.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+        bad_tok.extend_from_slice(&4u32.to_le_bytes()); // UINT32 (invalid for tokens)
+        bad_tok.extend_from_slice(&1u64.to_le_bytes());
+        let len_t = bad_tok.len() as u64;
+        let mut cur_t = Cursor::new(bad_tok);
+        assert!(matches!(
+            parse_single_header(&mut cur_t, 0, len_t, true),
+            Err(GgufIoError::InvalidFormat(_))
+        ));
     }
 }

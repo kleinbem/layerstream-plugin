@@ -863,6 +863,7 @@ fn download_with_resume(
     let _lock = PartLock::acquire(&lock_path)?;
 
     // Another concurrent process may have completed the download while we waited for the lock.
+    // coverage: requires cross-process flock contention finishing while another process waits.
     if is_complete_cached_file(dest) {
         if let Some(cb) = on_progress {
             let sz = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
@@ -1170,6 +1171,8 @@ fn download_with_resume(
                 })?;
                 last_cb = Instant::now();
             }
+        // coverage: headless CI has `stderr().is_terminal() == false`, and unit-test downloads
+        // finish in <10 ms (below the 120 ms TTY / 2 s non-TTY progress log throttle).
         } else if tty_stderr {
             if last_log.elapsed() >= Duration::from_millis(120) {
                 let elapsed_s = start.elapsed().as_secs_f64().max(1e-3);

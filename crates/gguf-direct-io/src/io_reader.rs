@@ -77,6 +77,7 @@ unsafe impl Sync for AlignedBuf {}
 impl AlignedBuf {
     pub fn new(min_bytes: usize) -> Result<Self> {
         let base = min_bytes.max(DIRECT_IO_ALIGN as usize) as u64;
+        // coverage: 64-bit alignment overflow and OOM `alloc_zeroed() == null` are unreachable in normal unit tests.
         let rounded = base
             .checked_add(DIRECT_IO_ALIGN - 1)
             .map(|v| v & !(DIRECT_IO_ALIGN - 1))
@@ -544,6 +545,7 @@ impl LayerIoPool {
         let total_us = self.pread_us.fetch_add(elapsed_us, Ordering::Relaxed) + elapsed_us;
         // One-time slow-storage check after the first 128 MiB read: warns if running on
         // slow media (e.g., microSD, HDD, USB 2.0, or network share < 150 MiB/s).
+        // coverage: requires >=128 MiB read at <150 MiB/s (~850 ms stall); runtime diagnostic only.
         if total_bytes >= 128 * 1024 * 1024
             && total_us > 0
             && !self.slow_storage_warned.load(Ordering::Relaxed)

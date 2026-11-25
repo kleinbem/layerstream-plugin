@@ -1408,6 +1408,146 @@ fn covers_env_cache_dirs_hub_cache_hit_tokens_reentry_and_resume_edge_cases() {
     }
 }
 
+#[test]
+fn covers_resolve_url_form_auto_draft_fallbacks_and_link_edge_cases() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // `hf://org/repo/resolve/<rev>/file.gguf` form extracts revision automatically.
+    let parsed = HfSpec::parse("hf://Org/Repo/resolve/v2/sub/model.gguf").unwrap();
+    assert_eq!(parsed.repo_id, "Org/Repo");
+    assert_eq!(parsed.revision, "v2");
+    assert_eq!(parsed.filename, "sub/model.gguf");
+
+    // `extract_expected_sha256` never trusts a redirected CDN's ETag without hub_sha256.
+    let mut cdn_hdrs = ureq::http::HeaderMap::new();
+    cdn_hdrs.insert("etag", format!("\"{}\"", "b".repeat(64)).parse().unwrap());
+    assert_eq!(extract_expected_sha256(&cdn_hdrs, true, None), None);
+    assert!(extract_expected_sha256(&cdn_hdrs, false, None).is_some());
+
+    // Mock server testing:
+    // 1. `resolve_auto_draft_model_with_probe` fallback when `Q4_K_M` is absent (retries `quant: None`)
+    //    AND draft has incompatible vocabulary -> returns `Ok(None)` cleanly!
+    // 2. `resolve_auto_draft_model_with_probe` when draft repo returns 404 -> returns `Ok(None)` cleanly!
+    // 3. `resolve_pretrained_model_with_probe` with `use_gpu: false` and `vram_budget_bytes: None`.
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let target_p = tmp.path().join("big-qwen2.gguf");
+    make_sparse_gguf(&target_p, "qwen2", &["a", "b", "c"], 3 * 1024 * 1024 * 1024);
+    let target = ResolvedModel {
+        local_path: target_p,
+        source_uri: None,
+        resolved_repo: None,
+        selected_quant: None,
+    };
+
+    let bad_draft_src = tmp.path().join("bad_draft_src.gguf");
+    make_sparse_gguf(&bad_draft_src, "qwen2", &["X", "Y", "Z"], 1024);
+    let bad_draft_bytes = fs::read(&bad_draft_src).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bad_srv = bad_draft_bytes.clone();
+    let server = std::thread::spawn(move || {
+        for stream_res in listener.incoming() {
+            let Ok(mut stream) = stream_res else { break };
+            let mut req_buf = [0u8; 4096];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let req = String::from_utf8_lossy(&req_buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("");
+            if path.ends_with("/__stop") {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                break;
+            } else if path.contains("/api/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/tree/") {
+                // Only Q8_0 available (no Q4_K_M -> triggers quant=None retry!).
+                let body = r#"[{"type":"file","path":"Qwen2.5-0.5B-Q8_0.gguf","size":500000000}]"#;
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nLink: <http://{addr}/prev>; rel=\"prev\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            } else if path.ends_with("Qwen2.5-0.5B-Q8_0.gguf") {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bad_srv.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(&bad_srv);
+            } else {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        }
+    });
+
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe {
+        std::env::set_var("HF_ENDPOINT", format!("http://{addr}"));
+    }
+    let cache = tmp.path().join("cache");
+
+    // 1. Q4_K_M missing -> retries quant=None -> downloads Q8_0 -> vocab incompatible -> Ok(None).
+    assert!(
+        resolve_auto_draft_model_with_probe(
+            &target,
+            Some(cache.clone()),
+            Some(2 * 1024 * 1024 * 1024),
+            false,
+            None,
+            || None,
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // 2. Draft repo 404 -> falls back cleanly to Ok(None).
+    let gemma_p = tmp.path().join("big-gemma3.gguf");
+    make_sparse_gguf(&gemma_p, "gemma3", &["a", "b"], 3 * 1024 * 1024 * 1024);
+    let gemma_target = ResolvedModel {
+        local_path: gemma_p,
+        source_uri: None,
+        resolved_repo: None,
+        selected_quant: None,
+    };
+    assert!(
+        resolve_auto_draft_model_with_probe(
+            &gemma_target,
+            Some(cache.clone()),
+            None,
+            false,
+            None,
+            || None,
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // 3. `resolve_pretrained_model_with_probe` with `use_gpu: false` & `vram_budget_bytes: None`.
+    let cpu_opts = PretrainedResolveOptions {
+        cache_dir: Some(cache),
+        use_gpu: false,
+        vram_budget_bytes: None,
+        ..Default::default()
+    };
+    let cpu_res =
+        resolve_pretrained_model_with_probe("Qwen/Qwen2.5-0.5B-Instruct-GGUF", &cpu_opts, || None)
+            .unwrap();
+    assert_eq!(cpu_res.selected_quant.as_deref(), Some("Q8_0"));
+
+    let _ = ureq::get(&format!("http://{addr}/__stop")).call();
+    // SAFETY: Serialized by `ENV_LOCK`.
+    unsafe { std::env::remove_var("HF_ENDPOINT") };
+    server.join().unwrap();
+}
+
 fn make_sparse_gguf(path: &Path, arch: &str, tokens: &[&str], sparse_size: u64) {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"GGUF");
