@@ -208,7 +208,6 @@ fn main() {
         "cpp/engine_internal.hpp",
         "cpp/backend_loader.cpp",
         "cpp/stream_engine.cpp",
-        "cpp/sampler_eval.cpp",
     ] {
         println!("cargo:rerun-if-changed={cpp_file}");
     }
@@ -324,7 +323,6 @@ fn main() {
         .std("c++20")
         .file("cpp/backend_loader.cpp")
         .file("cpp/stream_engine.cpp")
-        .file("cpp/sampler_eval.cpp")
         .include("cpp")
         .warnings(true)
         .extra_warnings(true);
