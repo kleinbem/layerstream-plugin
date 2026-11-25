@@ -104,63 +104,17 @@ class ChatCompletionStream {
   }
 
   _enqueueDeltas(deltas) {
-    for (const ev of deltas) {
-      if (ev.type === "content") {
-        this._pending.push({
-          id: this._id,
-          object: "chat.completion.chunk",
-          created: this._created,
-          model: this._modelId,
-          choices: [
-            { index: 0, delta: { content: ev.text ?? "" }, finish_reason: null, logprobs: null },
-          ],
-          usage: null,
-        });
-      } else if (ev.type === "reasoning") {
-        this._pending.push({
-          id: this._id,
-          object: "chat.completion.chunk",
-          created: this._created,
-          model: this._modelId,
-          choices: [
-            {
-              index: 0,
-              delta: { reasoning_content: ev.text ?? "" },
-              finish_reason: null,
-              logprobs: null,
-            },
-          ],
-          usage: null,
-        });
-      } else if (ev.type === "tool_call") {
-        this._pending.push({
-          id: this._id,
-          object: "chat.completion.chunk",
-          created: this._created,
-          model: this._modelId,
-          choices: [
-            {
-              index: 0,
-              delta: {
-                tool_calls: [
-                  {
-                    index: ev.index ?? 0,
-                    id: ev.id ?? "call_ls_1",
-                    type: "function",
-                    function: {
-                      name: ev.name ?? "",
-                      arguments: ev.arguments ?? "{}",
-                    },
-                  },
-                ],
-              },
-              finish_reason: null,
-              logprobs: null,
-            },
-          ],
-          usage: null,
-        });
-      }
+    if (!deltas || deltas.length === 0) return;
+    const chunks = JSON.parse(
+      native.buildChatDeltaChunksJson(
+        this._id,
+        this._created,
+        this._modelId,
+        JSON.stringify(deltas),
+      ),
+    );
+    for (const chunk of chunks) {
+      this._pending.push(chunk);
     }
   }
 
@@ -456,6 +410,31 @@ class ModelManager {
   }
 }
 
+function extractGenOpts(params, defaultMaxTokens, signal, extras) {
+  return {
+    maxTokens:
+      params.max_completion_tokens ??
+      params.maxCompletionTokens ??
+      params.max_tokens ??
+      params.maxTokens ??
+      defaultMaxTokens,
+    temperature: params.temperature ?? 0.0,
+    topP: params.top_p ?? params.topP ?? 0.95,
+    minP: params.min_p ?? params.minP ?? 0.0,
+    topK: params.top_k ?? params.topK ?? 40,
+    repeatPenalty: params.repeat_penalty ?? params.repeatPenalty ?? 1.0,
+    frequencyPenalty: params.frequency_penalty ?? params.frequencyPenalty ?? 0.0,
+    presencePenalty: params.presence_penalty ?? params.presencePenalty ?? 0.0,
+    penaltyLastN: params.penalty_last_n ?? params.penaltyLastN ?? 64,
+    seed: params.seed ?? 42,
+    stop: params.stop,
+    ngramSpeculation: params.ngram_speculation ?? params.ngramSpeculation ?? true,
+    maxDraftTokens: params.max_draft_tokens ?? params.maxDraftTokens,
+    signal,
+    ...extras,
+  };
+}
+
 class ChatCompletionsResource {
   constructor(mgr) {
     this._mgr = mgr;
@@ -476,33 +455,9 @@ class ChatCompletionsResource {
     const { modelId, engine } = await this._mgr.resolve(params.model);
     throwIfAborted(signal);
 
-    const maxTokens =
-      params.max_completion_tokens ??
-      params.maxCompletionTokens ??
-      params.max_tokens ??
-      params.maxTokens ??
-      512;
     const reqId = `chatcmpl-ls-${crypto.randomBytes(8).toString("hex")}`;
     const created = Math.floor(Date.now() / 1000);
-
-    const genOpts = {
-      maxTokens,
-      temperature: params.temperature ?? 0.0,
-      topP: params.top_p ?? params.topP ?? 0.95,
-      minP: params.min_p ?? params.minP ?? 0.0,
-      topK: params.top_k ?? params.topK ?? 40,
-      repeatPenalty: params.repeat_penalty ?? params.repeatPenalty ?? 1.0,
-      frequencyPenalty: params.frequency_penalty ?? params.frequencyPenalty ?? 0.0,
-      presencePenalty: params.presence_penalty ?? params.presencePenalty ?? 0.0,
-      penaltyLastN: params.penalty_last_n ?? params.penaltyLastN ?? 64,
-      seed: params.seed ?? 42,
-      stop: params.stop,
-      tools: params.tools,
-      grammar,
-      ngramSpeculation: params.ngram_speculation ?? params.ngramSpeculation ?? true,
-      maxDraftTokens: params.max_draft_tokens ?? params.maxDraftTokens,
-      signal,
-    };
+    const genOpts = extractGenOpts(params, 512, signal, { tools: params.tools, grammar });
 
     if (params.stream) {
       const tokStream = await engine.chat(params.messages, { ...genOpts, stream: true });
@@ -520,51 +475,16 @@ class ChatCompletionsResource {
       summary = engine.lastSummary ?? null;
     }
 
-    const rawReason = summary?.finishReason ?? "stop";
-    let message;
-    let finishReason = "stop";
-
-    if (grammar !== undefined) {
-      message = {
-        role: "assistant",
-        content: String(raw),
-        reasoning_content: null,
-        tool_calls: null,
-        parsed: null,
-      };
-      finishReason = rawReason === "length" ? "length" : "stop";
-    } else {
-      const parsedOut = native.parseAssistantOutput(String(raw));
-      const tcs = (parsedOut.toolCalls || []).map((tc) => ({
-        id: tc.id,
-        type: tc.type,
-        function: {
-          name: tc.function.name,
-          arguments: tc.function.arguments,
-        },
-      }));
-      message = {
-        role: "assistant",
-        content: parsedOut.content || tcs.length === 0 ? parsedOut.content : null,
-        reasoning_content: parsedOut.reasoningContent ?? null,
-        tool_calls: tcs.length > 0 ? tcs : null,
-        parsed: null,
-      };
-      if (tcs.length > 0) {
-        finishReason = "tool_calls";
-      } else if (rawReason === "length") {
-        finishReason = "length";
-      }
-    }
-
-    return {
-      id: reqId,
-      object: "chat.completion",
-      created,
-      model: modelId,
-      choices: [{ index: 0, message, finish_reason: finishReason, logprobs: null }],
-      usage: usageFromSummary(summary),
-    };
+    return JSON.parse(
+      native.buildChatCompletionJson(
+        reqId,
+        created,
+        modelId,
+        String(raw),
+        grammar !== undefined,
+        summary ? JSON.stringify(summary) : null,
+      ),
+    );
   }
 
   async parse(params = {}, callOpts = {}) {
@@ -594,25 +514,10 @@ class CompletionsResource {
 
     const reqId = `cmpl-ls-${crypto.randomBytes(8).toString("hex")}`;
     const created = Math.floor(Date.now() / 1000);
-
-    const genOpts = {
-      maxTokens: params.max_tokens ?? params.maxTokens ?? 256,
-      temperature: params.temperature ?? 0.0,
-      topP: params.top_p ?? params.topP ?? 0.95,
-      minP: params.min_p ?? params.minP ?? 0.0,
-      topK: params.top_k ?? params.topK ?? 40,
-      repeatPenalty: params.repeat_penalty ?? params.repeatPenalty ?? 1.0,
-      frequencyPenalty: params.frequency_penalty ?? params.frequencyPenalty ?? 0.0,
-      presencePenalty: params.presence_penalty ?? params.presencePenalty ?? 0.0,
-      penaltyLastN: params.penalty_last_n ?? params.penaltyLastN ?? 64,
-      seed: params.seed ?? 42,
-      stop: params.stop,
+    const genOpts = extractGenOpts(params, 256, signal, {
       grammar: params.grammar,
       jsonSchema: params.json_schema ?? params.jsonSchema,
-      ngramSpeculation: params.ngram_speculation ?? params.ngramSpeculation ?? true,
-      maxDraftTokens: params.max_draft_tokens ?? params.maxDraftTokens,
-      signal,
-    };
+    });
 
     if (params.stream) {
       const tokStream = await engine.generate(params.prompt, { ...genOpts, stream: true });
@@ -630,15 +535,15 @@ class CompletionsResource {
       summary = engine.lastSummary ?? null;
     }
 
-    const reason = summary?.finishReason ?? "stop";
-    return {
-      id: reqId,
-      object: "text_completion",
-      created,
-      model: modelId,
-      choices: [{ text, index: 0, finish_reason: reason, logprobs: null }],
-      usage: usageFromSummary(summary),
-    };
+    return JSON.parse(
+      native.buildTextCompletionJson(
+        reqId,
+        created,
+        modelId,
+        text,
+        summary ? JSON.stringify(summary) : null,
+      ),
+    );
   }
 }
 
