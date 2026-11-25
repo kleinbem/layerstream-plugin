@@ -101,39 +101,15 @@ function validateMessages(messages) {
   if (!Array.isArray(messages)) {
     throw new TypeError("messages must be an array of { role, content } objects");
   }
-  if (messages.length === 0) {
-    throw new RangeError("messages must not be empty");
+  try {
+    return JSON.parse(native.normalizeChatMessagesJson(JSON.stringify(messages)));
+  } catch (err) {
+    const msg = err?.message || String(err);
+    if (msg.startsWith("RANGE_ERR:")) {
+      throw new RangeError(msg.slice("RANGE_ERR:".length));
+    }
+    throw new TypeError(msg.startsWith("TYPE_ERR:") ? msg.slice("TYPE_ERR:".length) : msg);
   }
-  const out = [];
-  for (const item of messages) {
-    if (!isPlainObject(item)) {
-      throw new TypeError("each message must be an object");
-    }
-    if (typeof item.role !== "string" || item.role.length === 0) {
-      throw new TypeError("each message must contain a non-empty 'role' string");
-    }
-    if (!("content" in item) && !("tool_calls" in item)) {
-      throw new TypeError("each message must contain 'content' or 'tool_calls'");
-    }
-    const clean = {
-      role: item.role,
-      content: item.content ?? null,
-    };
-    if (item.tool_calls !== undefined && item.tool_calls !== null) {
-      if (!Array.isArray(item.tool_calls)) {
-        throw new TypeError("message 'tool_calls' must be an array");
-      }
-      clean.tool_calls = item.tool_calls;
-    }
-    if (item.name !== undefined && item.name !== null) {
-      clean.name = String(item.name);
-    }
-    if (item.tool_call_id !== undefined && item.tool_call_id !== null) {
-      clean.tool_call_id = String(item.tool_call_id);
-    }
-    out.push(clean);
-  }
-  return out;
 }
 
 function resolveGrammarOption(grammar, jsonSchema) {
