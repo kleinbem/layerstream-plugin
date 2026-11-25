@@ -3,6 +3,8 @@
 //! Replaces embedded bash/awk/Python recipes previously living in `Justfile`.
 //! Uses only the Rust standard library so it compiles in < 1s with zero dependencies.
 
+mod wheel_audit;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -294,7 +296,7 @@ fn cmd_preflight(root: &Path) -> Result<(), String> {
     nix_develop(
         root,
         Some(".#python"),
-        "cd bindings/python && ruff check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py ../../benchmarks && ruff format --check python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py ../../benchmarks && pyright python/layerstream tests",
+        "cd bindings/python && ruff check python tests ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py ../../benchmarks && ruff format --check python tests ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py ../../benchmarks && pyright python/layerstream tests",
     )?;
     nix_develop(root, Some(".#node"), "cd bindings/node && biome check .")?;
     run_in(root, "nix", &["fmt", "--", "--ci"])?;
@@ -317,7 +319,7 @@ fn cmd_fmt(root: &Path) -> Result<(), String> {
     nix_develop(
         root,
         Some(".#python"),
-        "cd bindings/python && ruff format python tests scripts ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py ../../benchmarks",
+        "cd bindings/python && ruff format python tests ../python-cuda13/python ../python-cuda13/scripts ../python-cuda13/setup.py ../../benchmarks",
     )?;
     nix_develop(
         root,
@@ -450,6 +452,7 @@ fn print_usage() {
            lint-cpp            Run clang-tidy static analysis on C++ shim\n\
            coverage-cpp        Measure C++ gcov line coverage for crates/layerstream-core/cpp/\n\
            gpu-smoke [backend] Run real GPU parity smoke test (vulkan | cuda)\n\
+           audit-wheel-elf     Verify Linux wheel ELF symbols, RUNPATH, and PyPI 100 MiB cap\n\
            bump <version>      Bump semver across all manifests and refresh Cargo.lock files"
     );
 }
@@ -488,7 +491,7 @@ fn main() -> ExitCode {
         Some("test-python-fast") => nix_develop(
             &root,
             Some(".#python"),
-            "cd bindings/python && pytest -v tests/test_audit_wheel_elf.py tests/test_cuda13_plugin.py",
+            "cd bindings/python && pytest -v tests/test_cuda13_plugin.py",
         ),
         Some("coverage-python") => nix_develop(
             &root,
@@ -506,6 +509,7 @@ fn main() -> ExitCode {
             let backend = args.get(1).map_or("vulkan", String::as_str);
             cmd_gpu_smoke(&root, backend)
         }
+        Some("audit-wheel-elf") => wheel_audit::cmd_audit_wheel_elf(&args[1..]),
         Some("bump") => match args.get(1) {
             Some(ver) => cmd_bump(&root, ver),
             None => Err("usage: cargo xtask bump <major.minor.patch>".to_string()),

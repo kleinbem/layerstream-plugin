@@ -30,5 +30,6 @@ Out-of-core GGUF layer-streaming LLM inference engine, Axum OpenAI HTTP/SSE serv
 
 - `cargo xtask preflight` — version sync, Rust/Python/Nix formatting, `ruff`, and workaround link check.
 - `cargo xtask test-rust` — workspace `clippy -D warnings` + unit/protocol/lifecycle tests.
-- `cargo xtask test-python-fast` — fast pure-Python unit tests (`audit_wheel_elf`, `layerstream-cuda13`).
+- `cargo xtask test-python-fast` — fast pure-Python unit tests (`layerstream-cuda13`).
+- `cargo xtask audit-wheel-elf <wheel.whl>` — strict Linux wheel ELF / RUNPATH / PyPI 100 MiB auditor.
 - `cargo xtask gpu-smoke vulkan` / `cargo xtask gpu-smoke cuda` — real GPU `parity_test` on local hardware (`nixos-nvme` / `orin-nano`).
