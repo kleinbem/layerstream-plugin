@@ -1425,6 +1425,7 @@ fn py_format_tools_system_prompt(tools: &Bound<'_, PyAny>) -> PyResult<String> {
     Ok(format_tools_system_prompt(&parsed))
 }
 
+mod cli;
 mod worker;
 use worker::{PyWorkerClient, PyWorkerStream, map_worker_err};
 
@@ -1456,6 +1457,7 @@ fn _layerstream(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWorkerStream>()?;
     m.add_class::<PyStreamTagParser>()?;
     m.add_class::<ServerHandle>()?;
+    m.add_function(wrap_pyfunction!(cli::run_cli, m)?)?;
     m.add_function(wrap_pyfunction!(py_run_worker_server, m)?)?;
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     m.add_function(wrap_pyfunction!(probe_gpu_memory, m)?)?;

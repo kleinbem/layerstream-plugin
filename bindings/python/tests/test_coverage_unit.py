@@ -7,17 +7,15 @@ and in-process OpenAI/AsyncOpenAI schema/streaming/fallback paths without extern
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import ctypes
 import dataclasses
 import enum
 import json
 import os
-import subprocess
 import sys
 import types
 import typing
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -283,215 +281,13 @@ async def test_init_serve_cleanup_automodel_guards_and_async_cm(
 # ---------------------------------------------------------------------------
 
 
-def test_cli_helpers_recommend_check_pull_and_serve(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert cli._parse_vram_budget(None) == "auto"
-    assert cli._parse_vram_budget("") is None
-    assert cli._parse_vram_budget("none") is None
-    assert cli._parse_vram_budget("AUTO") == "auto"
-    assert cli._parse_vram_budget("4096") == 4096
-    assert cli._fmt_gib(None) == "-"
-
-    # _cmd_recommend: JSON, empty, and formatted table
-    rec_item = {
-        "resolved_repo": "Org/Model-GGUF",
-        "recommended": True,
-        "quant": "Q4_K_M",
-        "total_bytes": 4 * 1024**3,
-        "verdict": "fast",
-        "pinned_pct": 100,
-        "est_tps_low": 20.0,
-        "est_tps_high": 30.0,
-        "hf_uri": "hf://Org/Model-GGUF:m.gguf",
-    }
-    monkeypatch.setattr(cli, "recommend", lambda *a, **kw: [rec_item])
-    assert cli.main(["recommend", "Org/Model-GGUF", "--json"]) == 0
-    assert "Q4_K_M" in capsys.readouterr().out
-
-    assert cli.main(["recommend", "Org/Model-GGUF"]) == 0
-    table_out = capsys.readouterr().out
-    assert "Repository: Org/Model-GGUF" in table_out
-    assert "Q4_K_M" in table_out
-
-    monkeypatch.setattr(cli, "recommend", lambda *a, **kw: [])
-    assert cli.main(["recommend", "Org/Empty-GGUF"]) == 1
-    assert "No GGUF candidates found" in capsys.readouterr().err
-
-    # _cmd_check: non-JSON failure + success with draft_model_path
-    def _fail_check(*a: object, **kw: object) -> dict[str, Any]:
-        raise RuntimeError("disk too slow")
-
-    monkeypatch.setattr(cli, "check", _fail_check)
-    assert cli.main(["check", "fake.gguf"]) == 1
-    assert "Preflight FAILED: disk too slow" in capsys.readouterr().err
-
-    monkeypatch.setattr(
-        cli,
-        "check",
-        lambda *a, **kw: {
-            "verdict": "ok",
-            "summary": "good",
-            "model_path": "/m.gguf",
-            "draft_model_path": "/draft.gguf",
-            "total_file_bytes": 1024**3,
-            "architecture": "llama",
-            "n_layers": 4,
-            "context_length": 2048,
-            "gpu_backend": "Vulkan",
-            "gpu_free_bytes": 8 * 1024**3,
-            "gpu_total_bytes": 16 * 1024**3,
-            "storage_mib_s": 3500.0,
-            "direct_io": True,
-        },
-    )
-    assert cli.main(["check", "fake.gguf"]) == 0
-    chk_out = capsys.readouterr().out
-    assert "Draft Model:    /draft.gguf" in chk_out
-
-    # _cmd_pull
-    monkeypatch.setattr(cli, "pull", lambda *a, **kw: "/cache/model.gguf")
-    assert cli.main(["pull", "Org/Model-GGUF"]) == 0
-    assert capsys.readouterr().out.strip() == "/cache/model.gguf"
-
-    # _resolve_use_gpu (isolated rc=0, isolated rc=1, inproc GPU found, inproc fallback)
-    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess([], 0))
-    assert cli._resolve_use_gpu(False, isolated=True) is True
-    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess([], 1))
-    assert cli._resolve_use_gpu(False, isolated=True) is False
-    monkeypatch.setattr(cli, "probe_gpu_device", lambda _: {"name": "FakeGPU"})
-    assert cli._resolve_use_gpu(False, isolated=False) is True
-    monkeypatch.setattr(cli, "probe_gpu_device", lambda _: None)
-    assert cli._resolve_use_gpu(False, isolated=False) is False
-
-    # _cmd_serve (normal + KeyboardInterrupt)
-    class _FakeServeHandle:
-        def __init__(self, *, interrupt: bool) -> None:
-            self.base_url = "http://127.0.0.1:8080"
-            self._interrupt = interrupt
-
-        def __enter__(self) -> _FakeServeHandle:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            pass
-
-        def wait(self) -> None:
-            if self._interrupt:
-                raise KeyboardInterrupt
-
-    monkeypatch.setattr(cli, "start_server", lambda *a, **kw: _FakeServeHandle(interrupt=False))
-    assert cli.main(["serve", "fake.gguf", "--cpu"]) == 0
-    assert "serving OpenAI API" in capsys.readouterr().err
-
-    monkeypatch.setattr(cli, "start_server", lambda *a, **kw: _FakeServeHandle(interrupt=True))
-    assert cli.main(["serve", "fake.gguf", "--cpu"]) == 0
-    assert "shutting down HTTP server" in capsys.readouterr().err
-
-
-def test_cli_chat_repl_edge_cases_and_non_stream_guards(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    class _ReplModel:
-        def __init__(self, *, stream_factory: Any) -> None:
-            self._stream_factory = stream_factory
-            self.saved: list[str] = []
-
-        def __enter__(self) -> _ReplModel:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            pass
-
-        def stats(self) -> dict[str, Any]:
-            return {
-                "model_path": "fake.gguf",
-                "backend_name": "CPU",
-                "resident_layers": 1,
-                "n_layers": 2,
-                "cached_kv_tokens": 3,
-                "io": {"bytes_read": 0},
-            }
-
-        def kv_clear(self) -> None:
-            pass
-
-        def save_state(self, path: str) -> int:
-            if "fail" in path:
-                raise OSError("cannot write")
-            self.saved.append(path)
-            return 5
-
-        def load_state(self, path: str) -> int:
-            if "fail" in path:
-                raise ValueError("bad state")
-            return 5
-
-        def chat(self, messages: Sequence[Mapping[str, Any]], **kwargs: Any) -> Any:
-            return self._stream_factory()
-
-    # Non-stream return guard in single-prompt mode
-    monkeypatch.setattr(
-        cli.AutoModel,
-        "from_pretrained",
-        classmethod(lambda cls, *a, **kw: _ReplModel(stream_factory=lambda: "not-a-stream")),
-    )
-    with pytest.raises(TypeError, match="expected streaming TokenStream"):
-        cli.main(["chat", "fake.gguf", "--cpu", "-p", "hi"])
-
-    # Interactive REPL: blank line, /save error, /load error, KeyboardInterrupt mid-stream, EOFError, --save-state
-    inputs = iter(["", "/save fail.bin", "/load fail.bin", "trigger cancel"])
-
-    def _fake_input(_prompt: str = "") -> str:
-        try:
-            return next(inputs)
-        except StopIteration as exc:
-            raise EOFError from exc
-
-    monkeypatch.setattr("builtins.input", _fake_input)
-
-    def _cancel_stream() -> contextlib.AbstractContextManager[Any]:
-        class _Ctx:
-            summary = None
-
-            def __enter__(self) -> _Ctx:
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                pass
-
-            def __iter__(self) -> Iterator[str]:
-                raise KeyboardInterrupt
-
-        return _Ctx()
-
-    save_target = str(tmp_path / "exit.kv")
-    repl_model = _ReplModel(stream_factory=_cancel_stream)
-    monkeypatch.setattr(
-        cli.AutoModel,
-        "from_pretrained",
-        classmethod(lambda cls, *a, **kw: repl_model),
-    )
-    assert cli.main(["chat", "fake.gguf", "--cpu", "--save-state", save_target]) == 0
-    captured = capsys.readouterr()
-    assert "[cancelled]" in captured.out
-    assert "save failed" in captured.err
-    assert "load failed" in captured.err
-    assert save_target in repl_model.saved
-
-    # Non-stream guard in interactive REPL
-    inputs2 = iter(["hello", "/quit"])
-    monkeypatch.setattr("builtins.input", lambda _p="": next(inputs2))
-    monkeypatch.setattr(
-        cli.AutoModel,
-        "from_pretrained",
-        classmethod(lambda cls, *a, **kw: _ReplModel(stream_factory=lambda: {"bad": 1})),
-    )
-    with pytest.raises(TypeError, match="expected streaming TokenStream"):
-        cli.main(["chat", "fake.gguf", "--cpu"])
+def test_cli_rust_entrypoint_help_version_and_errors() -> None:
+    assert cli.main(["--version"]) == 0
+    assert cli.main(["--help"]) == 0
+    assert cli.main([]) == 2
+    assert cli.main(["nonexistent-command"]) == 2
+    assert cli.main(["check", "/definitely/missing/model.gguf", "--cpu"]) == 1
+    assert cli.main(["check", "/definitely/missing/model.gguf", "--cpu", "--json"]) == 1
 
 
 # ---------------------------------------------------------------------------
