@@ -419,6 +419,8 @@ pub struct LayerIoPool {
     max_chunk_bytes: usize,
     profile_enabled: bool,
     workers: ScopedWorkerPool,
+    #[cfg(target_os = "linux")]
+    uring: Option<Mutex<crate::uring::UringReader>>,
     scratch: Mutex<Option<AlignedBuf>>,
     moe_scratches: Mutex<Vec<AlignedBuf>>,
     span_cache: Mutex<HashMap<i32, Arc<[CoalescedSpan]>>>,
@@ -513,6 +515,8 @@ impl LayerIoPool {
             .map(|mb| mb.saturating_mul(1024 * 1024));
 
         let workers = ScopedWorkerPool::new(io_threads.max(moe_io_threads));
+        #[cfg(target_os = "linux")]
+        let uring = crate::uring::UringReader::try_new().map(Mutex::new);
 
         Ok(Self {
             index,
@@ -524,6 +528,8 @@ impl LayerIoPool {
             max_chunk_bytes,
             profile_enabled,
             workers,
+            #[cfg(target_os = "linux")]
+            uring,
             scratch: Mutex::new(None),
             moe_scratches: Mutex::new(Vec::new()),
             span_cache: Mutex::new(HashMap::new()),
@@ -830,8 +836,53 @@ impl LayerIoPool {
         };
 
         let spans = self.index.plan_coalesced_sub_slices_resolved(active_reqs)?;
+        #[cfg(target_os = "linux")]
+        let mut handled_by_uring = false;
+        #[cfg(target_os = "linux")]
+        if !self.sparse_direct_io
+            && spans.len() > 1
+            && spans.iter().all(|s| s.slices.len() == 1)
+            && let Some(uring_mu) = &self.uring
+        {
+            use std::os::unix::io::AsRawFd;
+            let mut ops = Vec::with_capacity(spans.len());
+            for span in &spans {
+                let slice = &span.slices[0];
+                let fd = self.shards[span.shard_idx].sparse_buffered.as_raw_fd();
+                let offset = span.aligned_offset + slice.span_offset as u64;
+                ops.push(crate::uring::UringReadOp {
+                    fd,
+                    // SAFETY: All slice destination ranges were validated in-bounds and disjoint above.
+                    ptr: unsafe { dst.as_mut_ptr().add(slice.dst_offset) },
+                    len: slice.len,
+                    offset,
+                    min_valid: slice.len,
+                });
+            }
+            let t_wall = std::time::Instant::now();
+            let read_res = uring_mu.lock().read_batch(&ops);
+            if let Ok(bytes) = read_res {
+                for span in &spans {
+                    let handle = &self.shards[span.shard_idx];
+                    evict_page_cache_range(
+                        &handle.sparse_buffered,
+                        span.aligned_offset,
+                        span.valid_len,
+                    );
+                }
+                self.span_reads
+                    .fetch_add(spans.len() as u64, Ordering::Relaxed);
+                self.record_io_sample(bytes, t_wall.elapsed().as_micros() as u64);
+                handled_by_uring = true;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let handled_by_uring = false;
+
         let n_workers = self.moe_io_threads.min(spans.len()).max(1);
-        if n_workers <= 1 {
+        if handled_by_uring {
+            // Completed in a single batched io_uring submission above.
+        } else if n_workers <= 1 {
             let mut scratch_guard = self.scratch.lock();
             let scratch = match scratch_guard.as_mut() {
                 Some(buf) => buf,
@@ -1105,7 +1156,8 @@ impl LayerIoPool {
     }
 
     /// Drives NVMe queue depth and parallel dm-crypt decryption by splitting large
-    /// 4K-aligned direct-IO spans across `io_threads` concurrent `pread` calls.
+    /// 4K-aligned direct-IO spans across batched Linux `io_uring` SQEs (when available)
+    /// or `io_threads` concurrent `pread` calls.
     fn read_parallel_or_single(
         &self,
         file: &File,
@@ -1113,6 +1165,18 @@ impl LayerIoPool {
         base_offset: u64,
         valid_len: usize,
     ) -> bool {
+        #[cfg(target_os = "linux")]
+        if valid_len >= crate::uring::URING_SPLIT_MIN_BYTES
+            && let Some(uring_mu) = &self.uring
+        {
+            use std::os::unix::io::AsRawFd;
+            if uring_mu
+                .lock()
+                .read_aligned_span(file.as_raw_fd(), buf, base_offset, valid_len)
+            {
+                return true;
+            }
+        }
         if self.io_threads <= 1 || valid_len < PARALLEL_READ_MIN_BYTES {
             return matches!(pread_exact_or_eof(file, buf, base_offset), Ok(n) if n >= valid_len);
         }
