@@ -193,16 +193,17 @@ struct ls_engine {
     ggml_backend_buffer_t slot_buf[2] = {nullptr, nullptr};
     ggml_backend_buffer_t expert_slot_buf = nullptr;
 
-    // Single shared host staging buffer for discrete GPUs (page-aligned / cudaHostAlloc).
-    // Exclusively written by `worker_thread` (never concurrently by eval thread) to guarantee
-    // zero data races and zero aliasing &mut [u8] UB while saving ~166-385 MiB of locked RAM.
-    uint8_t * pin_buf = nullptr;
+    // Double-buffered host staging buffers for discrete GPUs (page-aligned / cudaHostAlloc),
+    // one per ping-pong slot so NVMe read(L+1) into `pin_buf[slot]` overlaps with
+    // in-flight H2D DMA(L) from `pin_buf[1 - slot]` and GPU compute(L-1).
+    // Exclusively written by `worker_thread` (never concurrently by eval thread).
+    uint8_t * pin_buf[2] = {nullptr, nullptr};
     size_t pin_cap = 0;
 #ifdef LAYERSTREAM_HAS_CUDA_RT
     bool pin_is_cuda_host = false;
     ls_cuda::Stream copy_stream = nullptr;
     ls_cuda::Event slot_event[2] = {nullptr, nullptr};
-    int last_h2d_slot = -1; // exclusively accessed on worker_thread
+    bool slot_h2d_recorded[2] = {false, false}; // exclusively accessed on worker_thread
 #endif
 
     // Layer plans indexed by layer index [0..stream_end_layer).
@@ -319,11 +320,12 @@ struct ls_engine {
         } else {
             using Clock = std::chrono::steady_clock;
             auto t_h2d_wait0 = profile_enabled ? Clock::now() : Clock::time_point{};
+            uint8_t * slot_pin = pin_buf[slot];
 #ifdef LAYERSTREAM_HAS_CUDA_RT
-            // Ensure the previous H2D DMA from our shared pinned buffer has finished
-            // before refilling it with the next layer's NVMe read.
-            if (copy_stream != nullptr && last_h2d_slot >= 0 && slot_event[last_h2d_slot] != nullptr) {
-                if (ls_cuda::event_synchronize(slot_event[last_h2d_slot]) != ls_cuda::kSuccess) {
+            // Only synchronize this SAME slot's previous H2D DMA (2 layers ago), allowing
+            // NVMe read(L+1) into `pin_buf[slot]` to overlap with in-flight H2D(L) from `pin_buf[1 - slot]`.
+            if (copy_stream != nullptr && slot_h2d_recorded[slot] && slot_event[slot] != nullptr) {
+                if (ls_cuda::event_synchronize(slot_event[slot]) != ls_cuda::kSuccess) {
                     return -9;
                 }
             }
@@ -345,7 +347,7 @@ struct ls_engine {
                     plan.offsets.data(),
                     plan.sizes.data(),
                     plan.tensors.size(),
-                    pin_buf,
+                    slot_pin,
                     pin_cap,
                     direct_slices,
                     128
@@ -363,7 +365,7 @@ struct ls_engine {
                     plan.offsets.data(),
                     plan.sizes.data(),
                     plan.tensors.size(),
-                    pin_buf,
+                    slot_pin,
                     pin_cap
                 );
                 if (rc != 0) {
@@ -391,7 +393,7 @@ struct ls_engine {
                     for (int i = 0; i < n_direct; ++i) {
                         int ce = ls_cuda::memcpy_async(
                             gpu_dst + direct_slices[i].dst_offset,
-                            pin_buf + direct_slices[i].src_offset,
+                            slot_pin + direct_slices[i].src_offset,
                             direct_slices[i].len,
                             ls_cuda::kMemcpyHostToDevice,
                             copy_stream
@@ -405,7 +407,7 @@ struct ls_engine {
                 } else {
                     int ce = ls_cuda::memcpy_async(
                         gpu_dst,
-                        pin_buf,
+                        slot_pin,
                         plan.total_bytes,
                         ls_cuda::kMemcpyHostToDevice,
                         copy_stream
@@ -434,7 +436,7 @@ struct ls_engine {
                     fence_on_err();
                     return -11;
                 }
-                last_h2d_slot = slot;
+                slot_h2d_recorded[slot] = true;
             } else
 #endif
             {
@@ -487,14 +489,15 @@ struct ls_engine {
             }
 
 #ifdef LAYERSTREAM_HAS_CUDA_RT
-            if (copy_stream != nullptr && last_h2d_slot >= 0 && slot_event[last_h2d_slot] != nullptr) {
-                if (ls_cuda::event_synchronize(slot_event[last_h2d_slot]) != ls_cuda::kSuccess) {
+            if (copy_stream != nullptr && slot_h2d_recorded[0] && slot_event[0] != nullptr) {
+                if (ls_cuda::event_synchronize(slot_event[0]) != ls_cuda::kSuccess) {
                     return -21;
                 }
             }
 #endif
             req.direct_slices.resize(std::max<size_t>(plan.tensors.size() * 2, 64));
             int n_direct = 0;
+            uint8_t * moe_pin = pin_buf[0];
             if (load_layer_direct_cb != nullptr) {
                 n_direct = load_layer_direct_cb(
                     io_user_data,
@@ -503,7 +506,7 @@ struct ls_engine {
                     plan.offsets.data(),
                     plan.sizes.data(),
                     plan.tensors.size(),
-                    pin_buf,
+                    moe_pin,
                     pin_cap,
                     req.direct_slices.data(),
                     req.direct_slices.size()
@@ -520,7 +523,7 @@ struct ls_engine {
                     plan.offsets.data(),
                     plan.sizes.data(),
                     plan.tensors.size(),
-                    pin_buf,
+                    moe_pin,
                     pin_cap
                 );
                 if (rc != 0) {
@@ -542,7 +545,7 @@ struct ls_engine {
                     for (int i = 0; i < n_direct; ++i) {
                         if (ls_cuda::memcpy_async(
                                 gpu_dst + req.direct_slices[i].dst_offset,
-                                pin_buf + req.direct_slices[i].src_offset,
+                                moe_pin + req.direct_slices[i].src_offset,
                                 req.direct_slices[i].len,
                                 ls_cuda::kMemcpyHostToDevice,
                                 copy_stream
@@ -555,7 +558,7 @@ struct ls_engine {
                 } else {
                     if (ls_cuda::memcpy_async(
                             gpu_dst,
-                            pin_buf,
+                            moe_pin,
                             plan.total_bytes,
                             ls_cuda::kMemcpyHostToDevice,
                             copy_stream
@@ -593,14 +596,15 @@ struct ls_engine {
         }
 
 #ifdef LAYERSTREAM_HAS_CUDA_RT
-        if (copy_stream != nullptr && last_h2d_slot >= 0 && slot_event[last_h2d_slot] != nullptr) {
-            if (ls_cuda::event_synchronize(slot_event[last_h2d_slot]) != ls_cuda::kSuccess) {
+        if (copy_stream != nullptr && slot_h2d_recorded[0] && slot_event[0] != nullptr) {
+            if (ls_cuda::event_synchronize(slot_event[0]) != ls_cuda::kSuccess) {
                 return -24;
             }
         }
 #endif
+        uint8_t * moe_pin = pin_buf[0];
         const auto & packed_reqs = *req.packed_reqs;
-        int rc = load_slices_cb(io_user_data, packed_reqs.data(), packed_reqs.size(), pin_buf, pin_cap);
+        int rc = load_slices_cb(io_user_data, packed_reqs.data(), packed_reqs.size(), moe_pin, pin_cap);
         if (rc != 0) {
             return rc;
         }
@@ -612,7 +616,7 @@ struct ls_engine {
             for (size_t i = 0; i < reqs.size(); ++i) {
                 if (ls_cuda::memcpy_async(
                         gpu_dst + reqs[i].dst_offset,
-                        pin_buf + packed_reqs[i].dst_offset,
+                        moe_pin + packed_reqs[i].dst_offset,
                         reqs[i].len,
                         ls_cuda::kMemcpyHostToDevice,
                         copy_stream
@@ -743,7 +747,7 @@ struct ls_engine {
                             if (tidx < plan.tensors.size()) {
                                 ggml_backend_tensor_set(
                                     plan.tensors[tidx].tensor,
-                                    pin_buf + work.direct_slices[i].src_offset,
+                                    pin_buf[0] + work.direct_slices[i].src_offset,
                                     0,
                                     work.direct_slices[i].len
                                 );
@@ -751,7 +755,7 @@ struct ls_engine {
                         }
                     } else {
                         for (const auto & tb : plan.tensors) {
-                            ggml_backend_tensor_set(tb.tensor, pin_buf + tb.offset, 0, tb.nbytes);
+                            ggml_backend_tensor_set(tb.tensor, pin_buf[0] + tb.offset, 0, tb.nbytes);
                         }
                     }
                 } else {
@@ -759,7 +763,7 @@ struct ls_engine {
                         const auto & tb = plan.tensors[reqs[i].tensor_idx];
                         ggml_backend_tensor_set(
                             tb.tensor,
-                            pin_buf + packed_reqs[i].dst_offset,
+                            pin_buf[0] + packed_reqs[i].dst_offset,
                             reqs[i].src_offset_in_tensor,
                             reqs[i].len
                         );
@@ -816,10 +820,15 @@ struct ls_engine {
                         if (!uses_deferred_eval_h2d()) {
                             return true;
                         }
-                        // On non-CUDA discrete GPU (Vulkan), wait until eval thread has uploaded
-                        // any prior `pin_buf` dense layer before overwriting `pin_buf`.
+                        // On non-CUDA discrete GPU (Vulkan), `pin_buf[0]` and `pin_buf[1]` are
+                        // independent, so wake if ANY queued job targets a free staging slot.
                         std::lock_guard<std::mutex> slk(slot_mu);
-                        return !slot_needs_h2d[0] && !slot_needs_h2d[1];
+                        for (const auto & job : pending_jobs) {
+                            if (!slot_needs_h2d[job.slot]) {
+                                return true;
+                            }
+                        }
+                        return false;
                     }
                     return false;
                 });
@@ -829,21 +838,28 @@ struct ls_engine {
                 if (active_moe_req != nullptr && !moe_io_done) {
                     moe_req = active_moe_req;
                 } else {
-                    dense_job = pending_jobs.front();
-                    pending_jobs.erase(pending_jobs.begin());
+                    size_t pick = 0;
+                    if (uses_deferred_eval_h2d()) {
+                        std::lock_guard<std::mutex> slk(slot_mu);
+                        for (size_t i = 0; i < pending_jobs.size(); ++i) {
+                            if (!slot_needs_h2d[pending_jobs[i].slot]) {
+                                pick = i;
+                                break;
+                            }
+                        }
+                    }
+                    dense_job = pending_jobs[pick];
+                    pending_jobs.erase(pending_jobs.begin() + static_cast<ptrdiff_t>(pick));
                 }
             }
 
             if (moe_req != nullptr) {
-                // Any preceding dense prefetch on this worker has already finished and published;
-                // invalidate deferred (un-uploaded) Vulkan dense slots before overwriting `pin_buf`.
+                // MoE uses `pin_buf[0]`; invalidate only slot 0 if it holds an un-uploaded Vulkan dense layer.
                 if (uses_deferred_eval_h2d()) {
                     std::lock_guard<std::mutex> slk(slot_mu);
-                    for (int s = 0; s < 2; ++s) {
-                        if (slot_needs_h2d[s]) {
-                            slot_loaded_layer[s] = -1;
-                            slot_needs_h2d[s] = false;
-                        }
+                    if (slot_needs_h2d[0]) {
+                        slot_loaded_layer[0] = -1;
+                        slot_needs_h2d[0] = false;
                     }
                 }
                 moe_req->rc = execute_moe_work_on_worker(*moe_req);
@@ -953,9 +969,8 @@ struct ls_engine {
         }
 
         if (needs_h2d) {
-            // Non-CUDA discrete GPU (e.g. Vulkan): worker paused before overwriting `pin_buf`
-            // because `slot_needs_h2d[slot]` is true; perform `ggml_backend_tensor_set` safely
-            // on the eval thread while the GPU backend is idle and synchronized.
+            // Non-CUDA discrete GPU (e.g. Vulkan): perform `ggml_backend_tensor_set` safely
+            // from `pin_buf[slot]` on the eval thread while the GPU backend is idle/synchronized.
             const auto & plan = layer_plans[layer_idx];
             const int n_direct = slot_h2d_n_direct[slot];
             if (n_direct > 0) {
@@ -964,7 +979,7 @@ struct ls_engine {
                     if (tidx < plan.tensors.size()) {
                         ggml_backend_tensor_set(
                             plan.tensors[tidx].tensor,
-                            pin_buf + slot_h2d_direct_slices[slot][i].src_offset,
+                            pin_buf[slot] + slot_h2d_direct_slices[slot][i].src_offset,
                             0,
                             slot_h2d_direct_slices[slot][i].len
                         );
@@ -972,7 +987,7 @@ struct ls_engine {
                 }
             } else {
                 for (const auto & tb : plan.tensors) {
-                    ggml_backend_tensor_set(tb.tensor, pin_buf + tb.offset, 0, tb.nbytes);
+                    ggml_backend_tensor_set(tb.tensor, pin_buf[slot] + tb.offset, 0, tb.nbytes);
                 }
             }
             {
