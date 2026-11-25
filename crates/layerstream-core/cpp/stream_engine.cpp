@@ -788,17 +788,20 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         // Add +2 MiB headroom for 4K-aligned O_DIRECT span padding around a single layer.
         const uint64_t max_stream_buf = std::max(eng->slot_bytes, eng->expert_slot_bytes);
         const size_t pin_bytes = align_up(max_stream_buf + (2ULL * 1024 * 1024), 4096);
+        const int n_pin_bufs = (eng->streamed_dense_layers > 0) ? 2 : 1;
 #ifdef LAYERSTREAM_HAS_CUDA_RT
         if (eng->is_cuda_backend && ls_cuda::ensure_loaded() &&
             ls_cuda::stream_create_with_flags(&eng->copy_stream, ls_cuda::kStreamNonBlocking) == ls_cuda::kSuccess) {
             eng->pin_is_cuda_host = true;
-            if (ls_cuda::host_alloc(reinterpret_cast<void **>(&eng->pin_buf), pin_bytes, ls_cuda::kHostAllocDefault) != ls_cuda::kSuccess) {
-                ls_internal::set_error(err_buf, err_cap, "failed to allocate CUDA pinned staging buffer");
-                ls_engine_free(eng);
-                return nullptr;
-            }
-            std::memset(eng->pin_buf, 0, pin_bytes);
             eng->pin_cap = pin_bytes;
+            for (int s = 0; s < n_pin_bufs; ++s) {
+                if (ls_cuda::host_alloc(reinterpret_cast<void **>(&eng->pin_buf[s]), pin_bytes, ls_cuda::kHostAllocDefault) != ls_cuda::kSuccess) {
+                    ls_internal::set_error(err_buf, err_cap, "failed to allocate CUDA pinned staging buffer");
+                    ls_engine_free(eng);
+                    return nullptr;
+                }
+                std::memset(eng->pin_buf[s], 0, pin_bytes);
+            }
             for (int s = 0; s < 2; ++s) {
                 if (ls_cuda::event_create_with_flags(&eng->slot_event[s], ls_cuda::kEventDisableTiming) != ls_cuda::kSuccess) {
                     ls_internal::set_error(err_buf, err_cap, "failed to create CUDA slot event");
@@ -809,14 +812,16 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         } else
 #endif
         {
-            eng->pin_buf = alloc_aligned_4k(pin_bytes);
             eng->pin_cap = pin_bytes;
-            if (!eng->pin_buf) {
-                ls_internal::set_error(err_buf, err_cap, "failed to allocate 4K-aligned host staging buffer");
-                ls_engine_free(eng);
-                return nullptr;
+            for (int s = 0; s < n_pin_bufs; ++s) {
+                eng->pin_buf[s] = alloc_aligned_4k(pin_bytes);
+                if (!eng->pin_buf[s]) {
+                    ls_internal::set_error(err_buf, err_cap, "failed to allocate 4K-aligned host staging buffer");
+                    ls_engine_free(eng);
+                    return nullptr;
+                }
+                std::memset(eng->pin_buf[s], 0, pin_bytes);
             }
-            std::memset(eng->pin_buf, 0, pin_bytes);
         }
     }
 
@@ -925,22 +930,26 @@ void ls_engine_free(ls_engine * eng) {
             eng->slot_event[s] = nullptr;
         }
     }
-    if (eng->pin_buf) {
-        if (eng->pin_is_cuda_host) {
-            ls_cuda::free_host(eng->pin_buf);
-        } else {
-            free_aligned_4k(eng->pin_buf);
+    for (int s = 0; s < 2; ++s) {
+        if (eng->pin_buf[s]) {
+            if (eng->pin_is_cuda_host) {
+                ls_cuda::free_host(eng->pin_buf[s]);
+            } else {
+                free_aligned_4k(eng->pin_buf[s]);
+            }
+            eng->pin_buf[s] = nullptr;
         }
-        eng->pin_buf = nullptr;
     }
     if (eng->copy_stream) {
         ls_cuda::stream_destroy(eng->copy_stream);
         eng->copy_stream = nullptr;
     }
 #else
-    if (eng->pin_buf) {
-        free_aligned_4k(eng->pin_buf);
-        eng->pin_buf = nullptr;
+    for (int s = 0; s < 2; ++s) {
+        if (eng->pin_buf[s]) {
+            free_aligned_4k(eng->pin_buf[s]);
+            eng->pin_buf[s] = nullptr;
+        }
     }
 #endif
 
