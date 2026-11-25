@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "layerstream-cuda13"
-version = "0.4.1"
+version = "0.5.0"
 description = "CUDA 13 dynamic ggml backend plugin for layerstream (zero-compile NVIDIA GPU support via PyPI)"
 readme = "README.md"
 license = "Apache-2.0"
