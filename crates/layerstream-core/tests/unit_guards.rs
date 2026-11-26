@@ -303,3 +303,59 @@ fn repetition_and_frequency_penalties_preserve_exact_speculative_parity() {
         "penalized rejection sampler TV distance too high: {tv:.5}"
     );
 }
+
+#[test]
+fn property_stream_tag_parser_matches_batch_across_all_chunk_splits() {
+    use layerstream_core::{StreamDelta, StreamTagParser, parse_assistant_output};
+
+    let sample = "<think>Analyzing 🚀 café</think>Hello!\n<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Zürich\"}}</tool_call>\nDone.";
+    let expected = parse_assistant_output(sample);
+    let char_offsets: Vec<usize> = sample
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(sample.len()))
+        .collect();
+
+    // Test every chunk size from 1 char up to 17 chars.
+    for chunk_chars in 1..=17 {
+        let mut parser = StreamTagParser::new();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut tool_calls = 0usize;
+        let mut i = 0;
+        while i + 1 < char_offsets.len() {
+            let next_i = (i + chunk_chars).min(char_offsets.len() - 1);
+            let piece = &sample[char_offsets[i]..char_offsets[next_i]];
+            for d in parser.push(piece) {
+                match d {
+                    StreamDelta::Content(s) => content.push_str(&s),
+                    StreamDelta::Reasoning(s) => reasoning.push_str(&s),
+                    StreamDelta::ToolCall { .. } => tool_calls += 1,
+                }
+            }
+            i = next_i;
+        }
+        for d in parser.flush() {
+            match d {
+                StreamDelta::Content(s) => content.push_str(&s),
+                StreamDelta::Reasoning(s) => reasoning.push_str(&s),
+                StreamDelta::ToolCall { .. } => tool_calls += 1,
+            }
+        }
+        assert_eq!(
+            content.trim(),
+            expected.content.trim(),
+            "content mismatch for chunk_chars={chunk_chars}"
+        );
+        assert_eq!(
+            reasoning.trim(),
+            expected.reasoning_content.as_deref().unwrap_or("").trim(),
+            "reasoning mismatch for chunk_chars={chunk_chars}"
+        );
+        assert_eq!(
+            tool_calls,
+            expected.tool_calls.len(),
+            "tool_calls mismatch for chunk_chars={chunk_chars}"
+        );
+    }
+}
