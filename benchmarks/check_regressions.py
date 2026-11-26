@@ -130,7 +130,9 @@ def check_pair(
             )
 
     if isinstance(c_swap, (int, float)) and c_swap > max_swap_mib:
-        fails.append(f"FAIL [{model} {workload}] swap delta +{c_swap:.1f} MiB exceeds {max_swap_mib} MiB")
+        fails.append(
+            f"FAIL [{model} {workload}] swap delta +{c_swap:.1f} MiB exceeds {max_swap_mib} MiB"
+        )
 
     if cand.get("using_gpu") is True and str(cand.get("backend_name") or "").upper() == "CPU":
         fails.append(f"FAIL [{model} {workload}] GPU requested but backend_name is CPU")
@@ -170,7 +172,9 @@ def main() -> int:
         print(f"No benchmark JSON records found in {args.candidate}", file=sys.stderr)
         return 2
 
-    print("| Model | Mode | Workload | Baseline `tok/s` | Candidate `tok/s` | Delta | Peak RSS | `J/tok` |")
+    print(
+        "| Model | Mode | Workload | Baseline `tok/s` | Candidate `tok/s` | Delta | Peak RSS | `J/tok` |"
+    )
     print("|---|---|---|---:|---:|---:|---:|---:|")
 
     all_warns: list[str] = []
