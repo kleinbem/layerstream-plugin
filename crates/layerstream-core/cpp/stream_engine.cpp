@@ -80,6 +80,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         llama_model_params mparams = llama_model_default_params();
         mparams.n_gpu_layers = cfg->use_gpu ? 999 : 0;
         mparams.no_alloc = false;
+        mparams.load_mtp = true;
         if (!cfg->use_gpu && g_cpu_only_devs[0] != nullptr) {
             mparams.devices = g_cpu_only_devs;
         } else if (cfg->use_gpu && ref_gpu_dev != nullptr) {
@@ -139,6 +140,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         const bool can_kv_trim =
             mem != nullptr && llama_memory_can_shift(mem) && llama_memory_seq_rm(mem, 0, 1, -1);
         eng->can_speculate = can_kv_trim || eng->rs_rollback_max > 0;
+        eng->init_mtp_context(n_ctx, n_batch, n_threads, cfg->kv_cache_type);
         return eng;
     }
 
@@ -181,6 +183,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     mparams.n_gpu_layers = eng->using_gpu ? 999 : 0;
     mparams.load_mode = LLAMA_LOAD_MODE_NONE;
     mparams.no_alloc = true;
+    mparams.load_mtp = true;
     if (!eng->using_gpu && g_cpu_only_devs[0] != nullptr) {
         mparams.devices = g_cpu_only_devs;
     } else if (eng->using_gpu && chosen_gpu_dev != nullptr) {
@@ -888,6 +891,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     const bool can_kv_trim =
         mem != nullptr && llama_memory_can_shift(mem) && llama_memory_seq_rm(mem, 0, 1, -1);
     eng->can_speculate = can_kv_trim || eng->rs_rollback_max > 0;
+    eng->init_mtp_context(n_ctx, n_batch, n_threads, cfg->kv_cache_type);
     return eng;
 }
 
@@ -922,6 +926,10 @@ void ls_engine_free(ls_engine * eng) {
         eng->worker_thread.join();
     }
 
+    if (eng->ctx_mtp) {
+        llama_free(eng->ctx_mtp);
+        eng->ctx_mtp = nullptr;
+    }
     if (eng->ctx) {
         llama_free(eng->ctx);
         eng->ctx = nullptr;
@@ -1010,6 +1018,7 @@ void ls_engine_get_stats(const ls_engine * eng, ls_engine_stats * out) {
     out->using_gpu = eng->using_gpu;
     out->can_speculate = eng->can_speculate;
     out->rs_rollback_max = eng->rs_rollback_max;
+    out->mtp_layers = eng->mtp_layers;
     std::memset(out->backend_name, 0, sizeof(out->backend_name));
     const size_t bn_len = std::min(sizeof(out->backend_name) - 1, eng->backend_name.size());
     std::memcpy(out->backend_name, eng->backend_name.data(), bn_len);
@@ -1174,13 +1183,161 @@ void ls_engine_kv_clear(ls_engine * eng) {
         return;
     }
     llama_memory_clear(llama_get_memory(eng->ctx), true);
+    eng->mtp_reset_state();
 }
 
 bool ls_engine_kv_trim(ls_engine * eng, int32_t pos_min) {
     if (!eng || !eng->ctx) {
         return false;
     }
-    return llama_memory_seq_rm(llama_get_memory(eng->ctx), 0, pos_min, -1);
+    const bool ok = llama_memory_seq_rm(llama_get_memory(eng->ctx), 0, pos_min, -1);
+    if (ok && eng->ctx_mtp && !eng->mtp_is_mem_shared) {
+        llama_memory_seq_rm(llama_get_memory(eng->ctx_mtp), 0, pos_min, -1);
+    }
+    return ok;
+}
+
+void ls_engine_mtp_accept(ls_engine * eng, int32_t n_accepted) {
+    if (!eng || !eng->ctx_mtp || eng->mtp_verify_rows <= 0 || eng->mtp_n_embd <= 0) {
+        return;
+    }
+    const int32_t clamped = std::max<int32_t>(0, std::min<int32_t>(n_accepted, eng->mtp_verify_rows - 1));
+    const size_t n_embd_sz = static_cast<size_t>(eng->mtp_n_embd);
+    std::memcpy(
+        eng->mtp_pending_h.data(),
+        eng->mtp_verify_h.data() + static_cast<size_t>(clamped) * n_embd_sz,
+        n_embd_sz * sizeof(float)
+    );
+}
+
+int32_t ls_engine_mtp_draft(
+    ls_engine * eng,
+    int32_t last_token,
+    int32_t pos0,
+    int32_t max_draft,
+    int32_t * out_tokens,
+    char * err_buf,
+    size_t err_cap
+) {
+    if (!eng || !out_tokens || max_draft <= 0) {
+        ls_internal::set_error(err_buf, err_cap, "invalid arguments to ls_engine_mtp_draft");
+        return -1;
+    }
+    if (!eng->ctx_mtp || !eng->vocab || eng->mtp_n_embd <= 0 || eng->mtp_pending_h.empty()) {
+        return 0;
+    }
+    const int32_t vocab_n = llama_vocab_n_tokens(eng->vocab);
+    if (vocab_n <= 0) {
+        return 0;
+    }
+    const int32_t eff_max = eng->mtp_chain_heads
+        ? std::min<int32_t>(max_draft, static_cast<int32_t>(eng->mtp_layers))
+        : max_draft;
+    const size_t n_embd_sz = static_cast<size_t>(eng->mtp_n_embd);
+
+    llama_batch_ext * mb = llama_batch_ext_init(eng->ctx_mtp);
+    if (!mb) {
+        ls_internal::set_error(err_buf, err_cap, "llama_batch_ext_init failed for MTP context");
+        return -2;
+    }
+
+    std::vector<float> chain_h;
+    if (eng->mtp_chain_heads) {
+        chain_h = eng->mtp_pending_h;
+    }
+
+    int32_t last_idx = llama_batch_ext_add_token(mb, 0, last_token);
+    if (last_idx < 0) {
+        llama_batch_ext_free(mb);
+        return 0;
+    }
+    const llama_pos p0 = pos0;
+    llama_batch_ext_set_pos(mb, last_idx, &p0);
+    llama_batch_ext_set_output_logits(mb, last_idx, true);
+    llama_batch_ext_set_embd_state(mb, last_idx, llama_embd{eng->mtp_pending_h.data(), 1, n_embd_sz});
+
+    int32_t drafted = 0;
+    llama_memory_t mem_mtp = llama_get_memory(eng->ctx_mtp);
+
+    for (int32_t step = 0; step < eff_max; ++step) {
+        if (eng->is_cancelled()) {
+            break;
+        }
+        if (eng->mtp_chain_heads) {
+            llama_memory_seq_rm(mem_mtp, 0, pos0, -1);
+            llama_set_nextn_layer_offset(eng->ctx_mtp, step);
+        }
+        if (llama_process(eng->ctx_mtp, LLAMA_PROCESS_TYPE_DECODE, mb) != 0) {
+            break;
+        }
+
+        const float * logits = llama_get_logits_ith(eng->ctx_mtp, last_idx);
+        if (!logits) {
+            break;
+        }
+        int32_t best_id = 0;
+        float best_val = logits[0];
+        for (int32_t v = 1; v < vocab_n; ++v) {
+            if (logits[v] > best_val) {
+                best_val = logits[v];
+                best_id = v;
+            }
+        }
+        if (llama_vocab_is_eog(eng->vocab, best_id)) {
+            break;
+        }
+        out_tokens[drafted++] = best_id;
+        if (drafted >= eff_max) {
+            break;
+        }
+
+        const float * h_row = llama_get_embeddings_nextn_ith(eng->ctx_mtp, last_idx);
+        if (!h_row) {
+            break;
+        }
+        llama_batch_ext_clear(mb);
+        if (eng->mtp_chain_heads) {
+            chain_h.insert(chain_h.end(), h_row, h_row + n_embd_sz);
+            const int32_t n_rows = drafted + 1;
+            bool batch_err = false;
+            for (int32_t t = 0; t < n_rows; ++t) {
+                const int32_t tok = (t == 0) ? last_token : out_tokens[t - 1];
+                const int32_t idx = llama_batch_ext_add_token(mb, 0, tok);
+                if (idx < 0) {
+                    batch_err = true;
+                    break;
+                }
+                const llama_pos pt = pos0 + t;
+                llama_batch_ext_set_pos(mb, idx, &pt);
+                llama_batch_ext_set_output_logits(mb, idx, t == n_rows - 1);
+                llama_batch_ext_set_embd_state(
+                    mb, idx, llama_embd{chain_h.data() + static_cast<size_t>(t) * n_embd_sz, 1, n_embd_sz}
+                );
+                last_idx = idx;
+            }
+            if (batch_err) {
+                break;
+            }
+        } else {
+            last_idx = llama_batch_ext_add_token(mb, 0, best_id);
+            if (last_idx < 0) {
+                break;
+            }
+            const llama_pos pn = eng->mtp_is_mem_shared ? pos0 : (pos0 + step + 1);
+            llama_batch_ext_set_pos(mb, last_idx, &pn);
+            llama_batch_ext_set_output_logits(mb, last_idx, true);
+            llama_batch_ext_set_embd_state(mb, last_idx, llama_embd{h_row, 1, n_embd_sz});
+        }
+    }
+
+    if (eng->mtp_chain_heads) {
+        llama_set_nextn_layer_offset(eng->ctx_mtp, 0);
+    }
+    if (!eng->mtp_is_mem_shared) {
+        llama_memory_seq_rm(mem_mtp, 0, pos0, -1);
+    }
+    llama_batch_ext_free(mb);
+    return drafted;
 }
 
 int ls_engine_save_state(
@@ -1311,6 +1468,7 @@ int ls_engine_run_decode_batch(
     if (rc != 0 || eng->eval_failed) {
         return report_failure(rc, decode_err_msg);
     }
+    eng->mtp_on_target_decode(tokens, n_tokens, pos_start);
     return 0;
 }
 

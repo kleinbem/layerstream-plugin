@@ -83,6 +83,8 @@ pub struct EngineStatsSnapshot {
     pub is_unified_memory: bool,
     pub using_gpu: bool,
     pub can_speculate: bool,
+    #[serde(default)]
+    pub mtp_layers: u32,
     pub io: IoStats,
 }
 
@@ -267,6 +269,7 @@ impl LoadedSession {
             is_unified_memory: st.is_unified_memory,
             using_gpu: st.using_gpu,
             can_speculate: st.can_speculate,
+            mtp_layers: st.mtp_layers,
             io,
         }
     }
