@@ -279,6 +279,18 @@ fn large_layer_read_exercises_parallel_span_and_negative_cached_layer() {
             .load_slices_into(&[("blk.0.big", 0, 0, 4096, 0)], &mut slice_dst)
             .unwrap();
         assert_eq!(&slice_dst[..], &payload[4096..8192]);
+        // Exercise persistent hot-expert profile save, clear, and sequential warm-up.
+        let prof_path = dir.path().join("profiles/big_layer.lsep");
+        let saved = pool2.save_expert_profile(&prof_path).unwrap();
+        assert!(saved >= 1);
+        pool2.clear_expert_cache();
+        let warmed = pool2.warm_expert_profile(&prof_path).unwrap();
+        assert_eq!(warmed, saved);
+        let hits_before = pool2.stats().cache_hits;
+        pool2
+            .load_slices_into(&[("blk.0.big", 0, 0, 4096, 0)], &mut slice_dst)
+            .unwrap();
+        assert!(pool2.stats().cache_hits > hits_before);
         // Drop prints `[layerstream-io-profile]` summary.
     }
     // SAFETY: Tests run with `--test-threads 1` so env mutation is serialized.

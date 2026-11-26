@@ -23,6 +23,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod inspect;
+pub use inspect::{
+    RemoteGgufMetadata, inspect_local_gguf, inspect_remote_gguf, parse_gguf_header_metadata,
+};
+
 /// Error returned by Hugging Face GGUF discovery, quant recommendation, and download operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

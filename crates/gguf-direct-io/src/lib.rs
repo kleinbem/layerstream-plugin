@@ -1,6 +1,7 @@
 //! Pure-Rust GGUF v2/v3 header parser, 4K-aligned coalesced span planner,
 //! and cross-platform `O_DIRECT` pread reader.
 
+pub mod expert_profile;
 pub mod gguf_index;
 pub mod io_reader;
 #[cfg(target_os = "linux")]

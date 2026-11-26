@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::Mutex;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn parses_colon_slash_and_revision_specs() {
