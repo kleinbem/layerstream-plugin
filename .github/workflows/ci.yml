@@ -258,12 +258,12 @@ jobs:
             echo "### Release Binary Size & Cold-Start Budget"
             echo "| Metric | Measured | Budget |"
             echo "|---|---|---|"
-            echo "| \`layerstream-plugin\` (x86_64-linux-gnu, stripped) | **${KB} KB** | <= 16,000 KB |"
+            echo "| \`layerstream-plugin\` (x86_64-linux-gnu, stripped) | **${KB} KB** | <= 14,000 KB |"
             echo "| \`--version\` cold-start (median of 5) | **${START_MS} ms** | <= 250 ms |"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "layerstream-plugin release size: ${KB} KB, cold-start: ${START_MS} ms"
-          if [ "$KB" -gt 16000 ]; then
-            echo "::error::Release binary ${KB} KB exceeds 16,000 KB budget"
+          if [ "$KB" -gt 14000 ]; then
+            echo "::error::Release binary ${KB} KB exceeds 14,000 KB budget"
             exit 1
           fi
 
@@ -286,15 +286,15 @@ jobs:
           {
             echo "### Rust Bundle A Coverage (pure-Rust crates)"
             echo '```'
-            cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --summary-only --show-missing-lines --fail-under-lines 91.0 -- --test-threads 1 | tee /tmp/cov_a.txt /dev/stderr
+            cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --summary-only --show-missing-lines --fail-under-lines 91.2 -- --test-threads 1 | tee /tmp/cov_a.txt /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY'
           import re, sys
           gates = {
               "gguf-direct-io": 91.8,
-              "hf-gguf": 88.4,
-              "json-schema-gbnf": 92.9,
+              "hf-gguf": 88.5,
+              "json-schema-gbnf": 93.3,
           }
           totals = {k: [0, 0] for k in gates}
           pat = re.compile(r"^([a-z0-9_-]+)/src/\S+\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+\d+\s+[\d.]+%\s+(\d+)\s+(\d+)\s+")
