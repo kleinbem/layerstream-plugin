@@ -23,29 +23,29 @@ static constexpr unsigned int kEventDisableTiming = cudaEventDisableTiming;
 static constexpr unsigned int kHostAllocDefault = cudaHostAllocDefault;
 static constexpr int kDevAttrIntegrated = static_cast<int>(cudaDevAttrIntegrated);
 
-static bool ensure_loaded() { return true; }
-static int device_get_attribute(int * value, int attr, int device) {
+inline bool ensure_loaded() { return true; }
+inline int device_get_attribute(int * value, int attr, int device) {
     return static_cast<int>(cudaDeviceGetAttribute(value, static_cast<cudaDeviceAttr>(attr), device));
 }
-static int stream_create_with_flags(Stream * s, unsigned int flags) {
+inline int stream_create_with_flags(Stream * s, unsigned int flags) {
     return static_cast<int>(cudaStreamCreateWithFlags(s, flags));
 }
-static int stream_destroy(Stream s) { return static_cast<int>(cudaStreamDestroy(s)); }
-static int stream_synchronize(Stream s) { return static_cast<int>(cudaStreamSynchronize(s)); }
-static int event_create_with_flags(Event * e, unsigned int flags) {
+inline int stream_destroy(Stream s) { return static_cast<int>(cudaStreamDestroy(s)); }
+inline int stream_synchronize(Stream s) { return static_cast<int>(cudaStreamSynchronize(s)); }
+inline int event_create_with_flags(Event * e, unsigned int flags) {
     return static_cast<int>(cudaEventCreateWithFlags(e, flags));
 }
-static int event_destroy(Event e) { return static_cast<int>(cudaEventDestroy(e)); }
-static int event_record(Event e, Stream s) { return static_cast<int>(cudaEventRecord(e, s)); }
-static int event_synchronize(Event e) { return static_cast<int>(cudaEventSynchronize(e)); }
-static int host_alloc(void ** ptr, size_t bytes, unsigned int flags) {
+inline int event_destroy(Event e) { return static_cast<int>(cudaEventDestroy(e)); }
+inline int event_record(Event e, Stream s) { return static_cast<int>(cudaEventRecord(e, s)); }
+inline int event_synchronize(Event e) { return static_cast<int>(cudaEventSynchronize(e)); }
+inline int host_alloc(void ** ptr, size_t bytes, unsigned int flags) {
     return static_cast<int>(cudaHostAlloc(ptr, bytes, flags));
 }
-static int free_host(void * ptr) { return static_cast<int>(cudaFreeHost(ptr)); }
-static int memcpy_async(void * dst, const void * src, size_t count, int kind, Stream s) {
+inline int free_host(void * ptr) { return static_cast<int>(cudaFreeHost(ptr)); }
+inline int memcpy_async(void * dst, const void * src, size_t count, int kind, Stream s) {
     return static_cast<int>(cudaMemcpyAsync(dst, src, count, static_cast<cudaMemcpyKind>(kind), s));
 }
-static int memset_async(void * dst, int value, size_t count, Stream s) {
+inline int memset_async(void * dst, int value, size_t count, Stream s) {
     return static_cast<int>(cudaMemsetAsync(dst, value, count, s));
 }
 #else
@@ -124,52 +124,52 @@ static const Api & get_api() {
     return api;
 }
 
-static bool ensure_loaded() { return get_api().ready; }
-static int device_get_attribute(int * value, int attr, int device) {
+inline bool ensure_loaded() { return get_api().ready; }
+inline int device_get_attribute(int * value, int attr, int device) {
     const auto & a = get_api();
     return a.ready ? a.device_get_attribute(value, attr, device) : -1;
 }
-static int stream_create_with_flags(Stream * s, unsigned int flags) {
+inline int stream_create_with_flags(Stream * s, unsigned int flags) {
     const auto & a = get_api();
     return a.ready ? a.stream_create_with_flags(s, flags) : -1;
 }
-static int stream_destroy(Stream s) {
+inline int stream_destroy(Stream s) {
     const auto & a = get_api();
     return a.ready ? a.stream_destroy(s) : -1;
 }
-static int stream_synchronize(Stream s) {
+inline int stream_synchronize(Stream s) {
     const auto & a = get_api();
     return a.ready ? a.stream_synchronize(s) : -1;
 }
-static int event_create_with_flags(Event * e, unsigned int flags) {
+inline int event_create_with_flags(Event * e, unsigned int flags) {
     const auto & a = get_api();
     return a.ready ? a.event_create_with_flags(e, flags) : -1;
 }
-static int event_destroy(Event e) {
+inline int event_destroy(Event e) {
     const auto & a = get_api();
     return a.ready ? a.event_destroy(e) : -1;
 }
-static int event_record(Event e, Stream s) {
+inline int event_record(Event e, Stream s) {
     const auto & a = get_api();
     return a.ready ? a.event_record(e, s) : -1;
 }
-static int event_synchronize(Event e) {
+inline int event_synchronize(Event e) {
     const auto & a = get_api();
     return a.ready ? a.event_synchronize(e) : -1;
 }
-static int host_alloc(void ** ptr, size_t bytes, unsigned int flags) {
+inline int host_alloc(void ** ptr, size_t bytes, unsigned int flags) {
     const auto & a = get_api();
     return a.ready ? a.host_alloc(ptr, bytes, flags) : -1;
 }
-static int free_host(void * ptr) {
+inline int free_host(void * ptr) {
     const auto & a = get_api();
     return a.ready ? a.free_host(ptr) : -1;
 }
-static int memcpy_async(void * dst, const void * src, size_t count, int kind, Stream s) {
+inline int memcpy_async(void * dst, const void * src, size_t count, int kind, Stream s) {
     const auto & a = get_api();
     return a.ready ? a.memcpy_async(dst, src, count, kind, s) : -1;
 }
-static int memset_async(void * dst, int value, size_t count, Stream s) {
+inline int memset_async(void * dst, int value, size_t count, Stream s) {
     const auto & a = get_api();
     return a.ready ? a.memset_async(dst, value, count, s) : -1;
 }
