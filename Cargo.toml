@@ -29,6 +29,38 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 
+# Size-optimize cold CLI/HTTP/TLS/MCP crates while keeping hot inference & I/O crates at opt-level = 3.
+[profile.release.package.clap]
+opt-level = "z"
+[profile.release.package.clap_builder]
+opt-level = "z"
+[profile.release.package.axum]
+opt-level = "z"
+[profile.release.package.hyper]
+opt-level = "z"
+[profile.release.package.hyper-util]
+opt-level = "z"
+[profile.release.package.ureq]
+opt-level = "z"
+[profile.release.package.rustls]
+opt-level = "z"
+[profile.release.package.webpki-roots]
+opt-level = "z"
+[profile.release.package.rmcp]
+opt-level = "z"
+[profile.release.package.schemars]
+opt-level = "z"
+[profile.release.package.mesh-llm-plugin]
+opt-level = "z"
+[profile.release.package.mesh-llm-config]
+opt-level = "z"
+[profile.release.package.mesh-llm-types]
+opt-level = "z"
+[profile.release.package.toml]
+opt-level = "z"
+[profile.release.package.toml_edit]
+opt-level = "z"
+
 [workspace.dependencies]
 anyhow = "1"
 axum = "0.8"
