@@ -673,6 +673,7 @@
           { label: "layerstream-plugin R=0 Sparse + TinyLFU (v0.6.1)", sub: "15.09 tok/s · all-GPU splits=1 · 1.02 J/tok · 3.39 GiB RSS", row: findOne(r => r.round === "round11_v061" && r.mode === "r11_olmoe_r0_sparse_cached" && r.workload === workload) },
           { label: "layerstream-plugin R=0 Sparse + TinyLFU (v0.2.1)", sub: "98–100% cache hit · reps=3 · 0 MiB swap · parallel FADV_RANDOM+DONTNEED", row: findOne(r => r.round === "round9_v021" && r.mode === "r9_olmoe_r0_sparse_cached" && r.workload === workload) },
           { label: "layerstream-plugin R=0 Sparse + TinyLFU (v0.1.0)", sub: "98–100% cache hit · reps=3 · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_olmoe_r0_sparse_cached" && r.workload === workload) },
+          { label: "JustVugg/colibri v2.2.0 (c/olmoe CPU)", sub: "3.60–3.64 tok/s · 2.64 GiB RSS · 64/64 experts cached in RAM", row: findOne(r => r.round === "competitors" && r.mode === "colibri_olmoe" && r.workload === workload) },
           { label: "layerstream-plugin R=0 Full-Layer Stream", sub: "Baseline without sparse MoE / TinyLFU", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_olmoe_r0_full") },
         ].filter(x => x.row);
       }
@@ -682,6 +683,8 @@
         { label: "Stock llama.cpp CPU mmap (-ngl 0 -dev none -b 512)", sub: "1.27 tok/s · 6.07 GiB RSS · +248 MiB swap · 25.3 s load · 15.26 J/tok", row: findOne(r => r.round === "competitors" && r.mode === "llama_cpp_qwen3_30b_cpu_mmap_b512") },
         { label: "layerstream-plugin v0.6.1 Sparse + 0.6B (code_edit)", sub: "0.81 tok/s · 4.26 GiB RSS · 6.95 s TTFT · all-GPU splits=1", row: findOne(r => r.round === "round11_v061" && r.mode === "r11_qwen3_30b_a3b_r0_draft06b" && r.workload === "code_edit") },
         { label: "layerstream-plugin v0.2.1 Sparse + 0.6B (code_edit)", sub: "0.95 tok/s (8.4× vs v0.1.0) · 4.09 GiB RSS · 1,261 MiB/s · 0 NVMe stalls", row: findOne(r => r.round === "round9_v021" && r.mode === "r9_qwen3_30b_a3b_r0_draft06b" && r.workload === "code_edit") },
+        { label: "JustVugg/colibri v2.2.0 (qwen36, open_ended)", sub: "0.65 tok/s · 2.32 GiB RSS · 0 MiB swap · cache=8/layer, no draft", row: findOne(r => r.round === "competitors" && r.mode === "colibri_qwen3_30b_a3b" && r.workload === "open_ended") },
+        { label: "JustVugg/colibri v2.2.0 (qwen36, code_edit)", sub: "0.65 tok/s · 2.33 GiB RSS · 0 MiB swap · 35.8 s TTFT", row: findOne(r => r.round === "competitors" && r.mode === "colibri_qwen3_30b_a3b" && r.workload === "code_edit") },
         { label: "layerstream-plugin v0.1.0 Sparse + 0.6B (open_ended)", sub: "Before fix: O_DIRECT Tegra nvme1 stalls · 3.97 GiB RSS · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_qwen3_30b_a3b_r0_draft06b" && r.workload === "open_ended") },
         { label: "layerstream-plugin v0.1.0 Sparse + 0.6B (code_edit)", sub: "Before fix: hit 30 s Orin Tegra nvme1 IRQ stalls · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_qwen3_30b_a3b_r0_draft06b" && r.workload === "code_edit") },
         { label: "Stock llama.cpp GPU MoE offload (-ot exps=CPU)", sub: "OOM rc=1 · +12.34 GiB swap", row: findOne(r => r.round === "competitors" && r.mode === "llama_cpp_qwen3_30b_gpu_moe_offload") },
