@@ -13,6 +13,7 @@ pub mod sampler;
 #[cfg(feature = "hf")]
 pub mod sdk;
 pub mod speculator;
+pub mod tuning;
 #[cfg(feature = "hf")]
 pub mod worker_ipc;
 
@@ -39,3 +40,7 @@ pub use openai::{
 pub use profile::{HardwareProfile, MemoryTier, MemoryTopology, ProfileOverride, StorageStack};
 pub use residency::{AdmissionPermit, EngineLease, Residency};
 pub use speculator::{DraftModelProposer, NgramProposer, SpeculationStats};
+pub use tuning::{
+    TUNING_SCHEMA_VERSION, TuneCandidateResult, TunedProfile, default_tuning_dir,
+    hardware_fingerprint, run_dir_storage_sweep, run_storage_sweep, select_best_candidate,
+};
