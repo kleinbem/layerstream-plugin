@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/0bb2eedc20e4739f29e8045034f2828ad7054f8f";
     llama-cpp-src = {
-      url = "github:ggml-org/llama.cpp/6d5f6487219ec7171a5558aa5d75b97c5720dad6";
+      url = "github:ggml-org/llama.cpp/9c003a97ab34a69cc49243f9b02014038205ffae";
       flake = false;
     };
   };
