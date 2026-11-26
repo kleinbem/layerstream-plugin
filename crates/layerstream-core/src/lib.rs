@@ -7,6 +7,7 @@ pub use json_schema_gbnf as grammar;
 pub mod hf;
 pub use gguf_direct_io::io_reader;
 pub mod openai;
+pub mod profile;
 pub mod residency;
 pub mod sampler;
 #[cfg(feature = "hf")]
@@ -35,5 +36,6 @@ pub use openai::{
     CompiledResponseFormat, OpenAiUsage, compile_response_format, normalize_finish_reason,
     normalize_kv_cache_type, normalize_vram_budget_mb, validate_sample_params,
 };
+pub use profile::{HardwareProfile, MemoryTier, MemoryTopology, ProfileOverride, StorageStack};
 pub use residency::{AdmissionPermit, EngineLease, Residency};
 pub use speculator::{DraftModelProposer, NgramProposer, SpeculationStats};

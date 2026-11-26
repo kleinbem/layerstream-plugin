@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::Args;
-use layerstream_core::{KvCacheType, StreamEngine, hf, probe_storage_mib_per_s};
+use layerstream_core::{
+    HardwareProfile, KvCacheType, ProfileOverride, StreamEngine, hf, probe_storage_mib_per_s,
+};
 use layerstream_server::{ModelRegistry, ServerConfig};
 
 const MIN_STREAMING_STORAGE_MIB_S: f64 = 150.0;
@@ -53,9 +55,13 @@ pub struct EngineArgs {
     #[arg(long)]
     pub allow_slow: bool,
 
+    /// Hardware/OS capability profile: `auto` (probe RAM, GPU topology & storage), `edge`, `balanced`, or `performance`.
+    #[arg(long, env = "LAYERSTREAM_HARDWARE_PROFILE", default_value = "auto")]
+    pub profile: String,
+
     // Hidden internal/CI flags kept out of normal `--help` to prevent footguns.
-    #[arg(long, default_value_t = 512, hide = true)]
-    pub batch_size: u32,
+    #[arg(long, hide = true)]
+    pub batch_size: Option<u32>,
 
     #[arg(long, hide = true)]
     pub threads: Option<u32>,
@@ -182,12 +188,22 @@ impl EngineArgs {
             .or(managed_idle_timeout_secs)
             .unwrap_or(60);
 
+        let profile_override: ProfileOverride = self
+            .profile
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --profile: {e}"))?;
+        let effective_override = if self.low_vram && profile_override == ProfileOverride::Auto {
+            ProfileOverride::Edge
+        } else {
+            profile_override
+        };
+
         let needs_defer = defer_uncached_hf && self.has_uncached_hf();
         let plan = DeferredPullPlan {
             models: self.models,
             models_dir: self.models_dir,
             draft_model: self.draft_model,
-            cache_root,
+            cache_root: cache_root.clone(),
             use_gpu,
             allow_slow: self.allow_slow,
         };
@@ -197,11 +213,29 @@ impl EngineArgs {
             (plan.execute()?, None)
         };
 
+        let probe_path = registry
+            .list()
+            .first()
+            .map(|m| m.path.as_path())
+            .unwrap_or(cache_root.as_path());
+        let hw_profile = HardwareProfile::detect(probe_path, use_gpu, false, effective_override);
+        let n_batch = self.batch_size.unwrap_or(hw_profile.recommended_n_batch);
+        let cpu_embeddings = self.low_vram || hw_profile.recommended_cpu_embeddings;
+        let stream_head = self.low_vram || hw_profile.recommended_stream_head;
+        tracing::info!(
+            profile = %hw_profile.label(),
+            n_batch,
+            recommended_io_threads = hw_profile.recommended_io_threads,
+            cpu_embeddings,
+            stream_head,
+            "resolved hardware/OS capability profile"
+        );
+
         Ok((
             ServerConfig {
                 registry,
                 n_ctx: self.ctx_size,
-                n_batch: self.batch_size,
+                n_batch,
                 n_threads,
                 resident_layers: None,
                 vram_budget_bytes,
@@ -209,9 +243,9 @@ impl EngineArgs {
                 kv_cache_type,
                 use_gpu,
                 prefer_direct_io: true,
-                cpu_embeddings: self.low_vram,
+                cpu_embeddings,
                 cpu_head: false,
-                stream_head: self.low_vram,
+                stream_head,
                 moe_active_streaming: true,
                 idle_timeout: Duration::from_secs(effective_idle_timeout_secs),
                 enable_ngram_speculation: true,
@@ -255,6 +289,18 @@ pub fn run_preflight_checks(
                 println!("GPU memory: disabled (--no-gpu test mode)");
             }
         }
+        let check_path = registry
+            .list()
+            .first()
+            .map(|m| m.path.as_path())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let prof = HardwareProfile::detect(check_path, use_gpu, false, ProfileOverride::Auto);
+        println!(
+            "Hardware profile: {} (recommended n_batch={}, io_threads={})",
+            prof.label(),
+            prof.recommended_n_batch,
+            prof.recommended_io_threads
+        );
     }
 
     for entry in registry.list() {
@@ -360,7 +406,8 @@ mod tests {
             idle_timeout_secs: None,
             in_process: false,
             allow_slow: true,
-            batch_size: 256,
+            profile: "auto".to_string(),
+            batch_size: Some(256),
             threads: None,
             no_gpu: true,
             low_vram: false,
