@@ -396,4 +396,12 @@ mod tests {
         stats.backend_name = [b'X' as c_char; 32];
         assert_eq!(stats.backend_name_str(), "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
     }
+
+    #[test]
+    fn gpu_probe_disabled_and_log_verbosity_toggle_work() {
+        assert!(crate::StreamEngine::probe_gpu_device(false).is_none());
+        assert!(crate::StreamEngine::probe_gpu_memory(false).is_none());
+        crate::StreamEngine::set_log_verbose(false);
+        crate::StreamEngine::set_log_verbose(true);
+    }
 }
