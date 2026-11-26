@@ -548,5 +548,78 @@ mod tests {
         bad_ver.extend_from_slice(&0u64.to_le_bytes());
         bad_ver.extend_from_slice(&0u64.to_le_bytes());
         assert!(parse_gguf_header_metadata(&bad_ver).is_err());
+
+        // Exercise hybrid-SSM + integer width variants (u8/i8/u16/i16/i32/i64) + summary_line.
+        let mut ssm = Vec::new();
+        ssm.extend_from_slice(b"GGUF");
+        ssm.extend_from_slice(&3u32.to_le_bytes());
+        ssm.extend_from_slice(&1u64.to_le_bytes());
+        ssm.extend_from_slice(&7u64.to_le_bytes());
+        push_kv_str(&mut ssm, "general.architecture", "qwen3next");
+        push_str(&mut ssm, "qwen3next.block_count");
+        ssm.extend_from_slice(&0u32.to_le_bytes());
+        ssm.push(24);
+        push_str(&mut ssm, "qwen3next.context_length");
+        ssm.extend_from_slice(&2u32.to_le_bytes());
+        ssm.extend_from_slice(&8192u16.to_le_bytes());
+        push_str(&mut ssm, "qwen3next.embedding_length");
+        ssm.extend_from_slice(&5u32.to_le_bytes());
+        ssm.extend_from_slice(&2048i32.to_le_bytes());
+        push_str(&mut ssm, "qwen3next.expert_count");
+        ssm.extend_from_slice(&1u32.to_le_bytes());
+        ssm.push(64);
+        push_str(&mut ssm, "qwen3next.ssm.conv_kernel");
+        ssm.extend_from_slice(&3u32.to_le_bytes());
+        ssm.extend_from_slice(&4i16.to_le_bytes());
+        push_str(&mut ssm, "general.file_type");
+        ssm.extend_from_slice(&11u32.to_le_bytes());
+        ssm.extend_from_slice(&15i64.to_le_bytes());
+        let ssm_meta = parse_gguf_header_metadata(&ssm).expect("parse hybrid ssm");
+        assert!(ssm_meta.is_hybrid_ssm);
+        assert!(ssm_meta.is_moe);
+        assert!(ssm_meta.needs_external_draft());
+        let line = ssm_meta.summary_line();
+        assert!(line.contains("MoE=64x"));
+        assert!(line.contains("hybrid-SSM"));
+    }
+
+    #[test]
+    fn inspect_remote_gguf_maps_404_and_500_errors() {
+        let _env_guard = crate::tests::ENV_LOCK.lock().unwrap();
+        for (status_line, expect_not_found) in [
+            ("HTTP/1.1 404 Not Found", true),
+            ("HTTP/1.1 500 Internal Server Error", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let resp =
+                    format!("{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(resp.as_bytes());
+            });
+            let prev = std::env::var_os("HF_ENDPOINT");
+            // SAFETY: serialized via ENV_LOCK around a single synchronous request.
+            unsafe { std::env::set_var("HF_ENDPOINT", format!("http://{addr}")) };
+            let spec = HfSpec::parse("hf://org/repo:missing.gguf").unwrap();
+            let err = inspect_remote_gguf(&spec).unwrap_err();
+            match prev {
+                Some(v) => {
+                    // SAFETY: restores saved HF_ENDPOINT value.
+                    unsafe { std::env::set_var("HF_ENDPOINT", v) }
+                }
+                None => {
+                    // SAFETY: removes test-only HF_ENDPOINT override.
+                    unsafe { std::env::remove_var("HF_ENDPOINT") }
+                }
+            }
+            server.join().expect("join");
+            assert_eq!(matches!(err, HfError::NotFound(_)), expect_not_found);
+        }
     }
 }
