@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "gguf-direct-io"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "io-uring",
  "libc",
@@ -272,7 +272,7 @@ checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 
 [[package]]
 name = "hf-gguf"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "gguf-direct-io",
  "serde",
@@ -327,7 +327,7 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
 name = "json-schema-gbnf"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "cc",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "layerstream-node"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "layerstream-core",

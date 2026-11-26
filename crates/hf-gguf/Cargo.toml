@@ -14,7 +14,7 @@ categories = ["network-programming", "api-bindings"]
 workspace = true
 
 [dependencies]
-gguf-direct-io = { path = "../gguf-direct-io", version = "0.6.0" }
+gguf-direct-io = { path = "../gguf-direct-io", version = "0.6.1" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
