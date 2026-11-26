@@ -454,5 +454,77 @@ mod tests {
             .into_server_config_with_deferred(true, None)
             .expect("deferred hf plan");
         assert!(deferred2.is_some());
+
+        // Invalid --profile -> error
+        let mut bad_prof = base_args();
+        bad_prof.profile = "turbo-invalid".to_string();
+        assert!(bad_prof.into_server_config().is_err());
+
+        // --low-vram with auto profile upgrades to Edge; explicit profile is preserved
+        let mut low_vram_args = base_args();
+        low_vram_args.batch_size = None;
+        low_vram_args.low_vram = true;
+        let (low_cfg, _) = low_vram_args
+            .into_server_config_with_deferred(false, None)
+            .expect("low_vram auto profile");
+        assert_eq!(low_cfg.n_batch, 256);
+        assert!(low_cfg.cpu_embeddings);
+        assert!(low_cfg.stream_head);
+        assert!(low_cfg.n_threads >= 1);
+
+        let mut perf_args = base_args();
+        perf_args.batch_size = None;
+        perf_args.no_gpu = false;
+        perf_args.profile = "performance".to_string();
+        let (perf_cfg, _) = perf_args
+            .into_server_config_with_deferred(false, None)
+            .expect("performance profile");
+        assert!(perf_cfg.n_batch >= 512);
+
+        // SaturatingSubF64 clamps negative values to 0.0
+        assert_eq!(10.0_f64.saturating_sub_f64(25.0), 0.0);
+        assert_eq!(25.0_f64.saturating_sub_f64(10.0), 15.0);
+    }
+
+    #[test]
+    fn preflight_checks_cover_report_logging_and_draft_paths() {
+        let dir = std::env::temp_dir().join(format!("ls-preflight-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let model_path = dir.join("tiny.gguf");
+        let draft_path = dir.join("draft.gguf");
+        // Write a minimal valid GGUF v3 header with tokenizer.ggml.tokens array so draft compat passes
+        let mut gguf = Vec::with_capacity(8192);
+        gguf.extend_from_slice(b"GGUF");
+        gguf.extend_from_slice(&3u32.to_le_bytes());
+        gguf.extend_from_slice(&0u64.to_le_bytes());
+        gguf.extend_from_slice(&1u64.to_le_bytes()); // 1 KV
+        let k = b"tokenizer.ggml.tokens";
+        gguf.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        gguf.extend_from_slice(k);
+        gguf.extend_from_slice(&9u32.to_le_bytes()); // array
+        gguf.extend_from_slice(&8u32.to_le_bytes()); // element type = string
+        gguf.extend_from_slice(&2u64.to_le_bytes()); // len = 2
+        for tok in [b"a".as_slice(), b"b".as_slice()] {
+            gguf.extend_from_slice(&(tok.len() as u64).to_le_bytes());
+            gguf.extend_from_slice(tok);
+        }
+        gguf.resize(8192, 0);
+        std::fs::write(&model_path, &gguf).expect("write tiny gguf");
+        std::fs::write(&draft_path, &gguf).expect("write draft gguf");
+
+        let plan = DeferredPullPlan {
+            models: vec![format!("tiny={}", model_path.display())],
+            models_dir: None,
+            draft_model: Some(draft_path.display().to_string()),
+            cache_root: dir.clone(),
+            use_gpu: false,
+            allow_slow: true,
+        };
+        let registry = plan.execute().expect("execute local plan");
+        assert_eq!(registry.len(), 1);
+        run_preflight_checks(&registry, false, true, true).expect("print_report=true");
+        run_preflight_checks(&registry, false, false, false).expect("print_report=false");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

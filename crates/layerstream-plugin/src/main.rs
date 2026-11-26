@@ -98,17 +98,7 @@ enum Command {
     Worker,
 }
 
-fn main() -> Result<()> {
-    // Log exclusively to stderr so stdout stays clean for CLI pipes and Mesh-LLM plugin host logs.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
-    let cli = Cli::parse();
-
+fn validate_cli(cli: &Cli) -> Result<()> {
     if cli.command.is_some()
         && (!cli.plugin_args.models.is_empty()
             || cli.plugin_args.in_process
@@ -122,26 +112,174 @@ fn main() -> Result<()> {
             "engine flags (such as --model, --in-process, --idle-timeout-secs) must be placed after the subcommand (for example: 'layerstream-plugin serve --model ...')"
         );
     }
+    Ok(())
+}
+
+fn run_pull_command(
+    spec: &str,
+    cache_dir: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    let root = cache_dir.unwrap_or_else(hf::default_cache_dir);
+    let local = hf::ensure_hf_downloaded(spec, &root)?;
+    println!("{}", local.display());
+    Ok(local)
+}
+
+fn run_inspect_command(spec: &str, json: bool) -> Result<String> {
+    let meta = if spec.starts_with("hf://") {
+        let parsed = hf::HfSpec::parse(spec)?;
+        hf::inspect_remote_gguf(&parsed)?
+    } else {
+        hf::inspect_local_gguf(std::path::Path::new(spec))?
+    };
+    let output = if json {
+        serde_json::to_string_pretty(&meta)?
+    } else {
+        meta.summary_line()
+    };
+    println!("{output}");
+    Ok(output)
+}
+
+fn format_recommend_report(
+    recs: &[hf::QuantRecommendation],
+    free_vram_bytes: u64,
+    storage_bw: f64,
+    no_draft: bool,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Hardware profile: {:.1} GiB free GPU/UMA | {:.0} MiB/s NVMe | draft={}\n",
+        free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        storage_bw,
+        if no_draft { "no" } else { "yes" }
+    ));
+    out.push_str(&format!(
+        "{:<3} {:<11} {:>8} {:>6} {:<12} {:>6} {:>13}  FILE\n",
+        "", "QUANT", "SIZE", "SHARDS", "VERDICT", "PIN%", "EST TOK/S"
+    ));
+    for r in recs {
+        let mark = if r.recommended { "★" } else { " " };
+        let gib = r.candidate.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        out.push_str(&format!(
+            "{:<3} {:<11} {:>6.2} G {:>6} {:<12} {:>5}% {:>5.2}-{:<6.2}  {}\n",
+            mark,
+            r.candidate.quant,
+            gib,
+            r.candidate.shard_count,
+            r.verdict,
+            r.pinned_pct,
+            r.est_tps_low,
+            r.est_tps_high,
+            r.candidate.primary_file
+        ));
+    }
+    if let Some(best) = recs.iter().find(|r| r.recommended) {
+        if let Ok(parsed) = hf::HfSpec::parse(&best.hf_uri)
+            && let Ok(meta) = hf::inspect_remote_gguf(&parsed)
+        {
+            out.push_str(&format!(
+                "\nHeader peek ({}):\n",
+                best.candidate.primary_file
+            ));
+            out.push_str(&format!("  {}\n", meta.summary_line()));
+        }
+        out.push_str("\nRecommended pull command:\n");
+        out.push_str(&format!("  layerstream-plugin pull {}\n", best.hf_uri));
+    }
+    out
+}
+
+fn run_recommend_command(
+    repo: &str,
+    revision: Option<&str>,
+    free_ram_gb: Option<f64>,
+    nvme_mib_s: Option<f64>,
+    no_draft: bool,
+    cache_dir: Option<std::path::PathBuf>,
+    json: bool,
+) -> Result<String> {
+    let (repo_id, rev) = hf::parse_repo_and_revision(repo, revision)?;
+    let free_vram_bytes = if let Some(gb) = free_ram_gb {
+        (gb.max(0.5) * 1024.0 * 1024.0 * 1024.0) as u64
+    } else if let Some((free, _total)) = layerstream_core::StreamEngine::probe_gpu_memory(true) {
+        free
+    } else {
+        anyhow::bail!(
+            "no usable GPU found for live probe; pass --free-ram-gb <GiB> to evaluate target hardware"
+        );
+    };
+
+    let storage_bw = if let Some(bw) = nvme_mib_s {
+        bw.max(10.0)
+    } else {
+        let probe_dir = cache_dir.unwrap_or_else(hf::default_cache_dir);
+        let _ = std::fs::create_dir_all(&probe_dir);
+        probe_dir_storage_mib_per_s(&probe_dir).unwrap_or(1500.0)
+    };
+
+    let candidates = hf::list_hf_gguf_candidates(&repo_id, &rev)?;
+    if candidates.is_empty() {
+        anyhow::bail!("no GGUF files found in {repo_id}@{rev}");
+    }
+    let recs = hf::recommend_candidates(
+        &repo_id,
+        &rev,
+        &candidates,
+        free_vram_bytes,
+        storage_bw,
+        !no_draft,
+    );
+
+    let output = if json {
+        serde_json::to_string_pretty(&recs)?
+    } else {
+        format_recommend_report(&recs, free_vram_bytes, storage_bw, no_draft)
+    };
+    print!("{output}");
+    if json {
+        println!();
+    }
+    Ok(output)
+}
+
+fn run_check_command(engine: EngineArgs) -> Result<()> {
+    let use_gpu = !engine.no_gpu;
+    let allow_slow = engine.allow_slow;
+    let server_cfg = engine.into_server_config()?;
+    run_preflight_checks(&server_cfg.registry, use_gpu, allow_slow, true)
+}
+
+fn validate_api_key(api_key: Option<&str>) -> Result<()> {
+    if let Some(k) = api_key
+        && k.trim().is_empty()
+    {
+        anyhow::bail!(
+            "--api-key / LAYERSTREAM_API_KEY must not be empty; unset it to run unauthenticated"
+        );
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    // Log exclusively to stderr so stdout stays clean for CLI pipes and Mesh-LLM plugin host logs.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    validate_cli(&cli)?;
 
     if let Some(Command::Pull { spec, cache_dir }) = cli.command {
-        let root = cache_dir.unwrap_or_else(hf::default_cache_dir);
-        let local = hf::ensure_hf_downloaded(&spec, &root)?;
-        println!("{}", local.display());
+        let _ = run_pull_command(&spec, cache_dir)?;
         return Ok(());
     }
 
     if let Some(Command::Inspect { spec, json }) = cli.command {
-        let meta = if spec.starts_with("hf://") {
-            let parsed = hf::HfSpec::parse(&spec)?;
-            hf::inspect_remote_gguf(&parsed)?
-        } else {
-            hf::inspect_local_gguf(std::path::Path::new(&spec))?
-        };
-        if json {
-            println!("{}", serde_json::to_string_pretty(&meta)?);
-        } else {
-            println!("{}", meta.summary_line());
-        }
+        let _ = run_inspect_command(&spec, json)?;
         return Ok(());
     }
 
@@ -155,88 +293,20 @@ fn main() -> Result<()> {
         json,
     }) = cli.command
     {
-        let (repo_id, rev) = hf::parse_repo_and_revision(&repo, revision.as_deref())?;
-        let free_vram_bytes = if let Some(gb) = free_ram_gb {
-            (gb.max(0.5) * 1024.0 * 1024.0 * 1024.0) as u64
-        } else if let Some((free, _total)) = layerstream_core::StreamEngine::probe_gpu_memory(true)
-        {
-            free
-        } else {
-            anyhow::bail!(
-                "no usable GPU found for live probe; pass --free-ram-gb <GiB> to evaluate target hardware"
-            );
-        };
-
-        let storage_bw = if let Some(bw) = nvme_mib_s {
-            bw.max(10.0)
-        } else {
-            let probe_dir = cache_dir.unwrap_or_else(hf::default_cache_dir);
-            let _ = std::fs::create_dir_all(&probe_dir);
-            probe_dir_storage_mib_per_s(&probe_dir).unwrap_or(1500.0)
-        };
-
-        let candidates = hf::list_hf_gguf_candidates(&repo_id, &rev)?;
-        if candidates.is_empty() {
-            anyhow::bail!("no GGUF files found in {repo_id}@{rev}");
-        }
-        let recs = hf::recommend_candidates(
-            &repo_id,
-            &rev,
-            &candidates,
-            free_vram_bytes,
-            storage_bw,
-            !no_draft,
-        );
-
-        if json {
-            println!("{}", serde_json::to_string_pretty(&recs)?);
-            return Ok(());
-        }
-
-        println!(
-            "Hardware profile: {:.1} GiB free GPU/UMA | {:.0} MiB/s NVMe | draft={}",
-            free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            storage_bw,
-            if no_draft { "no" } else { "yes" }
-        );
-        println!(
-            "{:<3} {:<11} {:>8} {:>6} {:<12} {:>6} {:>13}  FILE",
-            "", "QUANT", "SIZE", "SHARDS", "VERDICT", "PIN%", "EST TOK/S"
-        );
-        for r in &recs {
-            let mark = if r.recommended { "★" } else { " " };
-            let gib = r.candidate.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-            println!(
-                "{:<3} {:<11} {:>6.2} G {:>6} {:<12} {:>5}% {:>5.2}-{:<6.2}  {}",
-                mark,
-                r.candidate.quant,
-                gib,
-                r.candidate.shard_count,
-                r.verdict,
-                r.pinned_pct,
-                r.est_tps_low,
-                r.est_tps_high,
-                r.candidate.primary_file
-            );
-        }
-        if let Some(best) = recs.iter().find(|r| r.recommended) {
-            if let Ok(parsed) = hf::HfSpec::parse(&best.hf_uri)
-                && let Ok(meta) = hf::inspect_remote_gguf(&parsed)
-            {
-                println!("\nHeader peek ({}):", best.candidate.primary_file);
-                println!("  {}", meta.summary_line());
-            }
-            println!("\nRecommended pull command:");
-            println!("  layerstream-plugin pull {}", best.hf_uri);
-        }
+        let _ = run_recommend_command(
+            &repo,
+            revision.as_deref(),
+            free_ram_gb,
+            nvme_mib_s,
+            no_draft,
+            cache_dir,
+            json,
+        )?;
         return Ok(());
     }
 
     if let Some(Command::Check { engine }) = cli.command {
-        let use_gpu = !engine.no_gpu;
-        let allow_slow = engine.allow_slow;
-        let server_cfg = engine.into_server_config()?;
-        run_preflight_checks(&server_cfg.registry, use_gpu, allow_slow, true)?;
+        run_check_command(engine)?;
         return Ok(());
     }
 
@@ -254,13 +324,7 @@ fn main() -> Result<()> {
                 api_key,
                 engine,
             }) => {
-                if let Some(ref k) = api_key
-                    && k.trim().is_empty()
-                {
-                    anyhow::bail!(
-                        "--api-key / LAYERSTREAM_API_KEY must not be empty; unset it to run unauthenticated"
-                    );
-                }
+                validate_api_key(api_key.as_deref())?;
                 let in_process = engine.in_process;
                 let server_cfg = engine.into_server_config()?;
                 let addr = format!("{host}:{port}");
@@ -363,4 +427,132 @@ async fn run_plugin_mode(engine: EngineArgs) -> Result<()> {
         managed_startup,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_minimal_gguf(path: &std::path::Path) {
+        let mut gguf = Vec::with_capacity(8192);
+        gguf.extend_from_slice(b"GGUF");
+        gguf.extend_from_slice(&3u32.to_le_bytes()); // version
+        gguf.extend_from_slice(&0u64.to_le_bytes()); // n_tensors
+        gguf.extend_from_slice(&2u64.to_le_bytes()); // n_kv
+        // KV 1: general.architecture = "llama" (type 8 = string)
+        let k1 = b"general.architecture";
+        gguf.extend_from_slice(&(k1.len() as u64).to_le_bytes());
+        gguf.extend_from_slice(k1);
+        gguf.extend_from_slice(&8u32.to_le_bytes());
+        let v1 = b"llama";
+        gguf.extend_from_slice(&(v1.len() as u64).to_le_bytes());
+        gguf.extend_from_slice(v1);
+        // KV 2: llama.block_count = 4u32 (type 4 = u32)
+        let k2 = b"llama.block_count";
+        gguf.extend_from_slice(&(k2.len() as u64).to_le_bytes());
+        gguf.extend_from_slice(k2);
+        gguf.extend_from_slice(&4u32.to_le_bytes());
+        gguf.extend_from_slice(&4u32.to_le_bytes());
+        gguf.resize(8192, 0);
+        std::fs::write(path, &gguf).expect("write minimal gguf");
+    }
+
+    #[test]
+    fn validate_cli_rejects_misplaced_engine_flags_and_accepts_subcommands() {
+        let ok = Cli::try_parse_from(["layerstream-plugin", "check", "--no-gpu"])
+            .expect("parse valid check");
+        validate_cli(&ok).expect("valid subcommand passes");
+
+        let misplaced = Cli::try_parse_from(["layerstream-plugin", "--no-gpu", "check"])
+            .expect("parse misplaced flag");
+        assert!(validate_cli(&misplaced).is_err());
+
+        let misplaced_model =
+            Cli::try_parse_from(["layerstream-plugin", "--model", "foo.gguf", "serve"])
+                .expect("parse misplaced model");
+        assert!(validate_cli(&misplaced_model).is_err());
+
+        validate_api_key(None).expect("none key ok");
+        validate_api_key(Some("secret-token")).expect("non-empty key ok");
+        assert!(validate_api_key(Some("")).is_err());
+        assert!(validate_api_key(Some("   ")).is_err());
+    }
+
+    #[test]
+    fn inspect_check_pull_and_recommend_formatting_work() {
+        let dir = std::env::temp_dir().join(format!("ls-main-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let gguf_path = dir.join("model.gguf");
+        write_minimal_gguf(&gguf_path);
+
+        let text_out =
+            run_inspect_command(&gguf_path.display().to_string(), false).expect("inspect text");
+        assert!(text_out.contains("unknown") || !text_out.is_empty());
+
+        let json_out =
+            run_inspect_command(&gguf_path.display().to_string(), true).expect("inspect json");
+        assert!(json_out.contains("\"architecture\""));
+
+        // Invalid hf:// spec errors cleanly
+        assert!(run_inspect_command("hf://bad-spec-without-file", false).is_err());
+        assert!(run_pull_command("hf://bad-spec", Some(dir.clone())).is_err());
+
+        // Check subcommand in --no-gpu mode
+        let cli = Cli::try_parse_from([
+            "layerstream-plugin",
+            "check",
+            "--no-gpu",
+            "--model",
+            &gguf_path.display().to_string(),
+        ])
+        .expect("parse check");
+        let Some(Command::Check { engine }) = cli.command else {
+            panic!("expected Check command");
+        };
+        run_check_command(engine).expect("check --no-gpu succeeds");
+
+        // Recommend report formatting
+        let candidates = vec![
+            hf::HfGgufCandidate {
+                quant: "Q4_K_M".to_string(),
+                primary_file: "model-Q4_K_M.gguf".to_string(),
+                shard_count: 1,
+                total_bytes: 8 * 1024 * 1024 * 1024,
+            },
+            hf::HfGgufCandidate {
+                quant: "Q8_0".to_string(),
+                primary_file: "model-Q8_0.gguf".to_string(),
+                shard_count: 2,
+                total_bytes: 16 * 1024 * 1024 * 1024,
+            },
+        ];
+        let recs = hf::recommend_candidates(
+            "org/model",
+            "main",
+            &candidates,
+            6 * 1024 * 1024 * 1024,
+            2400.0,
+            true,
+        );
+        let report = format_recommend_report(&recs, 6 * 1024 * 1024 * 1024, 2400.0, false);
+        assert!(report.contains("Hardware profile: 6.0 GiB"));
+        assert!(report.contains("Q4_K_M"));
+        assert!(report.contains("Recommended pull command:"));
+
+        // Recommend error path for invalid repo
+        assert!(
+            run_recommend_command(
+                "not-a-valid-repo",
+                None,
+                Some(6.0),
+                Some(2000.0),
+                false,
+                Some(dir.clone()),
+                false
+            )
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
