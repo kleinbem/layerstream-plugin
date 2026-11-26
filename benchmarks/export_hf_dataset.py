@@ -49,6 +49,12 @@ def load_dir_hardware(round_dir: Path) -> tuple[str, str]:
     return DEFAULT_HARDWARE, DEFAULT_HARDWARE_ID
 
 
+def _derive_rate(num: Any, den: Any) -> float | None:
+    if isinstance(num, (int, float)) and isinstance(den, (int, float)) and den > 0:
+        return round(float(num) / float(den), 3)
+    return None
+
+
 def normalize_record(
     rec: dict[str, Any],
     source_file: str,
@@ -58,6 +64,12 @@ def normalize_record(
 ) -> dict[str, Any]:
     engine = rec.get("engine")
     default_ver = "0.1.0" if engine == "layerstream-plugin" else None
+    draft_acceptance_rate = rec.get("draft_acceptance_rate")
+    if draft_acceptance_rate is None:
+        draft_acceptance_rate = _derive_rate(rec.get("accepted_tokens"), rec.get("drafted_tokens"))
+    tokens_per_sweep = rec.get("tokens_per_sweep")
+    if tokens_per_sweep is None:
+        tokens_per_sweep = _derive_rate(rec.get("completion_tokens"), rec.get("sweeps"))
     return {
         "round": round_name,
         "source_file": source_file,
@@ -66,6 +78,7 @@ def normalize_record(
         "engine": engine,
         "engine_version": rec.get("engine_version", default_ver),
         "git_rev": rec.get("git_rev"),
+        "backend_name": rec.get("backend_name"),
         "mode": rec.get("mode"),
         "status": rec.get("status", "ok"),
         "model": rec.get("model"),
@@ -97,6 +110,10 @@ def normalize_record(
         "sweeps": rec.get("sweeps"),
         "drafted_tokens": rec.get("drafted_tokens"),
         "accepted_tokens": rec.get("accepted_tokens"),
+        "draft_acceptance_rate": draft_acceptance_rate,
+        "tokens_per_sweep": tokens_per_sweep,
+        "mtp_layers": rec.get("mtp_layers"),
+        "rs_rollback_max": rec.get("rs_rollback_max"),
         "resident_layers": rec.get("resident_layers"),
         "streamed_layers": rec.get("streamed_layers"),
         "n_layers": rec.get("n_layers"),

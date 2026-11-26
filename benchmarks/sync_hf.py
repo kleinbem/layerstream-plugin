@@ -24,6 +24,8 @@ REPRO_SCRIPTS = (
     "bench_accelerate.py",
     "bench_airllm.py",
     "export_hf_dataset.py",
+    "check_regressions.py",
+    "run_round.py",
 )
 
 
@@ -59,7 +61,7 @@ def main() -> None:
     args = ap.parse_args()
 
     export_script = repo_root / "benchmarks/export_hf_dataset.py"
-    subprocess.run(  # noqa: S603 — explicit argv list invoking repo-local export script
+    subprocess.run(
         [
             sys.executable,
             str(export_script),
