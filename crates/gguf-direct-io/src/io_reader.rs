@@ -224,6 +224,20 @@ impl ExpertSliceCache {
             cache.clear();
         }
     }
+
+    fn export_hot_entries(&self) -> Vec<crate::expert_profile::HotSliceEntry> {
+        let Some(cache) = self.cache.as_ref() else {
+            return Vec::new();
+        };
+        cache
+            .iter()
+            .map(|(k, _)| crate::expert_profile::HotSliceEntry {
+                shard_idx: k.shard_idx as u32,
+                file_offset: k.file_offset,
+                len: k.len as u64,
+            })
+            .collect()
+    }
 }
 
 fn auto_expert_cache_budget_bytes() -> usize {
@@ -572,6 +586,47 @@ impl LayerIoPool {
 
     pub fn clear_expert_cache(&self) {
         self.expert_cache.lock().clear();
+    }
+
+    /// Saves the currently resident S3-FIFO hot-expert slice coordinates to `path`
+    /// so a future session can pre-warm the cache sequentially from NVMe.
+    pub fn save_expert_profile(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        let entries = self.expert_cache.lock().export_hot_entries();
+        crate::expert_profile::write_expert_profile(path, &entries)
+    }
+
+    /// Pre-warms the S3-FIFO expert cache from a saved hot-expert profile using
+    /// sequential reads sorted by `(shard_idx, file_offset)`. Returns the number
+    /// of slices loaded into RAM.
+    pub fn warm_expert_profile(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        let entries = crate::expert_profile::read_expert_profile(path)?;
+        let mut loaded = 0usize;
+        let mut scratch = Vec::new();
+        for entry in entries {
+            let shard_idx = entry.shard_idx as usize;
+            let Ok(len) = usize::try_from(entry.len) else {
+                continue;
+            };
+            if len == 0 || shard_idx >= self.shards.len() {
+                continue;
+            }
+            if scratch.len() < len {
+                scratch.resize(len, 0);
+            }
+            let file = &self.shards[shard_idx].buffered;
+            if pread_all(file, &mut scratch[..len], entry.file_offset).is_ok() {
+                self.expert_cache.lock().insert(
+                    SliceKey {
+                        shard_idx,
+                        file_offset: entry.file_offset,
+                        len,
+                    },
+                    &scratch[..len],
+                );
+                loaded += 1;
+            }
+        }
+        Ok(loaded)
     }
 
     pub fn stats(&self) -> IoStats {

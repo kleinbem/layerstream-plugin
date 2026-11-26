@@ -178,6 +178,27 @@ pub struct StreamEngine {
     io_pool: Option<*mut LayerIoPool>,
     n_batch: usize,
     cached_kv_tokens: Vec<i32>,
+    expert_profile_path: Option<PathBuf>,
+}
+
+fn default_expert_profile_path(model_path: &Path) -> Option<PathBuf> {
+    if std::env::var("LAYERSTREAM_DISABLE_EXPERT_PROFILE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let meta = std::fs::metadata(model_path).ok()?;
+    let stem = model_path.file_name()?.to_string_lossy();
+    let cache_base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(
+        cache_base
+            .join("layerstream")
+            .join("expert_profiles")
+            .join(format!("{stem}-{}.lsep", meta.len())),
+    )
 }
 
 // SAFETY: `StreamEngine` owns its C++ `LsEngine` handle and `LayerIoPool` exclusively; all mutable
@@ -254,12 +275,32 @@ impl StreamEngine {
             bail!("failed to create layerstream engine: {msg}");
         };
 
-        Ok(Self {
+        let engine = Self {
             raw,
             io_pool: io_pool_raw,
             n_batch: cfg.n_batch.max(1) as usize,
             cached_kv_tokens: Vec::new(),
-        })
+            expert_profile_path: None,
+        };
+
+        let mut engine = engine;
+        let st = engine.stats();
+        if st.moe_active_streaming && st.moe_layers > 0 {
+            engine.expert_profile_path = default_expert_profile_path(&cfg.model_path);
+            if let Some(ref prof) = engine.expert_profile_path
+                && prof.is_file()
+                && let Ok(warmed) = engine.warm_expert_profile(prof)
+                && warmed > 0
+            {
+                tracing::info!(
+                    warmed_slices = warmed,
+                    path = %prof.display(),
+                    "pre-warmed MoE hot-expert cache from saved profile"
+                );
+            }
+        }
+
+        Ok(engine)
     }
 
     pub fn stats(&self) -> LsEngineStats {
@@ -281,6 +322,24 @@ impl StreamEngine {
             // SAFETY: `io_pool_ptr` is non-null, initialized from `Box::into_raw`, and remains valid until `StreamEngine::drop`.
             unsafe { &*p }.clear_expert_cache();
         }
+    }
+
+    /// Saves the currently resident MoE hot-expert slices to `path` for zero-cold-start pre-warming.
+    pub fn save_expert_profile(&self, path: &Path) -> std::io::Result<usize> {
+        let Some(p) = self.io_pool else {
+            return Ok(0);
+        };
+        // SAFETY: `io_pool` is non-null, initialized from `Box::into_raw`, and remains valid until `StreamEngine::drop`.
+        unsafe { &*p }.save_expert_profile(path)
+    }
+
+    /// Sequentially pre-warms the MoE expert cache from a saved hot-expert profile at `path`.
+    pub fn warm_expert_profile(&self, path: &Path) -> std::io::Result<usize> {
+        let Some(p) = self.io_pool else {
+            return Ok(0);
+        };
+        // SAFETY: `io_pool` is non-null, initialized from `Box::into_raw`, and remains valid until `StreamEngine::drop`.
+        unsafe { &*p }.warm_expert_profile(path)
     }
 
     pub fn vocab_size(&self) -> i32 {
@@ -1691,12 +1750,19 @@ impl StopFilter {
 
 impl Drop for StreamEngine {
     fn drop(&mut self) {
-        // Free C++ engine FIRST so `worker_thread` is joined before freeing `LayerIoPool`.
+        // Free C++ engine FIRST so `worker_thread` is joined before touching or freeing `LayerIoPool`.
         // SAFETY: `self.raw` is a valid engine handle owned exclusively by `self` and freed once on drop before reclaiming `io_pool_ptr`.
         unsafe { ls_engine_free(self.raw.as_ptr()) };
         if let Some(p) = self.io_pool.take() {
             // SAFETY: `p` was created via `Box::into_raw` in `StreamEngine::open` and is reclaimed exactly once after C++ no longer references it.
-            drop(unsafe { Box::from_raw(p) });
+            let pool = unsafe { Box::from_raw(p) };
+            if let Some(ref prof) = self.expert_profile_path {
+                let st = pool.stats();
+                if st.cache_hits + st.cache_misses > 0 {
+                    let _ = pool.save_expert_profile(prof);
+                }
+            }
+            drop(pool);
         }
     }
 }

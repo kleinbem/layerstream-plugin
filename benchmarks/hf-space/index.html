@@ -449,7 +449,7 @@
 
     <div class="tabs" role="tablist" aria-label="Dashboard sections">
       <button class="tab-btn" role="tab" id="tab-compare" aria-controls="panel-compare" aria-selected="true">1. 4-Engine Comparison</button>
-      <button class="tab-btn" role="tab" id="tab-tuning" aria-controls="panel-tuning" aria-selected="false">2. Tuning Story (R2 → R8)</button>
+      <button class="tab-btn" role="tab" id="tab-tuning" aria-controls="panel-tuning" aria-selected="false">2. Tuning Story (R2 → R11)</button>
       <button class="tab-btn" role="tab" id="tab-estimator" aria-controls="panel-estimator" aria-selected="false">3. Hardware Estimator</button>
       <button class="tab-btn" role="tab" id="tab-raw" aria-controls="panel-raw" aria-selected="false">4. Raw Dataset (<span id="total-runs-tab">…</span> Runs)</button>
     </div>
@@ -484,6 +484,8 @@
               <option value="ttft_s">TTFT (seconds — lower is better)</option>
               <option value="joules_per_tok">Gross Energy (J/tok — lower is better)</option>
               <option value="peak_rss_mib">Peak RSS (MiB — lower is better)</option>
+              <option value="draft_acceptance_rate">Draft Acceptance Rate (0–1 — higher is better)</option>
+              <option value="tokens_per_sweep">Tokens / Storage Sweep (higher is better)</option>
             </select>
           </div>
         </div>
@@ -636,6 +638,7 @@
       if (status && status !== "ok") return "var(--danger)";
       if (engine === "layerstream-plugin") return "linear-gradient(90deg, #38bdf8, #34d399)";
       if (engine === "llama.cpp") return "var(--purple)";
+      if (engine === "colibri") return "#ec4899";
       if (engine === "airllm") return "var(--warn)";
       return "#64748b";
     }
@@ -696,7 +699,12 @@
         return r[metric];
       });
       const maxVal = Math.max(...vals.filter(v => typeof v === "number" && v > 0), 1e-6);
-      const unit = metric === "decode_tok_per_s" ? "tok/s" : metric === "ttft_s" ? "s" : metric === "joules_per_tok" ? "J/tok" : "MiB";
+      const unit = metric === "decode_tok_per_s" ? "tok/s"
+        : metric === "ttft_s" ? "s"
+        : metric === "joules_per_tok" ? "J/tok"
+        : metric === "draft_acceptance_rate" ? "%"
+        : metric === "tokens_per_sweep" ? "tok/swp"
+        : "MiB";
 
       const container = document.getElementById("cmp-chart");
       container.innerHTML = items.map((item, i) => {
@@ -704,9 +712,10 @@
         const failed = r.status && r.status !== "ok";
         const v = vals[i];
         const pct = (typeof v === "number" && v > 0) ? Math.max(2, (v / maxVal) * 100) : 0;
+        const displayVal = metric === "draft_acceptance_rate" && typeof v === "number" ? v * 100 : v;
         const valText = failed && metric !== "peak_rss_mib"
           ? `<span class="badge b-err">${r.status.toUpperCase()}</span>`
-          : (typeof v === "number" ? `${fmt(v, metric === "peak_rss_mib" ? 0 : 2)} ${unit}` : `<span class="badge b-warn">N/A</span>`);
+          : (typeof displayVal === "number" ? `${fmt(displayVal, metric === "peak_rss_mib" ? 0 : metric === "draft_acceptance_rate" ? 1 : 2)} ${unit}` : `<span class="badge b-warn">N/A</span>`);
         return `
           <div class="bar-row">
             <div class="bar-label">${item.label}<span class="bar-sub">${item.sub}</span></div>
@@ -719,17 +728,17 @@
 
       const note = document.getElementById("cmp-note");
       if (modelKey === "qwen3_30b") {
-        note.className = "callout";
-        note.innerHTML = "<strong>Honest loss on 128-expert MoE on Orin Nano:</strong> Stock <code>llama.cpp</code> CPU <code>mmap</code> (<code>1.27 tok/s</code>) beats <code>layerstream-plugin</code> (<code>0.32 tok/s</code>) here because Linux page cache absorbs small random expert slices in 6 GiB RAM, while tiny random <code>O_DIRECT</code> bursts trigger Orin's Tegra <code>nvme1</code> 30 s IRQ polling timeouts. On <code>OLMoE</code> (64 experts), TinyLFU hits 98–100% and delivers <strong>12.0–13.7 tok/s</strong>.";
+        note.className = "callout good";
+        note.innerHTML = "<strong>128-expert MoE win in v0.6.1 (R11):</strong> After parallel <code>FADV_RANDOM+DONTNEED</code> sparse reads (v0.2.1) and the all-GPU <code>mparams.devices</code> fix (v0.6.1, <code>splits=1</code>), <code>layerstream-plugin</code> reaches <strong>1.621 tok/s</strong> (<code>open_ended</code>) at <strong>4.17 GiB RSS</strong> and <strong>9.47 J/tok</strong> — beating stock <code>llama.cpp</code> CPU <code>mmap</code> (<code>1.27 tok/s</code>, <code>6.07 GiB RSS</code>, <code>15.26 J/tok</code>) by <strong>+27.6%</strong> with 1.9 GiB less RAM.";
       } else if (modelKey === "14b") {
         note.className = "callout good";
-        note.innerHTML = "<strong>Why layerstream wins on oversized dense models:</strong> Stock <code>llama.cpp</code> (the runtime behind Ollama &amp; LM Studio) OOMs or times out, HF <code>accelerate</code> spends 144 s loading then times out, and AirLLM runs <code>0.033 tok/s</code> (8-token warm shards, 36.8 GiB disk). <code>layerstream-plugin</code> streams straight from a single 8.37 GiB GGUF at <strong>3.16–5.97 tok/s</strong> with <strong>0 MiB swap</strong>.";
+        note.innerHTML = "<strong>Why layerstream wins on oversized dense models:</strong> Stock <code>llama.cpp</code> (Ollama/LM Studio runtime) OOMs or times out, HF <code>accelerate</code> spends 144 s loading then times out, and AirLLM runs <code>0.033 tok/s</code>. <code>layerstream-plugin v0.6.1</code> streams straight from a single 8.37 GiB GGUF at <strong>4.66 tok/s</strong> (<code>b5400</code>) with <strong>0 MiB swap</strong> and <strong>3.54 J/tok</strong>.";
       } else if (modelKey === "32b") {
         note.className = "callout good";
-        note.innerHTML = "<strong>2.53× larger than total system RAM:</strong> <code>Qwen2.5-32B</code> (18.49 GiB) runs cleanly on a 7.3 GiB Orin Nano with <strong>0 MiB swap</strong> at <strong>0.84–0.94 tok/s</strong> (<code>code_edit</code>), whereas stock <code>llama.cpp -ngl 10</code> thrashed <strong>+17.24 GiB</strong> of swap and produced 0 tokens in 300 s.";
+        note.innerHTML = "<strong>2.53× larger than total system RAM:</strong> <code>Qwen2.5-32B</code> (18.49 GiB) runs cleanly on a 7.3 GiB Orin Nano with <strong>0 MiB swap</strong> at <strong>1.67 tok/s</strong> (<code>code_edit</code>, <strong>1.98× faster</strong> than v0.1.0), whereas stock <code>llama.cpp -ngl 10</code> thrashed <strong>+17.24 GiB</strong> of swap and produced 0 tokens in 300 s.";
       } else {
         note.className = "callout good";
-        note.innerHTML = "<strong>15.8×–17.9× MoE speedup at R=0:</strong> Combining active-expert router inspection with our scan-resistant TinyLFU hot-expert RAM cache lifts <code>OLMoE-1B-7B</code> from <code>0.76 tok/s</code> (full-layer) to <strong>12.05–13.67 tok/s</strong> and cuts energy <strong>10×</strong> (`14.34 → 1.40 J/tok`, net `0.45 J/tok`).";
+        note.innerHTML = "<strong>19.8× MoE speedup at R=0 (v0.6.1):</strong> Combining active-expert router inspection, TinyLFU hot-expert caching, and all-GPU <code>splits=1</code> lifts <code>OLMoE-1B-7B</code> from <code>0.76 tok/s</code> (full-layer) to <strong>15.09 tok/s</strong> and cuts energy <strong>14×</strong> (<code>14.34 → 1.02 J/tok</code>).";
       }
     }
 
@@ -738,9 +747,9 @@
         { label: "R2: Initial O_DIRECT + K=4 (R=14)", sub: "Load 53.4 s · 6.26 GiB RSS", val: 1.957, color: "#64748b" },
         { label: "R3: Chunked Load + Q8_0 KV + Adaptive K", sub: "Load 6.89 s (-7.7×)", val: 2.574, color: "#60a5fa" },
         { label: "R4: Single pin_buf + io_threads=1", sub: "5.71 GiB RSS · 1,834 MiB/s", val: 3.427, color: "#38bdf8" },
-        { label: "R5: Zero-Copy cudaHostAlloc + cudaMemcpyAsync", sub: "R=19 · -4.5 s memcpy · 2,660 MiB/s", val: 5.684, color: "#2dd4bf" },
-        { label: "R6: Final Tuned High-Residency (R=20)", sub: "6.15 GiB RSS · 2.73 J/tok gross", val: 5.974, color: "#34d399" },
         { label: "R8 v0.1.0: Safe Auto-Clamped (b5400 → R=7)", sub: "4.18 GiB RSS · 0 MiB swap · 2,961 MiB/s", val: 3.405, color: "#a78bfa" },
+        { label: "R11 v0.6.1: CUDA 13.4 + GCC 16.2 + All-GPU (R=7)", sub: "4.67 GiB RSS · 3.54 J/tok · +36.8% vs R8", val: 4.657, color: "#34d399" },
+        { label: "R6: Max High-Residency Ceiling (R=20)", sub: "6.15 GiB RSS · 2.73 J/tok gross", val: 5.974, color: "#2dd4bf" },
       ];
       const max14 = Math.max(...steps14b.map(s => s.val));
       document.getElementById("tuning-14b-chart").innerHTML = steps14b.map(s => `
@@ -751,12 +760,12 @@
         </div>`).join("");
 
       const ablations = [
-        { label: "OLMoE R=0 Sparse + TinyLFU (prompt_heavy)", sub: "100% cache hit · 17.9× vs full-layer", val: 13.667, color: "#34d399" },
-        { label: "OLMoE R=0 Full-Layer Stream", sub: "Reads all 64 experts every token", val: 0.763, color: "#64748b" },
+        { label: "OLMoE R11 v0.6.1 All-GPU (splits=1, open_ended)", sub: "1.02 J/tok · 3.39 GiB RSS · 19.8× vs full-layer", val: 15.092, color: "#34d399" },
+        { label: "OLMoE R9 v0.2.1 Sparse + TinyLFU (open_ended)", sub: "98.1% cache hit · 1.44 J/tok", val: 12.535, color: "#2dd4bf" },
+        { label: "OLMoE R10 CPU-split bug caught! (splits=127)", sub: "mparams.devices included CPU · +1.06 GiB wasted CUDA_Host", val: 6.742, color: "#f87171" },
+        { label: "OLMoE R8 Full-Layer Stream (no sparse MoE)", sub: "Reads all 64 experts every token", val: 0.763, color: "#64748b" },
         { label: "14B R=16 · io_threads=1 (optimal LUKS2)", sub: "Sequential BIOs across 6 kcryptd workers", val: 3.427, color: "#38bdf8" },
-        { label: "14B R=16 · io_threads=4 (regressed!)", sub: "-38% code_edit / -57% open_ended on dm-crypt", val: 2.127, color: "#f87171" },
-        { label: "14B + 0.5B Draft (R=19, 469 MiB draft)", sub: "Pareto winner: +7 resident target layers", val: 5.684, color: "#2dd4bf" },
-        { label: "14B + 1.5B Draft (R=12, 1.04 GiB draft)", sub: "2.8× slower due to lost target residency", val: 2.005, color: "#fbbf24" },
+        { label: "14B R=16 · io_threads=4 (regressed!)", sub: "-38% code_edit / -57% open_ended on dm-crypt", val: 2.127, color: "#fbbf24" },
       ];
       const maxAb = Math.max(...ablations.map(s => s.val));
       document.getElementById("tuning-ablation-chart").innerHTML = ablations.map(s => `

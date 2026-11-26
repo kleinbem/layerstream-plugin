@@ -62,6 +62,14 @@ enum Command {
         #[arg(long, env = "LAYERSTREAM_CACHE_DIR")]
         cache_dir: Option<std::path::PathBuf>,
     },
+    /// Inspect a local or Hugging Face GGUF header (~256 KiB HTTP Range) for architecture, MoE, hybrid-SSM, and built-in MTP heads without downloading weights.
+    Inspect {
+        /// Local `.gguf` path or Hugging Face URI (`hf://org/repo:file.gguf`).
+        spec: String,
+        /// Emit machine-readable JSON output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Query a Hugging Face GGUF repo and recommend the best quant for your probed GPU & NVMe budget.
     Recommend {
         /// Hugging Face repository (`org/repo`, `hf://org/repo@rev`, or URL).
@@ -119,6 +127,21 @@ fn main() -> Result<()> {
         let root = cache_dir.unwrap_or_else(hf::default_cache_dir);
         let local = hf::ensure_hf_downloaded(&spec, &root)?;
         println!("{}", local.display());
+        return Ok(());
+    }
+
+    if let Some(Command::Inspect { spec, json }) = cli.command {
+        let meta = if spec.starts_with("hf://") {
+            let parsed = hf::HfSpec::parse(&spec)?;
+            hf::inspect_remote_gguf(&parsed)?
+        } else {
+            hf::inspect_local_gguf(std::path::Path::new(&spec))?
+        };
+        if json {
+            println!("{}", serde_json::to_string_pretty(&meta)?);
+        } else {
+            println!("{}", meta.summary_line());
+        }
         return Ok(());
     }
 
@@ -197,6 +220,12 @@ fn main() -> Result<()> {
             );
         }
         if let Some(best) = recs.iter().find(|r| r.recommended) {
+            if let Ok(parsed) = hf::HfSpec::parse(&best.hf_uri)
+                && let Ok(meta) = hf::inspect_remote_gguf(&parsed)
+            {
+                println!("\nHeader peek ({}):", best.candidate.primary_file);
+                println!("  {}", meta.summary_line());
+            }
             println!("\nRecommended pull command:");
             println!("  layerstream-plugin pull {}", best.hf_uri);
         }
@@ -281,7 +310,12 @@ fn main() -> Result<()> {
             }
             Some(Command::Plugin { engine }) => run_plugin_mode(engine).await,
             None => run_plugin_mode(cli.plugin_args).await,
-            Some(Command::Pull { .. } | Command::Check { .. } | Command::Recommend { .. }) => {
+            Some(
+                Command::Pull { .. }
+                | Command::Inspect { .. }
+                | Command::Check { .. }
+                | Command::Recommend { .. },
+            ) => {
                 unreachable!()
             }
         }
