@@ -214,6 +214,9 @@ pub fn run_storage_sweep(probe_file: &Path, profile: &HardwareProfile) -> Result
     let mut candidates = Vec::new();
     for prefer_direct in [true, false] {
         for &threads in &thread_counts {
+            // Drop page-cache pages for the probe file before each candidate so buffered reads
+            // measure cold storage throughput rather than warm RAM cache hits.
+            evict_page_cache(probe_file);
             let t0 = Instant::now();
             let (mib_s, direct_ok) = if threads == 1 {
                 probe_storage_mib_per_s(probe_file, prefer_direct)?
@@ -246,22 +249,61 @@ pub fn run_storage_sweep(probe_file: &Path, profile: &HardwareProfile) -> Result
     })
 }
 
+fn evict_page_cache(path: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(f) = File::open(path) {
+            // SAFETY: `f.as_raw_fd()` is a valid open file descriptor; `offset=0, len=0` advises
+            // the kernel to drop cached pages for the whole file and has no memory-safety impact.
+            unsafe {
+                let _ = libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+    }
+}
+
 /// Runs a sweep using a temporary probe file inside `dir` (cleaned up automatically).
 pub fn run_dir_storage_sweep(dir: &Path, profile: &HardwareProfile) -> Result<TunedProfile> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TUNE_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+
     fs::create_dir_all(dir).with_context(|| format!("create probe directory {}", dir.display()))?;
-    let probe_path = dir.join(format!(
-        ".layerstream-tune-probe-{}.tmp",
-        std::process::id()
-    ));
+    let pid = std::process::id();
+    let mut created: Option<(PathBuf, File)> = None;
+    for _ in 0..32 {
+        let seq = TUNE_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(".layerstream-tune-probe-{pid}-{seq}.tmp"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                created = Some((candidate, f));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("create tune probe file {}", candidate.display()));
+            }
+        }
+    }
+    let (probe_path, mut f) =
+        created.ok_or_else(|| anyhow::anyhow!("failed to allocate unique tune probe file"))?;
     {
-        let mut f = File::create(&probe_path)
-            .with_context(|| format!("create tune probe file {}", probe_path.display()))?;
         let chunk = vec![0xA5u8; 1024 * 1024];
         for _ in 0..DEFAULT_PROBE_MIB {
             f.write_all(&chunk)?;
         }
         f.sync_all()?;
     }
+    drop(f);
     let res = run_storage_sweep(&probe_path, profile);
     let _ = fs::remove_file(&probe_path);
     res
@@ -289,7 +331,8 @@ fn probe_parallel_mib_per_s(
     });
     let per_thread = results?;
     let wall_s = t0.elapsed().as_secs_f64().max(1e-6);
-    let file_mib = (fs::metadata(path)?.len().min(64 * 1024 * 1024) as f64) / (1024.0 * 1024.0);
+    // Each worker calls `probe_storage_mib_per_s`, which reads at most 16 MiB.
+    let file_mib = (fs::metadata(path)?.len().min(16 * 1024 * 1024) as f64) / (1024.0 * 1024.0);
     let aggregate_mib_s = (file_mib * threads as f64) / wall_s;
     let all_direct = per_thread.iter().all(|&(_, d)| d);
     Ok((aggregate_mib_s, all_direct))
