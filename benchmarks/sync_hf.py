@@ -61,7 +61,7 @@ def main() -> None:
     args = ap.parse_args()
 
     export_script = repo_root / "benchmarks/export_hf_dataset.py"
-    subprocess.run(
+    subprocess.run(  # noqa: S603 — explicit argv list invoking repo-local export script
         [
             sys.executable,
             str(export_script),

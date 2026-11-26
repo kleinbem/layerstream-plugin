@@ -49,7 +49,7 @@ def run_case(
     cmd = [str(bench_bin), *extra_args]
     print(f"==> Running {name} ...", flush=True)
     with json_path.open("w", encoding="utf-8") as jf, log_path.open("w", encoding="utf-8") as lf:
-        subprocess.run(
+        subprocess.run(  # noqa: S603 — explicit argv list invoking compiled bench binary
             cmd,
             stdout=jf,
             stderr=lf,
@@ -191,7 +191,7 @@ def main() -> int:
 
     if args.baseline is not None and ran > 0:
         checker = Path(__file__).resolve().parent / "check_regressions.py"
-        res = subprocess.run(
+        res = subprocess.run(  # noqa: S603 — explicit argv list invoking repo-local checker
             [
                 sys.executable,
                 str(checker),

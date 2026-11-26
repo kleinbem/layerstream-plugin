@@ -92,7 +92,7 @@ def check_pair(
         spd = cand.get("ttft_speedup_x")
         row = (
             f"| `{model}` | `{mode}` | `multi_turn` | "
-            f"{b_t2 if b_t2 is not None else '—'} s | {c_t2} s | {spd}× TTFT | — | — |"
+            f"{b_t2 if b_t2 is not None else '—'} s | {c_t2} s | {spd}x TTFT | — | — |"
         )
         return row, warns, fails
 
