@@ -1059,3 +1059,66 @@ fn rejects_excessive_nesting_depth_and_rule_explosion() {
         "unexpected error: {err}"
     );
 }
+
+#[test]
+fn fuzz_random_schema_asts_never_panic() {
+    fn next(rng: &mut u64) -> u64 {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+        *rng
+    }
+    fn gen_schema(rng: &mut u64, depth: usize) -> Value {
+        if depth == 0 {
+            return match next(rng) % 6 {
+                0 => {
+                    let min_l = next(rng) % 4;
+                    let max_l = (next(rng) % 8) + 4;
+                    json!({"type": "string", "minLength": min_l, "maxLength": max_l})
+                }
+                1 => json!({"type": "integer"}),
+                2 => json!({"type": "number"}),
+                3 => json!({"type": "boolean"}),
+                4 => json!({"type": "null"}),
+                _ => json!({"enum": ["a", "b", 1, true, null]}),
+            };
+        }
+        match next(rng) % 5 {
+            0 => {
+                let items = gen_schema(rng, depth - 1);
+                let min_i = next(rng) % 2;
+                let max_i = (next(rng) % 3) + 2;
+                json!({
+                    "type": "array",
+                    "items": items,
+                    "minItems": min_i,
+                    "maxItems": max_i
+                })
+            }
+            1 => {
+                let mut props = serde_json::Map::new();
+                let n = (next(rng) % 3) + 1;
+                for i in 0..n {
+                    props.insert(format!("k{i}"), gen_schema(rng, depth - 1));
+                }
+                json!({"type": "object", "properties": props, "required": ["k0"]})
+            }
+            2 => {
+                let a = gen_schema(rng, depth - 1);
+                let b = gen_schema(rng, depth - 1);
+                json!({"anyOf": [a, b]})
+            }
+            3 => json!({"oneOf": [gen_schema(rng, depth - 1), {"type": "null"}]}),
+            _ => json!({"allOf": [gen_schema(rng, depth - 1), {"type": "object"}]}),
+        }
+    }
+
+    let mut seed = 0xA24B_AED4_963E_E407u64;
+    for case in 0..64 {
+        let depth = (case % 5) + 1;
+        let schema = gen_schema(&mut seed, depth);
+        if let Ok(gbnf) = json_schema_to_gbnf(&schema) {
+            assert_all_gbnf_rules_defined(&gbnf);
+        }
+    }
+}

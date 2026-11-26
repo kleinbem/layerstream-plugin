@@ -649,3 +649,31 @@ fn load_slices_into_rejects_oob_and_overflow_before_cache_lookup() {
     std::fs::create_dir_all(&as_dir).unwrap();
     assert!(gguf_direct_io::expert_profile::write_expert_profile(&as_dir, &[]).is_err());
 }
+
+#[test]
+fn fuzz_read_expert_profile_never_panics_or_ooms() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fuzz.lsep");
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next_u64 = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    for case in 0..256u32 {
+        let len = (next_u64() as usize) % 256;
+        let mut raw = Vec::with_capacity(len + 12);
+        if case % 2 == 0 {
+            // Half the cases start with valid magic + version to exercise count/payload parsing.
+            raw.extend_from_slice(b"LSEP");
+            raw.extend_from_slice(&1u32.to_le_bytes());
+        }
+        for _ in 0..len {
+            raw.push((next_u64() & 0xff) as u8);
+        }
+        std::fs::write(&path, &raw).unwrap();
+        let _ = gguf_direct_io::expert_profile::read_expert_profile(&path);
+    }
+}

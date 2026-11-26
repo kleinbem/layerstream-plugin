@@ -25,9 +25,9 @@ dbg_macro = "warn"
 todo = "warn"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
-strip = "debuginfo"
+strip = "symbols"
 
 [workspace.dependencies]
 anyhow = "1"

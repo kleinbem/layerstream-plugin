@@ -158,3 +158,45 @@ fn download_truncation_progress_callback_and_sha256_mismatch_paths() {
     }
     let _ = h3.join();
 }
+
+#[test]
+fn fuzz_gguf_header_and_hf_spec_parsers_never_panic() {
+    let mut seed = 0xD1B5_4A32_D192_ED03u64;
+    let mut next_u64 = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    // 1. Fuzz remote GGUF header parser across 256 random/mutated inputs.
+    for case in 0..256u32 {
+        let len = (next_u64() as usize) % 512;
+        let mut raw = Vec::with_capacity(len + 8);
+        if case % 2 == 0 {
+            raw.extend_from_slice(b"GGUF");
+            raw.extend_from_slice(&3u32.to_le_bytes());
+        }
+        for _ in 0..len {
+            raw.push((next_u64() & 0xff) as u8);
+        }
+        let _ = hf_gguf::parse_gguf_header_metadata(&raw);
+    }
+
+    // 2. Fuzz HfSpec::parse and ensure path-traversal attempts are always rejected.
+    let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789/:.@_-\\";
+    for _ in 0..256 {
+        let len = (next_u64() as usize) % 96;
+        let mut s = String::from("hf://");
+        for _ in 0..len {
+            let idx = (next_u64() as usize) % alphabet.len();
+            s.push(alphabet[idx] as char);
+        }
+        if let Ok(spec) = hf_gguf::HfSpec::parse(&s) {
+            assert!(!spec.repo_id.contains(".."));
+            assert!(!spec.filename.contains(".."));
+            assert!(!spec.filename.starts_with('/'));
+            assert!(!spec.filename.contains('\\'));
+        }
+    }
+}
