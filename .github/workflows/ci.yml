@@ -242,8 +242,8 @@ jobs:
           import re, sys
           gates = {
               "gguf-direct-io": 91.5,
-              "hf-gguf": 87.9,
-              "json-schema-gbnf": 92.8,
+              "hf-gguf": 88.3,
+              "json-schema-gbnf": 92.9,
           }
           totals = {k: [0, 0] for k in gates}
           pat = re.compile(r"^([a-z0-9_-]+)/src/\S+\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+\d+\s+[\d.]+%\s+(\d+)\s+(\d+)\s+")
@@ -368,15 +368,15 @@ jobs:
           {
             echo "### Rust Bundle B Coverage (core, server, ffi, plugin)"
             echo '```'
-            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 85.7 -- --test-threads 1 | tee /tmp/cov_b.txt /dev/stderr
+            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 86.7 -- --test-threads 1 | tee /tmp/cov_b.txt /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY'
           import re, sys
           gates = {
-              "layerstream-core": 84.3,
+              "layerstream-core": 86.1,
               "layerstream-ffi": 90.4,
-              "layerstream-plugin": 85.7,
+              "layerstream-plugin": 86.8,
               "layerstream-server": 87.9,
           }
           totals = {k: [0, 0] for k in gates}

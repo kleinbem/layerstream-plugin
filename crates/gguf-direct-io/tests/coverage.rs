@@ -478,4 +478,79 @@ fn warm_expert_profile_skips_oob_and_oversized_entries() {
     ];
     gguf_direct_io::expert_profile::write_expert_profile(&profile_path, &entries).unwrap();
     assert_eq!(pool.warm_expert_profile(&profile_path).unwrap(), 1);
+
+    // Zero-budget cache skips warming immediately.
+    let idx0 = GgufIndex::open(&model_path).unwrap();
+    let pool0 = LayerIoPool::new_with_options(idx0, false, None, Some(0)).unwrap();
+    assert_eq!(pool0.warm_expert_profile(&profile_path).unwrap(), 0);
+
+    // `probe_dir_storage_mib_per_s` reuses an existing >=16 MiB file in a nested subdirectory.
+    let nested_dir = dir.path().join("sub");
+    std::fs::create_dir_all(&nested_dir).unwrap();
+    let big_file = nested_dir.join("existing.bin");
+    std::fs::write(&big_file, vec![0x33u8; 16 * 1024 * 1024]).unwrap();
+    assert!(gguf_direct_io::probe_dir_storage_mib_per_s(dir.path()).is_some());
+}
+
+#[test]
+fn load_slices_into_rejects_oob_and_overflow_before_cache_lookup() {
+    use gguf_direct_io::{ModelMeta, TensorLocation};
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let shard = dir.path().join("oob.gguf");
+    std::fs::write(&shard, vec![0xAAu8; 4096]).unwrap();
+
+    let mut tensors = HashMap::new();
+    tensors.insert(
+        "small".to_string(),
+        TensorLocation {
+            name: "small".to_string(),
+            shard_idx: 0,
+            abs_offset: 64,
+            ggml_type: 0, // F32: 16 elems = 64 bytes
+            dims: vec![16],
+        },
+    );
+    tensors.insert(
+        "near_end".to_string(),
+        TensorLocation {
+            name: "near_end".to_string(),
+            shard_idx: 0,
+            abs_offset: 4032,
+            ggml_type: 999, // unknown type -> encoded_byte_len() == None, falls back to shard check
+            dims: vec![16],
+        },
+    );
+
+    let idx = GgufIndex {
+        shards: vec![shard],
+        shard_sizes: vec![4096],
+        meta: ModelMeta {
+            architecture: "llama".to_string(),
+            name: None,
+            n_layers: 1,
+            context_length: None,
+            total_file_bytes: 4096,
+        },
+        tensors,
+    };
+    let pool = LayerIoPool::new_with_options(idx, false, None, Some(65536)).unwrap();
+    let mut dst = vec![0u8; 256];
+
+    // 1. Relative offset overflow.
+    assert!(matches!(
+        pool.load_slices_into(&[("small", u64::MAX, 0, 16, 0)], &mut dst),
+        Err(GgufIoError::OutOfBounds(_))
+    ));
+    // 2. Exceeds tensor encoded byte length (64 bytes).
+    assert!(matches!(
+        pool.load_slices_into(&[("small", 32, 0, 64, 0)], &mut dst),
+        Err(GgufIoError::OutOfBounds(_))
+    ));
+    // 3. Exceeds shard size (4032 + 128 > 4096).
+    assert!(matches!(
+        pool.load_slices_into(&[("near_end", 0, 0, 128, 0)], &mut dst),
+        Err(GgufIoError::OutOfBounds(_))
+    ));
 }

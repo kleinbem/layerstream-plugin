@@ -232,5 +232,18 @@ mod tests {
         tr.push(0xFF);
         fs::write(&trailing, tr).expect("write trailing");
         assert!(read_expert_profile(&trailing).is_err());
+
+        // Short header and truncated payload fail closed cleanly.
+        let short_hdr = dir.path().join("short.lsep");
+        fs::write(&short_hdr, b"LS").expect("write short");
+        assert!(read_expert_profile(&short_hdr).is_err());
+
+        let trunc_body = dir.path().join("trunc.lsep");
+        let mut tb = b"LSEP".to_vec();
+        tb.extend_from_slice(&1u32.to_le_bytes());
+        tb.extend_from_slice(&2u32.to_le_bytes());
+        tb.extend_from_slice(&[0u8; 4]);
+        fs::write(&trunc_body, tb).expect("write trunc");
+        assert!(read_expert_profile(&trunc_body).is_err());
     }
 }
