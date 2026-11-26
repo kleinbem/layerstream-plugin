@@ -656,7 +656,8 @@ impl StreamEngine {
         if !path_ref.is_file() {
             bail!("KV state file not found: '{}'", path_ref.display());
         }
-        if !self.stats().can_speculate {
+        let st = self.stats();
+        if !st.can_speculate || st.rs_rollback_max > 0 {
             bail!(
                 "KV state restore requires a KV-trimmable transformer architecture \
                  (unsupported for hybrid recurrent/SSM models)"
@@ -1051,7 +1052,8 @@ impl StreamEngine {
 
         // Reuse longest matching KV prefix on multi-turn chat continuations
         // (avoids re-prefilling unchanged system prompts & prior turns off NVMe!).
-        let can_reuse_kv = self.stats().can_speculate;
+        let st = self.stats();
+        let can_reuse_kv = st.can_speculate && st.rs_rollback_max == 0;
         let mut common_prefix = 0usize;
         if can_reuse_kv && !self.cached_kv_tokens.is_empty() {
             let max_shared = self
@@ -1134,15 +1136,24 @@ impl StreamEngine {
         } else {
             opts.max_tokens
         };
-        let can_speculate = self.stats().can_speculate
-            && (opts.enable_ngram_speculation || draft_proposer.is_some());
+        let rs_rollback_cap = if st.rs_rollback_max > 0 {
+            st.rs_rollback_max as usize
+        } else {
+            usize::MAX
+        };
+        let can_speculate =
+            st.can_speculate && (opts.enable_ngram_speculation || draft_proposer.is_some());
 
         let min_adaptive_k = if draft_proposer.is_some() {
             opts.max_draft_tokens.clamp(6, 10)
         } else {
             3
-        };
-        let mut adaptive_draft_k = opts.max_draft_tokens.max(min_adaptive_k);
+        }
+        .min(rs_rollback_cap);
+        let mut adaptive_draft_k = opts
+            .max_draft_tokens
+            .max(min_adaptive_k)
+            .min(rs_rollback_cap);
         let max_adaptive_k = if draft_proposer.is_some() {
             (opts.max_draft_tokens * 3).clamp(12, 20)
         } else {
@@ -1203,7 +1214,7 @@ impl StreamEngine {
             } else {
                 remaining_by_max
             };
-            let max_step_draft = remaining_by_max.min(remaining_by_ctx);
+            let max_step_draft = remaining_by_max.min(remaining_by_ctx).min(rs_rollback_cap);
             if n_ctx > 0 && (pos as usize) >= n_ctx {
                 finish_reason = "length".to_string();
                 break 'gen_loop;
