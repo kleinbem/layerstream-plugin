@@ -301,6 +301,7 @@ pub fn list_hf_gguf_candidates(repo_id: &str, revision: &str) -> Result<Vec<HfGg
 
     let agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(Duration::from_secs(30)))
         .timeout_recv_body(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
         .build()

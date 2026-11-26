@@ -948,7 +948,7 @@ fn download_with_resume(
         .max_redirects(0)
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(read_timeout_secs)))
-        .timeout_recv_body(Some(Duration::from_secs(read_timeout_secs)))
+        .timeout_per_read(Some(Duration::from_secs(read_timeout_secs)))
         .build()
         .new_agent();
 

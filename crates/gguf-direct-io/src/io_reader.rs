@@ -339,8 +339,8 @@ impl ScopedWorkerPool {
             done_cv: Condvar::new(),
         });
         let mut handles = Vec::with_capacity(bg_count);
-        for bg_idx in 0..bg_count {
-            let worker_id = bg_idx + 1;
+        for _ in 0..bg_count {
+            let worker_id = handles.len() + 1;
             let sh = Arc::clone(&shared);
             let h = std::thread::Builder::new()
                 .name(format!("ls-io-{worker_id}"))
@@ -642,15 +642,30 @@ impl LayerIoPool {
         let entries = crate::expert_profile::read_expert_profile(path)?;
         let mut loaded = 0usize;
         let mut scratch = Vec::new();
+        let budget_bytes = self.expert_cache.lock().ensure_budget();
+        if budget_bytes == 0 {
+            return Ok(0);
+        }
+        let max_entry_bytes = budget_bytes / 2;
         for entry in entries {
             let shard_idx = entry.shard_idx as usize;
             let Ok(len) = usize::try_from(entry.len) else {
                 continue;
             };
-            if len == 0 || shard_idx >= self.shards.len() {
+            if len == 0 || shard_idx >= self.shards.len() || len > max_entry_bytes {
+                continue;
+            }
+            let shard_len = self.index.shard_sizes[shard_idx];
+            let Some(end) = entry.file_offset.checked_add(entry.len) else {
+                continue;
+            };
+            if end > shard_len {
                 continue;
             }
             if scratch.len() < len {
+                if scratch.try_reserve(len - scratch.len()).is_err() {
+                    continue;
+                }
                 scratch.resize(len, 0);
             }
             let file = &self.shards[shard_idx].buffered;
@@ -794,9 +809,6 @@ impl LayerIoPool {
         dst: &mut [u8],
     ) -> Result<()> {
         let spans: Arc<[CoalescedSpan]> = Arc::from(self.index.plan_coalesced_spans(requests)?);
-        if layer_idx >= 0 {
-            self.span_cache.lock().insert(layer_idx, Arc::clone(&spans));
-        }
 
         if layer_idx < 0 {
             // One-shot startup load (e.g. resident layers): use an ephemeral scratch buffer
@@ -816,6 +828,7 @@ impl LayerIoPool {
         for span in spans.iter() {
             self.read_span_into(span, scratch, dst)?;
         }
+        self.span_cache.lock().insert(layer_idx, spans);
         Ok(())
     }
 

@@ -123,6 +123,14 @@ impl<'a> Cursor<'a> {
     }
 
     fn skip_scalar(&mut self, vtype: u32) -> Option<()> {
+        self.skip_scalar_depth(vtype, 0)
+    }
+
+    fn skip_scalar_depth(&mut self, vtype: u32, depth: usize) -> Option<()> {
+        const MAX_ARRAY_NESTING_DEPTH: usize = 16;
+        if depth > MAX_ARRAY_NESTING_DEPTH {
+            return None;
+        }
         match vtype {
             0 | 1 | 7 => {
                 self.take(1)?;
@@ -144,7 +152,7 @@ impl<'a> Cursor<'a> {
                 let elem_type = self.read_u32()?;
                 let count = usize::try_from(self.read_u64()?).ok()?;
                 for _ in 0..count {
-                    self.skip_scalar(elem_type)?;
+                    self.skip_scalar_depth(elem_type, depth + 1)?;
                 }
             }
             _ => return None,
@@ -621,5 +629,28 @@ mod tests {
             server.join().expect("join");
             assert_eq!(matches!(err, HfError::NotFound(_)), expect_not_found);
         }
+    }
+
+    #[test]
+    fn rejects_deeply_nested_gguf_arrays() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        push_kv_str(&mut buf, "general.architecture", "llama");
+        push_str(&mut buf, "evil.nested");
+        // Nest 20 ARRAY (9) headers, exceeding MAX_ARRAY_NESTING_DEPTH (16).
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        for _ in 0..20 {
+            buf.extend_from_slice(&9u32.to_le_bytes()); // elem_type = ARRAY
+            buf.extend_from_slice(&1u64.to_le_bytes()); // len = 1
+        }
+        buf.extend_from_slice(&4u32.to_le_bytes()); // leaf U32
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        // Stops cleanly without recursing past MAX_ARRAY_NESTING_DEPTH.
+        let meta = parse_gguf_header_metadata(&buf).expect("gracefully stops on deep nesting");
+        assert_eq!(meta.architecture, "llama");
     }
 }

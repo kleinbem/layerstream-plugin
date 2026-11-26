@@ -180,6 +180,13 @@ impl GgufIndex {
                 kv_all = parsed.kv;
             }
             for t in parsed.tensors {
+                if tensors.contains_key(&t.name) {
+                    return Err(GgufIoError::InvalidFormat(format!(
+                        "duplicate tensor '{}' in shard {}",
+                        t.name,
+                        shard_path.display()
+                    )));
+                }
                 tensors.insert(t.name.clone(), t);
             }
         }
@@ -1342,6 +1349,19 @@ mod tests {
         assert!(matches!(
             parse_single_header(&mut cur_t, 0, len_t, true),
             Err(GgufIoError::InvalidFormat(_))
+        ));
+
+        // Duplicate tensor names across shards fail closed instead of silently overwriting.
+        let dup_dir = tempfile::tempdir().unwrap();
+        let dup1 = dup_dir.path().join("dup-00001-of-00002.gguf");
+        let dup2 = dup_dir.path().join("dup-00002-of-00002.gguf");
+        let bytes =
+            build_minimal_gguf("llama", 1, None, &[("blk.0.attn_q.weight", &[8], 0, 0)], 64);
+        std::fs::write(&dup1, &bytes).unwrap();
+        std::fs::write(&dup2, &bytes).unwrap();
+        assert!(matches!(
+            GgufIndex::open(&dup1),
+            Err(GgufIoError::InvalidFormat(msg)) if msg.contains("duplicate tensor '")
         ));
     }
 }
