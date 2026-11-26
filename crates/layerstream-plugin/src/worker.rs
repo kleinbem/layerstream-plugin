@@ -69,6 +69,10 @@ struct WorkerSpec {
     cpu_head: bool,
     stream_head: bool,
     moe_active_streaming: bool,
+    #[serde(default)]
+    io_threads: Option<usize>,
+    #[serde(default)]
+    expert_cache_bytes: Option<usize>,
     enable_ngram_speculation: bool,
     max_draft_tokens: usize,
     max_queued_requests: usize,
@@ -141,6 +145,8 @@ pub async fn run_worker_process() -> Result<()> {
         cpu_head: spec.cpu_head,
         stream_head: spec.stream_head,
         moe_active_streaming: spec.moe_active_streaming,
+        io_threads: spec.io_threads,
+        expert_cache_bytes: spec.expert_cache_bytes,
         // Parent supervisor owns idle eviction and terminates the entire worker process.
         idle_timeout: Duration::from_secs(86_400),
         enable_ngram_speculation: spec.enable_ngram_speculation,
@@ -499,6 +505,8 @@ impl WorkerCoordinator {
             cpu_head: self.config.cpu_head,
             stream_head: self.config.stream_head,
             moe_active_streaming: self.config.moe_active_streaming,
+            io_threads: self.config.io_threads,
+            expert_cache_bytes: self.config.expert_cache_bytes,
             enable_ngram_speculation: self.config.enable_ngram_speculation,
             max_draft_tokens: self.config.max_draft_tokens,
             max_queued_requests: self.config.max_queued_requests,
@@ -1117,6 +1125,8 @@ mod tests {
             cpu_head: false,
             stream_head: false,
             moe_active_streaming: true,
+            io_threads: None,
+            expert_cache_bytes: None,
             idle_timeout,
             enable_ngram_speculation: true,
             max_draft_tokens: 4,

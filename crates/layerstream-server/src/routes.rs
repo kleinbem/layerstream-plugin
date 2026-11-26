@@ -60,6 +60,8 @@ pub struct ServerConfig {
     pub cpu_head: bool,
     pub stream_head: bool,
     pub moe_active_streaming: bool,
+    pub io_threads: Option<usize>,
+    pub expert_cache_bytes: Option<usize>,
     pub idle_timeout: Duration,
     pub enable_ngram_speculation: bool,
     pub max_draft_tokens: usize,
@@ -228,6 +230,8 @@ impl AppState {
         cfg.cpu_head = self.config.cpu_head;
         cfg.stream_head = self.config.stream_head;
         cfg.moe_active_streaming = self.config.moe_active_streaming;
+        cfg.io_threads = self.config.io_threads;
+        cfg.expert_cache_bytes = self.config.expert_cache_bytes;
 
         let target = StreamEngine::open(&cfg)?;
         let draft = match &entry.draft_path {
