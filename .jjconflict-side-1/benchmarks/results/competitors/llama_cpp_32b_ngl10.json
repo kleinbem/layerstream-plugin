@@ -1,0 +1,32 @@
+[
+  {
+    "engine": "llama.cpp",
+    "mode": "llama_cpp_32b_ngl10",
+    "status": "timeout",
+    "model": "Qwen2.5-32B-Instruct-Q4_K_M.gguf",
+    "ngl": 10,
+    "kv_cache_type": "q8_0",
+    "extra_args": [
+      "-no-cnv"
+    ],
+    "workload": "open_ended",
+    "load_time_s": null,
+    "ttft_s": null,
+    "decode_time_s": 302.828,
+    "total_time_s": 302.828,
+    "prompt_tokens": null,
+    "completion_tokens": 0,
+    "decode_tok_per_s": 0.0,
+    "total_tok_per_s": 0.0,
+    "peak_rss_mib": 5714.7,
+    "mem_avail_before_mib": 5176.0,
+    "mem_avail_min_mib": 37.9,
+    "page_cache_delta_mib": -305.4,
+    "swap_delta_mib": 17242.8,
+    "idle_watts": 7.89,
+    "avg_watts": 10.29,
+    "joules_per_tok": null,
+    "output_preview": "When streaming transformer layers",
+    "stderr_tail": " = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900\n1.44.462.371 I sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> greedy \n1.44.462.372 I generate: n_ctx = 2048, n_batch = 2048, n_predict = 32, n_keep = 0\n1.44.462.373 I"
+  }
+]

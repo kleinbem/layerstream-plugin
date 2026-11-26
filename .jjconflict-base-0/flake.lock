@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "llama-cpp-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1795642795,
+        "narHash": "sha256-UpLs2cwbncRBoPR9q/dZRXJxu5F40171QXJtVJb8GdM=",
+        "owner": "ggml-org",
+        "repo": "llama.cpp",
+        "rev": "9c003a97ab34a69cc49243f9b02014038205ffae",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ggml-org",
+        "repo": "llama.cpp",
+        "rev": "9c003a97ab34a69cc49243f9b02014038205ffae",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1793540411,
+        "narHash": "sha256-fiPJ88izTVucjeo2EQ3jk4aWmLg03I1D4vxnX2QjEgE=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "0bb2eedc20e4739f29e8045034f2828ad7054f8f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "0bb2eedc20e4739f29e8045034f2828ad7054f8f",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "llama-cpp-src": "llama-cpp-src",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

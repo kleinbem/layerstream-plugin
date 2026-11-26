@@ -1,0 +1,86 @@
+>>>> bitsandbytes installed
+using generic AirLLM streaming model for architecture: Qwen2ForCausalLM
+Loading shard 1/8
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.embed_tokens.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.0.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.1.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.2.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.3.safetensors
+Loading shard 2/8
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.10.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.4.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.5.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.6.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.7.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.8.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.9.safetensors
+Loading shard 3/8
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.11.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.12.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.13.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.14.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.15.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.16.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.17.safetensors
+Loading shard 4/8
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.18.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.19.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.20.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.21.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.22.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.23.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.24.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.25.safetensors
+Loading shard 5/8
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.26.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.27.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.28.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.29.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.30.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.31.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.32.safetensors
+Loading shard 6/8
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.33.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.34.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.35.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.36.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.37.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.38.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.39.safetensors
+Loading shard 7/8
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.40.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.41.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.42.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.43.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.44.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.45.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.46.safetensors
+Loading shard 8/8
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.layers.47.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/model.norm.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-4bit/splitted_model.4bit/lm_head.safetensors
+prefetching is not supported together with compression for now; disabling prefetching.
+built empty Qwen2ForCausalLM via AutoModelForCausalLM (attn=sdpa)
+[
+  {
+    "engine": "airllm",
+    "engine_version": "4.0.0",
+    "mode": "airllm_4bit_prefetch",
+    "model": "Qwen/Qwen2.5-14B-Instruct",
+    "workload": "prompt_heavy",
+    "load_time_s": 365.529,
+    "ttft_s": 32.093,
+    "decode_time_s": 954.918,
+    "total_time_s": 987.011,
+    "prompt_tokens": 340,
+    "completion_tokens": 32,
+    "decode_tok_per_s": 0.032,
+    "total_tok_per_s": 0.032,
+    "peak_rss_mib": 5390.5,
+    "current_rss_mib": 689.2,
+    "cuda_max_allocated_mib": 1983.3,
+    "page_cache_delta_mib": 248.0,
+    "page_cache_delta_since_start_mib": -751.8,
+    "output_preview": " The core memory-management mechanism described is layer-streaming inference, which minimizes memory usage by allocating a small fixed pool of reusable buffers "
+  }
+]

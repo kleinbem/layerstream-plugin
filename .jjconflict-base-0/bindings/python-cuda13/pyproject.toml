@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "layerstream-cuda13"
+version = "0.6.1"
+description = "CUDA 13 dynamic ggml backend plugin for layerstream (zero-compile NVIDIA GPU support via PyPI)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.15"
+dependencies = [
+    "nvidia-cuda-runtime>=13.5,<14",
+    "nvidia-cublas>=13.8,<14",
+]
+keywords = ["llm", "gguf", "cuda", "layerstream", "inference"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/kleinbem/layerstream-plugin"
+Repository = "https://github.com/kleinbem/layerstream-plugin"
+Issues = "https://github.com/kleinbem/layerstream-plugin/issues"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+packages = ["layerstream_cuda13"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+layerstream_cuda13 = ["_backends/*.so*", "py.typed"]
+
+[tool.ruff]
+extend = "../python/pyproject.toml"
+
+[tool.ruff.lint.extend-per-file-ignores]
+"scripts/**" = ["S603", "S607"]

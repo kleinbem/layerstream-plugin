@@ -1,0 +1,61 @@
+{
+  "name": "layerstream",
+  "version": "0.6.1",
+  "description": "Out-of-core GGUF layer-streaming LLM inference engine with O_DIRECT GPU streaming (Node-API / TypeScript)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kleinbem/layerstream-plugin.git",
+    "directory": "bindings/node"
+  },
+  "homepage": "https://github.com/kleinbem/layerstream-plugin",
+  "bugs": {
+    "url": "https://github.com/kleinbem/layerstream-plugin/issues"
+  },
+  "keywords": [
+    "llm",
+    "gguf",
+    "llama.cpp",
+    "streaming",
+    "inference",
+    "out-of-core",
+    "moe",
+    "openai",
+    "napi-rs"
+  ],
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./openai": {
+      "types": "./openai.d.ts",
+      "default": "./openai.js"
+    }
+  },
+  "files": [
+    "_model.js",
+    "_shared.js",
+    "index.js",
+    "index.d.ts",
+    "openai.js",
+    "openai.d.ts",
+    "native.js",
+    "worker.js",
+    "layerstream.*.node",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "build": "node scripts/build-native.mjs --release",
+    "build:debug": "node scripts/build-native.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/layerstream.test.js test/esm-and-native.test.mjs test/coverage.unit.test.js",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-exclude=\"test/**\" --test-coverage-exclude=\"scripts/**\" --test-coverage-lines=100 test/layerstream.test.js test/esm-and-native.test.mjs test/coverage.unit.test.js"
+  }
+}

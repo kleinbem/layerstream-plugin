@@ -1,0 +1,962 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>layerstream-plugin — Out-of-Core Edge LLM Benchmark Explorer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --surface: #121a30;
+      --surface-2: #182341;
+      --border: #26355d;
+      --text: #e6edf7;
+      --muted: #98a8c7;
+      --accent: #38bdf8;
+      --accent-2: #34d399;
+      --warn: #fbbf24;
+      --danger: #f87171;
+      --purple: #a78bfa;
+      --radius: 12px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      background: radial-gradient(1200px 600px at 20% -10%, #1a2750 0%, var(--bg) 60%);
+      color: var(--text);
+      line-height: 1.5;
+      accent-color: var(--accent);
+    }
+
+    @supports not (accent-color: #38bdf8) {
+      input[type="range"] {
+        -webkit-appearance: none;
+        appearance: none;
+        background: transparent;
+      }
+      input[type="range"]::-webkit-slider-runnable-track {
+        height: 6px;
+        border-radius: 3px;
+        background: var(--border);
+      }
+      input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        height: 16px;
+        width: 16px;
+        border-radius: 50%;
+        background: var(--accent);
+        margin-top: -5px;
+      }
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .container {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 1.5rem clamp(1rem, 3vw, 2rem) 3rem;
+    }
+
+    header.hero {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+      padding-bottom: 1.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .hero h1 {
+      margin: 0 0 0.35rem;
+      font-size: clamp(1.5rem, 3vw, 2.15rem);
+      letter-spacing: -0.02em;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 68ch;
+      font-size: 0.95rem;
+    }
+
+    .pill-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.45rem 0.85rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 0.85rem;
+      font-weight: 500;
+    }
+    .pill:hover {
+      border-color: var(--accent);
+      text-decoration: none;
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 0.85rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .kpi {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.95rem 1.1rem;
+    }
+
+    .kpi .label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+
+    .kpi .val {
+      font-size: 1.55rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      margin: 0.2rem 0;
+    }
+
+    .kpi .sub {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin-bottom: 1.25rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.65rem;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--muted);
+      padding: 0.55rem 0.95rem;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.92rem;
+      font-weight: 600;
+      font-family: inherit;
+    }
+
+    .tab-btn:hover { color: var(--text); background: var(--surface); }
+    .tab-btn[aria-selected="true"] {
+      background: var(--surface-2);
+      border-color: var(--accent);
+      color: var(--text);
+    }
+
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.15rem 1.25rem;
+      margin-bottom: 1rem;
+    }
+
+    .card h2 {
+      margin: 0 0 0.35rem;
+      font-size: 1.15rem;
+    }
+
+    .card .desc {
+      margin: 0 0 1rem;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.85rem;
+      align-items: flex-end;
+      margin-bottom: 1rem;
+    }
+
+    .ctrl {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      min-width: 170px;
+    }
+
+    .ctrl label {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    select, input[type="number"] {
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.48rem 0.65rem;
+      font-family: inherit;
+      font-size: 0.9rem;
+    }
+
+    .bar-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.7rem;
+    }
+
+    .bar-row {
+      display: grid;
+      grid-template-columns: minmax(210px, 300px) 1fr minmax(120px, 165px);
+      gap: 0.75rem;
+      align-items: center;
+    }
+
+    @media (max-width: 720px) {
+      .bar-row { grid-template-columns: 1fr; gap: 0.25rem; }
+    }
+
+    .bar-label {
+      font-size: 0.86rem;
+      font-weight: 600;
+    }
+
+    .bar-sub {
+      display: block;
+      font-size: 0.75rem;
+      font-weight: 400;
+      color: var(--muted);
+    }
+
+    .bar-track {
+      height: 26px;
+      background: #0d1428;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: 5px;
+      transition: width 220ms ease;
+    }
+
+    .bar-value {
+      font-family: var(--mono);
+      font-size: 0.84rem;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      border-radius: 6px;
+      font-size: 0.74rem;
+      font-weight: 700;
+      font-family: var(--mono);
+      letter-spacing: 0.02em;
+    }
+
+    .b-ok { background: rgba(52, 211, 153, 0.16); color: var(--accent-2); border: 1px solid rgba(52, 211, 153, 0.35); }
+    .b-warn { background: rgba(251, 191, 36, 0.16); color: var(--warn); border: 1px solid rgba(251, 191, 36, 0.35); }
+    .b-err { background: rgba(248, 113, 113, 0.16); color: var(--danger); border: 1px solid rgba(248, 113, 113, 0.35); }
+    .b-info { background: rgba(56, 189, 248, 0.16); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.35); }
+
+    .callout {
+      border-left: 3px solid var(--warn);
+      background: rgba(251, 191, 36, 0.07);
+      padding: 0.75rem 1rem;
+      border-radius: 0 8px 8px 0;
+      font-size: 0.86rem;
+      color: var(--text);
+      margin-top: 1rem;
+    }
+
+    .callout.good {
+      border-left-color: var(--accent-2);
+      background: rgba(52, 211, 153, 0.07);
+    }
+
+    .preset-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+    }
+
+    .preset-btn {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.4rem 0.75rem;
+      border-radius: 8px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .preset-btn:hover { border-color: var(--accent); }
+
+    .est-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.1rem;
+    }
+
+    .slider-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+    }
+
+    .slider-head {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.84rem;
+    }
+
+    .slider-head strong {
+      font-family: var(--mono);
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .table-wrapper {
+      overflow: auto;
+      max-inline-size: 100%;
+      max-block-size: min(560px, 75vh);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 0.82rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    thead {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 2;
+      background: var(--surface-2);
+    }
+
+    th, td {
+      padding: 0.5rem 0.65rem;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    th { font-weight: 600; color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; }
+    td.num, th.num { text-align: right; font-family: var(--mono); }
+    tbody tr:hover { background: rgba(56, 189, 248, 0.06); }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1rem;
+    }
+
+    footer {
+      margin-top: 2rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.82rem;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header class="hero">
+      <div>
+        <h1>⚡ layerstream-plugin — Edge Out-of-Core LLM Benchmarks</h1>
+        <p>
+          Bare-metal 4-engine comparison on an <strong>8 GB NVIDIA Jetson Orin Nano</strong> (7.3 GiB RAM, CUDA <code>sm_87</code>, LUKS2 NVMe, INA3221 hardware power rail):
+          <strong>layerstream-plugin</strong> (R2–R8 on <code>v0.1.0</code>, R9 on <code>v0.2.1</code>, R10–R11 on <strong><code>v0.6.1</code></strong> with CUDA 13.4, GCC 16.2, <code>llama.cpp 1.1.0</code>, built-in MTP self-speculation, and all-GPU <code>splits=1</code> execution — hitting <strong>15.09 tok/s</strong> on <code>OLMoE-1B-7B</code>, <strong>4.66 tok/s</strong> on <code>Qwen2.5-14B</code>, <strong>1.67 tok/s</strong> on <code>Qwen2.5-32B</code>, and <strong>1.62 tok/s</strong> on <code>Qwen3-30B-A3B</code>) vs. <strong>stock llama.cpp</strong> (Ollama/LM Studio runtime), <strong>Hugging Face accelerate</strong>, and <strong>AirLLM 4.0.0</strong>.
+        </p>
+      </div>
+      <nav class="pill-links" aria-label="Project links">
+        <a class="pill" href="https://github.com/kleinbem/layerstream-plugin" target="_blank" rel="noopener">GitHub Repo</a>
+        <a class="pill" href="https://github.com/kleinbem/layerstream-plugin/releases/tag/v0.6.1" target="_blank" rel="noopener">v0.6.1 Release</a>
+        <a class="pill" href="https://huggingface.co/datasets/kleinbem/layerstream-orin-nano-benchmarks" target="_blank" rel="noopener">HF Dataset (<span id="total-runs-pill">…</span> runs)</a>
+      </nav>
+    </header>
+
+    <section class="kpi-grid" aria-label="Headline benchmark metrics">
+      <div class="kpi">
+        <div class="label">Qwen2.5-14B (8.37 GiB)</div>
+        <div class="val" style="color:var(--accent)">3.41 – 5.97 tok/s</div>
+        <div class="sub">0 MiB swap · 2,961 MiB/s O_DIRECT · 1.91 J/tok net</div>
+      </div>
+      <div class="kpi">
+        <div class="label">OLMoE-1B-7B (Sparse + TinyLFU)</div>
+        <div class="val" style="color:var(--accent-2)">12.0 – 13.7 tok/s</div>
+        <div class="sub">15.8×–17.9× vs full-layer R=0 · 98–100% cache hit</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Qwen2.5-32B (2.53× RAM)</div>
+        <div class="val" style="color:var(--purple)">0.84 – 0.94 tok/s</div>
+        <div class="sub">18.5 GiB on 7.3 GiB RAM · Stock llama.cpp +17.2 GiB swap</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Multi-Turn KV Prefix Reuse</div>
+        <div class="val" style="color:var(--warn)">4.97× faster TTFT</div>
+        <div class="sub">14.88 s → 2.99 s on 1,377-token conversation</div>
+      </div>
+    </section>
+
+    <div class="tabs" role="tablist" aria-label="Dashboard sections">
+      <button class="tab-btn" role="tab" id="tab-compare" aria-controls="panel-compare" aria-selected="true">1. 4-Engine Comparison</button>
+      <button class="tab-btn" role="tab" id="tab-tuning" aria-controls="panel-tuning" aria-selected="false">2. Tuning Story (R2 → R11)</button>
+      <button class="tab-btn" role="tab" id="tab-estimator" aria-controls="panel-estimator" aria-selected="false">3. Hardware Estimator</button>
+      <button class="tab-btn" role="tab" id="tab-raw" aria-controls="panel-raw" aria-selected="false">4. Raw Dataset (<span id="total-runs-tab">…</span> Runs)</button>
+    </div>
+
+    <!-- PANEL 1: 4-ENGINE COMPARISON -->
+    <section id="panel-compare" class="panel active" role="tabpanel" aria-labelledby="tab-compare">
+      <div class="card">
+        <h2>Head-to-Head Engine Comparison (Orin Nano Bare Metal)</h2>
+        <p class="desc">Compare measured throughput, latency, energy, and memory pressure across all 4 engines. Failed runs (OOM / 300 s timeout) are shown honestly alongside successful runs.</p>
+        <div class="controls">
+          <div class="ctrl">
+            <label for="cmp-model">Model</label>
+            <select id="cmp-model">
+              <option value="14b">Qwen2.5-14B-Instruct (8.37 GiB Dense)</option>
+              <option value="32b">Qwen2.5-32B-Instruct (18.49 GiB Dense — 2.53× RAM)</option>
+              <option value="olmoe">OLMoE-1B-7B (2.5 GiB, 64-Expert MoE)</option>
+              <option value="qwen3_30b">Qwen3-30B-A3B (17.3 GiB, 128-Expert MoE)</option>
+            </select>
+          </div>
+          <div class="ctrl">
+            <label for="cmp-workload">Workload</label>
+            <select id="cmp-workload">
+              <option value="code_edit">code_edit (48 tok, high structural overlap)</option>
+              <option value="open_ended" selected>open_ended (48 tok, unconstrained prose)</option>
+              <option value="prompt_heavy">prompt_heavy (340 prompt → 32 tok)</option>
+            </select>
+          </div>
+          <div class="ctrl">
+            <label for="cmp-metric">Metric</label>
+            <select id="cmp-metric">
+              <option value="decode_tok_per_s">Decode Speed (tok/s — higher is better)</option>
+              <option value="ttft_s">TTFT (seconds — lower is better)</option>
+              <option value="joules_per_tok">Gross Energy (J/tok — lower is better)</option>
+              <option value="peak_rss_mib">Peak RSS (MiB — lower is better)</option>
+              <option value="draft_acceptance_rate">Draft Acceptance Rate (0–1 — higher is better)</option>
+              <option value="tokens_per_sweep">Tokens / Storage Sweep (higher is better)</option>
+            </select>
+          </div>
+        </div>
+        <div id="cmp-chart" class="bar-list" aria-live="polite"></div>
+        <div id="cmp-note" class="callout"></div>
+      </div>
+    </section>
+
+    <!-- PANEL 2: TUNING STORY -->
+    <section id="panel-tuning" class="panel" role="tabpanel" aria-labelledby="tab-tuning">
+      <div class="two-col">
+        <div class="card">
+          <h2>Qwen2.5-14B Iterative Optimization (R2 → R8)</h2>
+          <p class="desc">Every engineering change profiled with microsecond I/O + DMA timers on bare-metal Jetson Orin Nano (`code_edit` decode tok/s).</p>
+          <div id="tuning-14b-chart" class="bar-list"></div>
+          <div class="callout good">
+            <strong>Takeaway:</strong> Zero-copy <code>O_DIRECT → cudaHostAlloc</code> + per-tensor <code>cudaMemcpyAsync</code> + <code>io_threads=1</code> + adaptive speculation lifted 14B from <strong>0.19 tok/s</strong> (pure stream) to <strong>3.41–5.97 tok/s</strong> with <strong>2,961 MiB/s</strong> sustained through LUKS2 <code>dm-crypt</code>.
+          </div>
+        </div>
+        <div class="card">
+          <h2>Sparse MoE + Negative Ablations</h2>
+          <p class="desc">Honest negative ablations matter just as much as wins — here is what actually hurt vs. helped on real hardware.</p>
+          <div id="tuning-ablation-chart" class="bar-list"></div>
+          <div class="callout">
+            <strong>Key findings:</strong> (1) Multi-threaded <code>O_DIRECT</code> (<code>io_threads=4</code>) <em>regressed -57%</em> on Linux LUKS2 <code>dm-crypt</code>. (2) Spending 580 MiB on a <code>1.5B</code> draft instead of extra resident layers lost 2.5×–3.0× to <code>0.5B</code>. (3) TinyLFU hot-expert caching jumped <code>OLMoE</code> <strong>15.8×–17.9×</strong> (`0.76 → 13.67 tok/s`).
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PANEL 3: HARDWARE ESTIMATOR -->
+    <section id="panel-estimator" class="panel" role="tabpanel" aria-labelledby="tab-estimator">
+      <div class="card">
+        <h2>Interactive Hardware Estimator (Mirrors <code>layerstream-plugin check</code>)</h2>
+        <p class="desc">Estimate resident layer pinning, cold load time, and expected decode speed on your own machine (Jetson, laptop, or AMD 8700G 64 GB APU).</p>
+        <div class="preset-row">
+          <button class="preset-btn" type="button" data-preset="orin14">8 GB Jetson Orin Nano · 14B Dense</button>
+          <button class="preset-btn" type="button" data-preset="orin32">8 GB Jetson Orin Nano · 32B Dense</button>
+          <button class="preset-btn" type="button" data-preset="apu123">64 GB AMD 8700G · 123B Dense</button>
+          <button class="preset-btn" type="button" data-preset="apu235">64 GB AMD 8700G · 235B MoE</button>
+          <button class="preset-btn" type="button" data-preset="laptop70">16 GB Laptop · 70B Dense</button>
+        </div>
+
+        <div class="est-grid">
+          <div class="slider-wrap">
+            <div class="slider-head"><label for="est-ram">Free GPU / Unified RAM</label><strong id="est-ram-val">5.2 GiB</strong></div>
+            <input id="est-ram" type="range" min="3" max="56" step="0.5" value="5.2">
+          </div>
+          <div class="slider-wrap">
+            <div class="slider-head"><label for="est-nvme">Sustained NVMe O_DIRECT BW</label><strong id="est-nvme-val">2,800 MiB/s</strong></div>
+            <input id="est-nvme" type="range" min="100" max="7000" step="100" value="2800">
+          </div>
+          <div class="slider-wrap">
+            <div class="slider-head"><label for="est-model">Model GGUF Size</label><strong id="est-model-val">8.4 GiB</strong></div>
+            <input id="est-model" type="range" min="2" max="200" step="0.5" value="8.4">
+          </div>
+          <div class="ctrl">
+            <label for="est-arch">Architecture &amp; Speculation</label>
+            <select id="est-arch">
+              <option value="dense_draft" selected>Dense + Small Draft Model (2.5×–5× spec)</option>
+              <option value="dense_none">Dense, No Speculation (1 tok/sweep floor)</option>
+              <option value="moe_cached">Sparse MoE + TinyLFU Hot-Expert Cache</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="est-output" class="kpi-grid" aria-live="polite"></div>
+        <div id="est-verdict" class="callout good"></div>
+      </div>
+    </section>
+
+    <!-- PANEL 4: RAW DATASET -->
+    <section id="panel-raw" class="panel" role="tabpanel" aria-labelledby="tab-raw">
+      <div class="card">
+        <h2>Normalized Benchmark Records (<span id="raw-count">0</span> / <span id="total-runs-raw">…</span> rows)</h2>
+        <p class="desc">Loaded directly from <code>kleinbem/layerstream-orin-nano-benchmarks</code> (Parquet / JSON). Use keyboard or horizontal scroll to inspect all telemetry columns.</p>
+        <div class="controls">
+          <div class="ctrl">
+            <label for="raw-hardware">Hardware</label>
+            <select id="raw-hardware"><option value="all">All Hardware</option></select>
+          </div>
+          <div class="ctrl">
+            <label for="raw-round">Round</label>
+            <select id="raw-round"><option value="all">All Rounds</option></select>
+          </div>
+          <div class="ctrl">
+            <label for="raw-engine">Engine</label>
+            <select id="raw-engine"><option value="all">All Engines</option></select>
+          </div>
+          <div class="ctrl">
+            <label for="raw-workload">Workload</label>
+            <select id="raw-workload"><option value="all">All Workloads</option></select>
+          </div>
+        </div>
+        <div tabindex="0" role="region" aria-labelledby="raw-table-cap" class="table-wrapper">
+          <table>
+            <caption id="raw-table-cap" style="position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)">Normalized Orin Nano benchmark runs</caption>
+            <thead>
+              <tr>
+                <th scope="col">Round</th>
+                <th scope="col">Engine</th>
+                <th scope="col">Mode</th>
+                <th scope="col">Model</th>
+                <th scope="col">Workload</th>
+                <th scope="col">Status</th>
+                <th scope="col" class="num">R</th>
+                <th scope="col" class="num">Load (s)</th>
+                <th scope="col" class="num">TTFT (s)</th>
+                <th scope="col" class="num">Decode tok/s</th>
+                <th scope="col" class="num">pread MiB/s</th>
+                <th scope="col" class="num">Peak RSS</th>
+                <th scope="col" class="num">Swap Δ</th>
+                <th scope="col" class="num">J/tok (Net)</th>
+              </tr>
+            </thead>
+            <tbody id="raw-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <span>Data source: <a href="https://huggingface.co/datasets/kleinbem/layerstream-orin-nano-benchmarks" target="_blank" rel="noopener">kleinbem/layerstream-orin-nano-benchmarks</a> (Apache-2.0)</span>
+      <span id="data-status">Loading dataset…</span>
+    </footer>
+  </main>
+
+  <script>
+    const HF_JSON_URL = "https://huggingface.co/datasets/kleinbem/layerstream-orin-nano-benchmarks/resolve/main/data/benchmarks.json";
+    let ALL_ROWS = [];
+
+    const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "—" : Number(v).toFixed(d);
+
+    // Tab switching + arrow-key navigation
+    const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+    const panels = Array.from(document.querySelectorAll('[role="tabpanel"]'));
+    function activateTab(btn) {
+      tabs.forEach(t => t.setAttribute("aria-selected", String(t === btn)));
+      panels.forEach(p => p.classList.toggle("active", p.id === btn.getAttribute("aria-controls")));
+    }
+    tabs.forEach((btn, idx) => {
+      btn.addEventListener("click", () => activateTab(btn));
+      btn.addEventListener("keydown", (e) => {
+        if (e.key === "ArrowRight") { const n = tabs[(idx + 1) % tabs.length]; n.focus(); activateTab(n); }
+        if (e.key === "ArrowLeft") { const p = tabs[(idx - 1 + tabs.length) % tabs.length]; p.focus(); activateTab(p); }
+      });
+    });
+
+    function engineColor(engine, status) {
+      if (status && status !== "ok") return "var(--danger)";
+      if (engine === "layerstream-plugin") return "linear-gradient(90deg, #38bdf8, #34d399)";
+      if (engine === "llama.cpp") return "var(--purple)";
+      if (engine === "colibri") return "#ec4899";
+      if (engine === "airllm") return "var(--warn)";
+      return "#64748b";
+    }
+
+    function pickComparisonRows(modelKey, workload) {
+      const findOne = (pred) => ALL_ROWS.find(pred);
+      if (modelKey === "14b") {
+        return [
+          { label: "layerstream-plugin (R6 max R=20 + 0.5B)", sub: "6.15 GiB RSS · clean RAM", row: findOne(r => r.round === "round6" && r.mode === "r6_hybrid_r20_draft05b" && r.workload === workload) },
+          { label: "layerstream-plugin (v0.6.1 b5400 + 0.5B)", sub: "R=7 · CUDA 13.4 + GCC 16.2 · 4.66 tok/s code_edit · 3.54 J/tok", row: findOne(r => r.round === "round11_v061" && r.mode === "r11_14b_b5400_draft05b" && r.workload === workload) },
+          { label: "layerstream-plugin (v0.6.1 auto + 0.5B)", sub: "R=4 · 4.30 tok/s code_edit · 2.79 s multi-turn TTFT", row: findOne(r => r.round === "round11_v061" && r.mode === "r11_14b_auto_draft05b" && r.workload === workload) },
+          { label: "layerstream-plugin (v0.1.0 b5400 + 0.5B)", sub: "R=7 · reps=3 · 0 MiB swap · 2,961 MiB/s", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_14b_b5400_draft05b" && r.workload === workload) },
+          { label: "layerstream-plugin (v0.1.0 auto + 0.5B)", sub: "R=4 · reps=3 · 3.7 GiB RSS · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_14b_auto_draft05b" && r.workload === workload) },
+          { label: "layerstream-plugin (v0.1.0 R=0 pure stream)", sub: "No draft · 2.46 GiB RSS · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_14b_r0") || findOne(r => r.round === "round5" && r.mode === "r5_zc_stream_r0" && r.workload === workload) },
+          { label: "AirLLM 4.0.0 (4-bit NF4)", sub: workload === "prompt_heavy" ? "Cold shards (365s load, 32 tok)" : "Warm shards (8 tok only · 36.8 GiB disk)", row: findOne(r => r.round === "airllm" && r.mode === "airllm_4bit_prefetch" && r.workload === workload) },
+          { label: "HF accelerate (4-bit NF4 disk offload)", sub: "144 s load → 300 s timeout (0 tok)", row: findOne(r => r.round === "competitors" && r.engine === "hf-accelerate") },
+          { label: "Stock llama.cpp (-ngl 12, -b 512)", sub: "OOM rc=1 · +3.7 GiB swap (Ollama/LM Studio runtime)", row: findOne(r => r.round === "competitors" && r.mode === "llama_cpp_14b_ngl12_b512" && r.workload === workload) },
+          { label: "Stock llama.cpp CPU mmap (-ngl 0 -dev none)", sub: "300 s timeout · 6.1 GiB RSS · +363 MiB swap", row: findOne(r => r.round === "competitors" && r.mode === "llama_cpp_14b_cpu_mmap") },
+        ].filter(x => x.row);
+      }
+      if (modelKey === "32b") {
+        return [
+          { label: "layerstream-plugin (v0.6.1 b5400 + 0.5B)", sub: "R=2/64 · CUDA 13.4 + GCC 16.2 · 1.67 tok/s code_edit · 4.28 GiB RSS", row: findOne(r => r.round === "round11_v061" && r.mode === "r11_32b_b5400_draft05b" && r.workload === workload) },
+          { label: "layerstream-plugin (R6 b5600 + 0.5B)", sub: "R=6/64 · 5.29 GiB RSS · clean RAM", row: findOne(r => r.round === "round6_32b" && r.mode === "r6_32b_auto5600_draft05b" && r.workload === workload) },
+          { label: "layerstream-plugin (v0.1.0 b5400 + 0.5B)", sub: "R=2/64 · reps=2 · 4.1 GiB RSS · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_32b_b5400_draft05b" && r.workload === workload) },
+          { label: "layerstream-plugin (R6 R=0 pure stream)", sub: "0 draft · 2.96 GiB RSS · 559.7 GiB read", row: findOne(r => r.round === "round6_32b" && r.mode === "r6_32b_stream_r0") },
+          { label: "Stock llama.cpp (-ngl 10)", sub: "300 s timeout · +17.24 GiB swap thrashing!", row: findOne(r => r.round === "competitors" && r.mode === "llama_cpp_32b_ngl10") },
+        ].filter(x => x.row);
+      }
+      if (modelKey === "olmoe") {
+        return [
+          { label: "layerstream-plugin R=0 Sparse + TinyLFU (v0.6.1)", sub: "15.09 tok/s · all-GPU splits=1 · 1.02 J/tok · 3.39 GiB RSS", row: findOne(r => r.round === "round11_v061" && r.mode === "r11_olmoe_r0_sparse_cached" && r.workload === workload) },
+          { label: "layerstream-plugin R=0 Sparse + TinyLFU (v0.2.1)", sub: "98–100% cache hit · reps=3 · 0 MiB swap · parallel FADV_RANDOM+DONTNEED", row: findOne(r => r.round === "round9_v021" && r.mode === "r9_olmoe_r0_sparse_cached" && r.workload === workload) },
+          { label: "layerstream-plugin R=0 Sparse + TinyLFU (v0.1.0)", sub: "98–100% cache hit · reps=3 · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_olmoe_r0_sparse_cached" && r.workload === workload) },
+          { label: "JustVugg/colibri v2.2.0 (c/olmoe CPU)", sub: "3.60–3.64 tok/s · 2.64 GiB RSS · 64/64 experts cached in RAM", row: findOne(r => r.round === "competitors" && r.mode === "colibri_olmoe" && r.workload === workload) },
+          { label: "layerstream-plugin R=0 Full-Layer Stream", sub: "Baseline without sparse MoE / TinyLFU", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_olmoe_r0_full") },
+        ].filter(x => x.row);
+      }
+      return [
+        { label: "layerstream-plugin v0.6.1 Sparse + 0.6B (open_ended)", sub: "Wins! 1.62 tok/s · 4.17 GiB RSS · 9.47 J/tok · all-GPU splits=1", row: findOne(r => r.round === "round11_v061" && r.mode === "r11_qwen3_30b_a3b_r0_draft06b" && r.workload === "open_ended") },
+        { label: "layerstream-plugin v0.2.1 Sparse + 0.6B (open_ended)", sub: "1.45 tok/s · 4.05 GiB RSS · 1,266 MiB/s · 0 NVMe stalls · 11.55 J/tok", row: findOne(r => r.round === "round9_v021" && r.mode === "r9_qwen3_30b_a3b_r0_draft06b" && r.workload === "open_ended") },
+        { label: "Stock llama.cpp CPU mmap (-ngl 0 -dev none -b 512)", sub: "1.27 tok/s · 6.07 GiB RSS · +248 MiB swap · 25.3 s load · 15.26 J/tok", row: findOne(r => r.round === "competitors" && r.mode === "llama_cpp_qwen3_30b_cpu_mmap_b512") },
+        { label: "layerstream-plugin v0.6.1 Sparse + 0.6B (code_edit)", sub: "0.81 tok/s · 4.26 GiB RSS · 6.95 s TTFT · all-GPU splits=1", row: findOne(r => r.round === "round11_v061" && r.mode === "r11_qwen3_30b_a3b_r0_draft06b" && r.workload === "code_edit") },
+        { label: "layerstream-plugin v0.2.1 Sparse + 0.6B (code_edit)", sub: "0.95 tok/s (8.4× vs v0.1.0) · 4.09 GiB RSS · 1,261 MiB/s · 0 NVMe stalls", row: findOne(r => r.round === "round9_v021" && r.mode === "r9_qwen3_30b_a3b_r0_draft06b" && r.workload === "code_edit") },
+        { label: "JustVugg/colibri v2.2.0 (qwen36, open_ended)", sub: "0.65 tok/s · 2.32 GiB RSS · 0 MiB swap · cache=8/layer, no draft", row: findOne(r => r.round === "competitors" && r.mode === "colibri_qwen3_30b_a3b" && r.workload === "open_ended") },
+        { label: "JustVugg/colibri v2.2.0 (qwen36, code_edit)", sub: "0.65 tok/s · 2.33 GiB RSS · 0 MiB swap · 35.8 s TTFT", row: findOne(r => r.round === "competitors" && r.mode === "colibri_qwen3_30b_a3b" && r.workload === "code_edit") },
+        { label: "layerstream-plugin v0.1.0 Sparse + 0.6B (open_ended)", sub: "Before fix: O_DIRECT Tegra nvme1 stalls · 3.97 GiB RSS · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_qwen3_30b_a3b_r0_draft06b" && r.workload === "open_ended") },
+        { label: "layerstream-plugin v0.1.0 Sparse + 0.6B (code_edit)", sub: "Before fix: hit 30 s Orin Tegra nvme1 IRQ stalls · 0 MiB swap", row: findOne(r => r.round === "round8_v010" && r.mode === "r8_qwen3_30b_a3b_r0_draft06b" && r.workload === "code_edit") },
+        { label: "Stock llama.cpp GPU MoE offload (-ot exps=CPU)", sub: "OOM rc=1 · +12.34 GiB swap", row: findOne(r => r.round === "competitors" && r.mode === "llama_cpp_qwen3_30b_gpu_moe_offload") },
+      ].filter(x => x.row);
+    }
+
+    function renderComparison() {
+      const modelKey = document.getElementById("cmp-model").value;
+      const workload = document.getElementById("cmp-workload").value;
+      const metric = document.getElementById("cmp-metric").value;
+      const items = pickComparisonRows(modelKey, workload);
+      const vals = items.map(x => {
+        const r = x.row;
+        if (r.status && r.status !== "ok" && metric !== "peak_rss_mib") return null;
+        return r[metric];
+      });
+      const maxVal = Math.max(...vals.filter(v => typeof v === "number" && v > 0), 1e-6);
+      const unit = metric === "decode_tok_per_s" ? "tok/s"
+        : metric === "ttft_s" ? "s"
+        : metric === "joules_per_tok" ? "J/tok"
+        : metric === "draft_acceptance_rate" ? "%"
+        : metric === "tokens_per_sweep" ? "tok/swp"
+        : "MiB";
+
+      const container = document.getElementById("cmp-chart");
+      container.innerHTML = items.map((item, i) => {
+        const r = item.row;
+        const failed = r.status && r.status !== "ok";
+        const v = vals[i];
+        const pct = (typeof v === "number" && v > 0) ? Math.max(2, (v / maxVal) * 100) : 0;
+        const displayVal = metric === "draft_acceptance_rate" && typeof v === "number" ? v * 100 : v;
+        const valText = failed && metric !== "peak_rss_mib"
+          ? `<span class="badge b-err">${r.status.toUpperCase()}</span>`
+          : (typeof displayVal === "number" ? `${fmt(displayVal, metric === "peak_rss_mib" ? 0 : metric === "draft_acceptance_rate" ? 1 : 2)} ${unit}` : `<span class="badge b-warn">N/A</span>`);
+        return `
+          <div class="bar-row">
+            <div class="bar-label">${item.label}<span class="bar-sub">${item.sub}</span></div>
+            <div class="bar-track">
+              <div class="bar-fill" style="width:${failed && metric !== "peak_rss_mib" ? 100 : pct}%;background:${engineColor(r.engine, r.status)};opacity:${failed && metric !== "peak_rss_mib" ? 0.22 : 1}"></div>
+            </div>
+            <div class="bar-value">${valText}</div>
+          </div>`;
+      }).join("");
+
+      const note = document.getElementById("cmp-note");
+      if (modelKey === "qwen3_30b") {
+        note.className = "callout good";
+        note.innerHTML = "<strong>128-expert MoE win in v0.6.1 (R11):</strong> After parallel <code>FADV_RANDOM+DONTNEED</code> sparse reads (v0.2.1) and the all-GPU <code>mparams.devices</code> fix (v0.6.1, <code>splits=1</code>), <code>layerstream-plugin</code> reaches <strong>1.621 tok/s</strong> (<code>open_ended</code>) at <strong>4.17 GiB RSS</strong> and <strong>9.47 J/tok</strong> — beating stock <code>llama.cpp</code> CPU <code>mmap</code> (<code>1.27 tok/s</code>, <code>6.07 GiB RSS</code>, <code>15.26 J/tok</code>) by <strong>+27.6%</strong> with 1.9 GiB less RAM.";
+      } else if (modelKey === "14b") {
+        note.className = "callout good";
+        note.innerHTML = "<strong>Why layerstream wins on oversized dense models:</strong> Stock <code>llama.cpp</code> (Ollama/LM Studio runtime) OOMs or times out, HF <code>accelerate</code> spends 144 s loading then times out, and AirLLM runs <code>0.033 tok/s</code>. <code>layerstream-plugin v0.6.1</code> streams straight from a single 8.37 GiB GGUF at <strong>4.66 tok/s</strong> (<code>b5400</code>) with <strong>0 MiB swap</strong> and <strong>3.54 J/tok</strong>.";
+      } else if (modelKey === "32b") {
+        note.className = "callout good";
+        note.innerHTML = "<strong>2.53× larger than total system RAM:</strong> <code>Qwen2.5-32B</code> (18.49 GiB) runs cleanly on a 7.3 GiB Orin Nano with <strong>0 MiB swap</strong> at <strong>1.67 tok/s</strong> (<code>code_edit</code>, <strong>1.98× faster</strong> than v0.1.0), whereas stock <code>llama.cpp -ngl 10</code> thrashed <strong>+17.24 GiB</strong> of swap and produced 0 tokens in 300 s.";
+      } else {
+        note.className = "callout good";
+        note.innerHTML = "<strong>19.8× MoE speedup at R=0 (v0.6.1):</strong> Combining active-expert router inspection, TinyLFU hot-expert caching, and all-GPU <code>splits=1</code> lifts <code>OLMoE-1B-7B</code> from <code>0.76 tok/s</code> (full-layer) to <strong>15.09 tok/s</strong> and cuts energy <strong>14×</strong> (<code>14.34 → 1.02 J/tok</code>).";
+      }
+    }
+
+    function renderTuningCharts() {
+      const steps14b = [
+        { label: "R2: Initial O_DIRECT + K=4 (R=14)", sub: "Load 53.4 s · 6.26 GiB RSS", val: 1.957, color: "#64748b" },
+        { label: "R3: Chunked Load + Q8_0 KV + Adaptive K", sub: "Load 6.89 s (-7.7×)", val: 2.574, color: "#60a5fa" },
+        { label: "R4: Single pin_buf + io_threads=1", sub: "5.71 GiB RSS · 1,834 MiB/s", val: 3.427, color: "#38bdf8" },
+        { label: "R8 v0.1.0: Safe Auto-Clamped (b5400 → R=7)", sub: "4.18 GiB RSS · 0 MiB swap · 2,961 MiB/s", val: 3.405, color: "#a78bfa" },
+        { label: "R11 v0.6.1: CUDA 13.4 + GCC 16.2 + All-GPU (R=7)", sub: "4.67 GiB RSS · 3.54 J/tok · +36.8% vs R8", val: 4.657, color: "#34d399" },
+        { label: "R6: Max High-Residency Ceiling (R=20)", sub: "6.15 GiB RSS · 2.73 J/tok gross", val: 5.974, color: "#2dd4bf" },
+      ];
+      const max14 = Math.max(...steps14b.map(s => s.val));
+      document.getElementById("tuning-14b-chart").innerHTML = steps14b.map(s => `
+        <div class="bar-row">
+          <div class="bar-label">${s.label}<span class="bar-sub">${s.sub}</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width:${(s.val / max14) * 100}%;background:${s.color}"></div></div>
+          <div class="bar-value">${s.val.toFixed(3)} tok/s</div>
+        </div>`).join("");
+
+      const ablations = [
+        { label: "OLMoE R11 v0.6.1 All-GPU (splits=1, open_ended)", sub: "1.02 J/tok · 3.39 GiB RSS · 19.8× vs full-layer", val: 15.092, color: "#34d399" },
+        { label: "OLMoE R9 v0.2.1 Sparse + TinyLFU (open_ended)", sub: "98.1% cache hit · 1.44 J/tok", val: 12.535, color: "#2dd4bf" },
+        { label: "OLMoE R10 CPU-split bug caught! (splits=127)", sub: "mparams.devices included CPU · +1.06 GiB wasted CUDA_Host", val: 6.742, color: "#f87171" },
+        { label: "OLMoE R8 Full-Layer Stream (no sparse MoE)", sub: "Reads all 64 experts every token", val: 0.763, color: "#64748b" },
+        { label: "14B R=16 · io_threads=1 (optimal LUKS2)", sub: "Sequential BIOs across 6 kcryptd workers", val: 3.427, color: "#38bdf8" },
+        { label: "14B R=16 · io_threads=4 (regressed!)", sub: "-38% code_edit / -57% open_ended on dm-crypt", val: 2.127, color: "#fbbf24" },
+      ];
+      const maxAb = Math.max(...ablations.map(s => s.val));
+      document.getElementById("tuning-ablation-chart").innerHTML = ablations.map(s => `
+        <div class="bar-row">
+          <div class="bar-label">${s.label}<span class="bar-sub">${s.sub}</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width:${(s.val / maxAb) * 100}%;background:${s.color}"></div></div>
+          <div class="bar-value">${s.val.toFixed(3)} tok/s</div>
+        </div>`).join("");
+    }
+
+    // Interactive Hardware Estimator
+    const PRESETS = {
+      orin14: { ram: 5.2, nvme: 2800, model: 8.4, arch: "dense_draft" },
+      orin32: { ram: 5.2, nvme: 2400, model: 18.5, arch: "dense_draft" },
+      apu123: { ram: 48.0, nvme: 6000, model: 70.0, arch: "dense_draft" },
+      apu235: { ram: 48.0, nvme: 6000, model: 135.0, arch: "moe_cached" },
+      laptop70: { ram: 12.0, nvme: 4500, model: 40.0, arch: "dense_draft" },
+    };
+
+    function updateEstimator() {
+      const ram = parseFloat(document.getElementById("est-ram").value);
+      const nvme = parseFloat(document.getElementById("est-nvme").value);
+      const model = parseFloat(document.getElementById("est-model").value);
+      const arch = document.getElementById("est-arch").value;
+
+      document.getElementById("est-ram-val").textContent = `${ram.toFixed(1)} GiB`;
+      document.getElementById("est-nvme-val").textContent = `${nvme.toLocaleString()} MiB/s`;
+      document.getElementById("est-model-val").textContent = `${model.toFixed(1)} GiB`;
+
+      const nvmeGibS = nvme / 1024;
+      const draftReserve = arch === "dense_draft" ? 0.65 : 0;
+      const headroom = Math.max(1.1, ram * 0.14);
+      const kvAndSlots = Math.min(2.2, Math.max(0.9, model * 0.08));
+      const usableForWeights = Math.max(0, ram - headroom - kvAndSlots - draftReserve);
+      const fitsResident = model <= usableForWeights;
+
+      let pinnedFrac = fitsResident ? 1.0 : Math.max(0, Math.min(0.85, usableForWeights / model));
+      const streamedGib = Math.max(0, model * (1 - pinnedFrac));
+      const loadS = (Math.min(model, usableForWeights + 0.8) / Math.max(nvmeGibS, 0.1));
+
+      let lowTps, highTps, verdictBadge, verdictMsg, calloutClass = "callout good";
+      if (fitsResident) {
+        lowTps = 12; highTps = 45;
+        verdictBadge = `<span class="badge b-info">FITS RESIDENT</span>`;
+        verdictMsg = "<strong>Use stock llama.cpp / Mesh-LLM Skippy!</strong> This model fits completely in RAM/VRAM — running resident will be 10×–50× faster than NVMe streaming.";
+      } else if (nvme < 150) {
+        lowTps = 0.01; highTps = 0.05;
+        verdictBadge = `<span class="badge b-err">BLOCKED (&lt;150 MiB/s)</span>`;
+        calloutClass = "callout";
+        verdictMsg = "<strong>Too slow for out-of-core streaming:</strong> <code>layerstream-plugin check</code> fails closed below 150 MiB/s (SD/HDD/USB) to avoid 0.01 tok/s misery.";
+      } else if (arch === "moe_cached") {
+        // Sparse MoE active fraction ~8-12% + TinyLFU cache hit rate scales with RAM/model
+        const activeFrac = 0.10;
+        const cacheHit = Math.min(0.95, Math.max(0.20, (usableForWeights / model) * 1.45));
+        const effReadGib = model * activeFrac * (1 - cacheHit * 0.85);
+        const sweepS = Math.max(0.06, effReadGib / nvmeGibS + 0.04);
+        lowTps = 1 / (sweepS * 1.4);
+        highTps = 1 / (sweepS * 0.75);
+        verdictBadge = lowTps >= 2 ? `<span class="badge b-ok">STRONG (MoE + TinyLFU)</span>` : `<span class="badge b-warn">USABLE (ASYNC / MoE)</span>`;
+        verdictMsg = `<strong>Sparse MoE estimate:</strong> ~${Math.round(cacheHit * 100)}% projected TinyLFU hot-expert cache hit rate in ~${usableForWeights.toFixed(1)} GiB RAM; remaining cold experts stream at ${nvme} MiB/s. Great fit for on-demand Mesh-LLM escalation.`;
+      } else {
+        const sweepS = Math.max(0.15, (streamedGib / nvmeGibS) * 1.15);
+        const multLow = arch === "dense_draft" ? 2.4 : 1.0;
+        const multHigh = arch === "dense_draft" ? 5.2 : 1.0;
+        lowTps = multLow / sweepS;
+        highTps = multHigh / sweepS;
+        if (lowTps >= 1.0) {
+          verdictBadge = `<span class="badge b-ok">GOOD</span>`;
+          verdictMsg = `<strong>Interactive / code-edit ready:</strong> Pins ~${Math.round(pinnedFrac * 100)}% of layers in RAM/VRAM and streams ${streamedGib.toFixed(1)} GiB/sweep with draft speculation.`;
+        } else if (highTps >= 0.5) {
+          verdictBadge = `<span class="badge b-warn">SLOW (BATCH / ASYNC)</span>`;
+          calloutClass = "callout";
+          verdictMsg = `<strong>Best for async tasks / code edits:</strong> Streams ${streamedGib.toFixed(1)} GiB/sweep (${sweepS.toFixed(1)} s/sweep). Pairing a small 0.5B–1.5B draft model is essential here.`;
+        } else {
+          verdictBadge = `<span class="badge b-err">VERY SLOW</span>`;
+          calloutClass = "callout";
+          verdictMsg = `<strong>Bandwidth-limited:</strong> Streaming ${streamedGib.toFixed(1)} GiB per sweep at ${nvme} MiB/s without speculation takes ${sweepS.toFixed(1)} s/token. Add a draft model, use a smaller quant, or choose a sparse MoE.`;
+        }
+      }
+
+      document.getElementById("est-output").innerHTML = `
+        <div class="kpi"><div class="label">Preflight Verdict</div><div class="val" style="font-size:1.1rem">${verdictBadge}</div><div class="sub">Mirrors <code>layerstream-plugin check</code></div></div>
+        <div class="kpi"><div class="label">Pinned Layers (R)</div><div class="val">${Math.round(pinnedFrac * 100)}%</div><div class="sub">${streamedGib.toFixed(1)} GiB streamed per sweep</div></div>
+        <div class="kpi"><div class="label">Est. Cold Load</div><div class="val">${loadS.toFixed(1)} s</div><div class="sub">0 MB GPU/CUDA context while idle (v0.2.0 worker)</div></div>
+        <div class="kpi"><div class="label">Est. Decode Speed</div><div class="val" style="color:var(--accent-2)">${fitsResident ? "12–45+" : `${lowTps.toFixed(2)}–${highTps.toFixed(2)}`} tok/s</div><div class="sub">${arch === "dense_draft" ? "prose → code_edit range" : arch === "moe_cached" ? "warm TinyLFU cache range" : "1 tok/sweep floor"}</div></div>
+      `;
+      const vEl = document.getElementById("est-verdict");
+      vEl.className = calloutClass;
+      vEl.innerHTML = verdictMsg;
+    }
+
+    document.querySelectorAll("[data-preset]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const p = PRESETS[btn.dataset.preset];
+        document.getElementById("est-ram").value = p.ram;
+        document.getElementById("est-nvme").value = p.nvme;
+        document.getElementById("est-model").value = p.model;
+        document.getElementById("est-arch").value = p.arch;
+        updateEstimator();
+      });
+    });
+    ["est-ram", "est-nvme", "est-model", "est-arch"].forEach(id => {
+      document.getElementById(id).addEventListener("input", updateEstimator);
+    });
+
+    // Raw table filter
+    function populateRawFilters() {
+      const fill = (id, vals) => {
+        const sel = document.getElementById(id);
+        Array.from(new Set(vals.filter(Boolean))).sort().forEach(v => {
+          const opt = document.createElement("option");
+          opt.value = v; opt.textContent = v;
+          sel.appendChild(opt);
+        });
+      };
+      fill("raw-hardware", ALL_ROWS.map(r => r.hardware_id || r.hardware));
+      fill("raw-round", ALL_ROWS.map(r => r.round));
+      fill("raw-engine", ALL_ROWS.map(r => r.engine));
+      fill("raw-workload", ALL_ROWS.map(r => r.workload));
+    }
+
+    function renderRawTable() {
+      const hf = document.getElementById("raw-hardware").value;
+      const rf = document.getElementById("raw-round").value;
+      const ef = document.getElementById("raw-engine").value;
+      const wf = document.getElementById("raw-workload").value;
+      const filtered = ALL_ROWS.filter(r =>
+        (hf === "all" || (r.hardware_id || r.hardware) === hf) &&
+        (rf === "all" || r.round === rf) &&
+        (ef === "all" || r.engine === ef) &&
+        (wf === "all" || r.workload === wf)
+      );
+      document.getElementById("raw-count").textContent = filtered.length;
+      document.getElementById("raw-tbody").innerHTML = filtered.map(r => {
+        const st = r.status || "ok";
+        const stBadge = st === "ok" ? `<span class="badge b-ok">ok</span>` : `<span class="badge b-err">${st}</span>`;
+        const dec = r.workload === "multi_turn_prefix_reuse"
+          ? `${fmt(r.ttft_speedup_x, 2)}× TTFT`
+          : (r.decode_tok_per_s_min != null && r.decode_tok_per_s_min !== r.decode_tok_per_s_max
+              ? `${fmt(r.decode_tok_per_s, 3)} (${fmt(r.decode_tok_per_s_min, 2)}–${fmt(r.decode_tok_per_s_max, 2)})`
+              : fmt(r.decode_tok_per_s, 3));
+        const jStr = r.joules_per_tok != null
+          ? (r.net_joules_per_tok != null ? `${fmt(r.joules_per_tok, 1)} (${fmt(r.net_joules_per_tok, 1)})` : fmt(r.joules_per_tok, 1))
+          : "—";
+        const rStr = r.resident_layers != null ? `${r.resident_layers}/${r.n_layers || "?"}` : "—";
+        return `<tr>
+          <td>${r.round || "—"}</td>
+          <td>${r.engine || "—"}</td>
+          <td><code>${r.mode || "—"}</code></td>
+          <td>${r.model || "—"}</td>
+          <td>${r.workload || "—"}</td>
+          <td>${stBadge}</td>
+          <td class="num">${rStr}</td>
+          <td class="num">${fmt(r.load_time_s, 2)}</td>
+          <td class="num">${r.workload === "multi_turn_prefix_reuse" ? `${fmt(r.turn1_ttft_s, 1)}→${fmt(r.turn2_ttft_s, 1)}` : fmt(r.ttft_s, 2)}</td>
+          <td class="num">${dec}</td>
+          <td class="num">${fmt(r.pread_mib_s, 0)}</td>
+          <td class="num">${fmt(r.peak_rss_mib, 0)}</td>
+          <td class="num">${fmt(r.swap_delta_mib, 1)}</td>
+          <td class="num">${jStr}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    ["cmp-model", "cmp-workload", "cmp-metric"].forEach(id => document.getElementById(id).addEventListener("change", renderComparison));
+    ["raw-hardware", "raw-round", "raw-engine", "raw-workload"].forEach(id => document.getElementById(id).addEventListener("change", renderRawTable));
+
+    async function init() {
+      updateEstimator();
+      renderTuningCharts();
+      try {
+        let resp = await fetch("./benchmarks.json");
+        if (!resp.ok) resp = await fetch(HF_JSON_URL);
+        ALL_ROWS = await resp.json();
+        document.getElementById("data-status").textContent = `Loaded ${ALL_ROWS.length} verified benchmark records`;
+        for (const id of ["total-runs-pill", "total-runs-tab", "total-runs-raw"]) {
+          const el = document.getElementById(id);
+          if (el) el.textContent = ALL_ROWS.length;
+        }
+      } catch (err) {
+        document.getElementById("data-status").textContent = `Failed to load dataset: ${err}`;
+        return;
+      }
+      populateRawFilters();
+      renderComparison();
+      renderRawTable();
+    }
+    init();
+  </script>
+</body>
+</html>

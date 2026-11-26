@@ -1,0 +1,45 @@
+[workspace]
+
+[package]
+name = "layerstream-py"
+version = "0.6.1"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+description = "Native Python bindings for layerstream-core (out-of-core GGUF layer-streaming LLM engine)"
+repository = "https://github.com/kleinbem/layerstream-plugin"
+
+[lints.clippy]
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[lib]
+name = "_layerstream"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+vulkan = ["layerstream-core/vulkan"]
+cuda = ["layerstream-core/cuda"]
+metal = ["layerstream-core/metal"]
+dynamic-backends = [
+    "layerstream-core/dynamic-backends",
+    "layerstream-core/python-stage-backends",
+]
+
+[dependencies]
+anyhow = "1"
+layerstream-core = { path = "../../crates/layerstream-core", features = ["hf"] }
+layerstream-server = { path = "../../crates/layerstream-server" }
+parking_lot = "0.12"
+pyo3 = { version = "0.30", features = ["abi3-py315"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }

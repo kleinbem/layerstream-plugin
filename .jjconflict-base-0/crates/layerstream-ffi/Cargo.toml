@@ -1,0 +1,28 @@
+[package]
+name = "layerstream-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "C ABI shared/static library for layerstream (Go, C/C++, Swift, C#, Zig)"
+
+[lib]
+name = "layerstream_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+vulkan = ["layerstream-core/vulkan"]
+cuda = ["layerstream-core/cuda"]
+metal = ["layerstream-core/metal"]
+dynamic-backends = ["layerstream-core/dynamic-backends"]
+
+[dependencies]
+anyhow.workspace = true
+layerstream-core = { path = "../layerstream-core", features = ["hf"] }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
