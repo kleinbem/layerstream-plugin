@@ -311,13 +311,12 @@ fn main() {
         && !dynamic_backends
         && env::var("LAYERSTREAM_CPP_COVERAGE").ok().as_deref() != Some("1")
     {
-        // Emit per-function/data sections in static C/C++ libraries so `--gc-sections`
-        // can dead-strip unused llama.cpp/ggml symbols from the final binary.
+        // Emit per-function/data sections in static C/C++ libraries so the linker's default
+        // `--gc-sections` pass can dead-strip unused llama.cpp/ggml symbols from final binaries.
         cfg.cflag("-ffunction-sections")
             .cflag("-fdata-sections")
             .cxxflag("-ffunction-sections")
             .cxxflag("-fdata-sections");
-        println!("cargo:rustc-link-arg-bins=-Wl,--gc-sections");
     }
 
     let has_explicit_gen = env::var("CMAKE_GENERATOR")
