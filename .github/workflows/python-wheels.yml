@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
-          ref: 6d5f6487219ec7171a5558aa5d75b97c5720dad6
+          ref: 9c003a97ab34a69cc49243f9b02014038205ffae
           path: third_party/llama.cpp
 
       - name: Install Linux build dependencies
@@ -123,7 +123,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
-          ref: 6d5f6487219ec7171a5558aa5d75b97c5720dad6
+          ref: 9c003a97ab34a69cc49243f9b02014038205ffae
           path: third_party/llama.cpp
 
       - name: Install macOS build dependencies
