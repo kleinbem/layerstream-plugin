@@ -654,6 +654,75 @@ mod tests {
             .is_err()
         );
 
+        // End-to-end offline `run_recommend_command` (text + JSON) against a local mock HF server.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            // Handles 3 requests: JSON mode tree API, text mode tree API, text mode header peek (404).
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut req_line = String::new();
+                let _ = reader.read_line(&mut req_line);
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                if req_line.contains("/api/models/") {
+                    let body = r#"[{"type":"file","path":"demo-Q4_K_M.gguf","size":4294967296}]"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        });
+        let prev_ep = std::env::var_os("HF_ENDPOINT");
+        // SAFETY: test binary runs single-threaded for this scoped mock request.
+        unsafe { std::env::set_var("HF_ENDPOINT", format!("http://{addr}")) };
+        let json_out = run_recommend_command(
+            "org/demo",
+            Some("main"),
+            Some(8.0),
+            Some(2000.0),
+            false,
+            Some(dir.clone()),
+            true,
+        )
+        .expect("recommend json");
+        assert!(json_out.contains("demo-Q4_K_M.gguf"));
+        let text_out = run_recommend_command(
+            "org/demo",
+            Some("main"),
+            Some(8.0),
+            Some(2000.0),
+            true,
+            Some(dir.clone()),
+            false,
+        )
+        .expect("recommend text");
+        assert!(text_out.contains("Hardware profile: 8.0 GiB"));
+        assert!(text_out.contains("Recommended pull command:"));
+        match prev_ep {
+            Some(v) => {
+                // SAFETY: restores saved HF_ENDPOINT.
+                unsafe { std::env::set_var("HF_ENDPOINT", v) }
+            }
+            None => {
+                // SAFETY: removes test-only HF_ENDPOINT override.
+                unsafe { std::env::remove_var("HF_ENDPOINT") }
+            }
+        }
+        server.join().expect("join mock server");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

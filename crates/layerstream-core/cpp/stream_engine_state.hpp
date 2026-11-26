@@ -1075,13 +1075,11 @@ struct ls_engine {
             {
                 std::lock_guard<std::mutex> wlk(worker_mu);
                 std::lock_guard<std::mutex> slk(slot_mu);
-                if (slot_loaded_layer[slot] != layer_idx) {
-                    for (int s = 0; s < 2; ++s) {
-                        if (slot_needs_h2d[s]) {
-                            slot_loaded_layer[s] = -1;
-                            slot_needs_h2d[s] = false;
-                            woke = true;
-                        }
+                for (int s = 0; slot_loaded_layer[slot] != layer_idx && s < 2; ++s) {
+                    if (slot_needs_h2d[s]) {
+                        slot_loaded_layer[s] = -1;
+                        slot_needs_h2d[s] = false;
+                        woke = true;
                     }
                 }
             }
