@@ -320,7 +320,7 @@ fn main() {
     let mut cc_build = cc::Build::new();
     cc_build
         .cpp(true)
-        .std("c++20")
+        .std("c++23")
         .file("cpp/backend_loader.cpp")
         .file("cpp/stream_engine.cpp")
         .include("cpp")

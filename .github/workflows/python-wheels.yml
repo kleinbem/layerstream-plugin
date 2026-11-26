@@ -102,7 +102,7 @@ jobs:
             manylinux: "2_34"
             vulkan_sdk: "/opt/vk"
             args: "--auditwheel skip --locked --release --out dist --features vulkan,dynamic-backends"
-          - os: macos-15
+          - os: macos-latest
             target: aarch64-apple-darwin
             container: ""
             manylinux: ""

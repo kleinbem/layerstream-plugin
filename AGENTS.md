@@ -18,7 +18,7 @@ Out-of-core GGUF layer-streaming LLM inference engine, Axum OpenAI HTTP/SSE serv
 
 ## Conventions & Floors
 
-- **Newest-only stack:** Rust Edition 2024 (`rust-version = "1.89"`), C++20, Python `>=3.15` (`abi3-py315`, `pathlib`, `pyright strict`, Ruff), Linux `manylinux_2_34` (`glibc >= 2.34`), CUDA `13.5+` (`driver >= 595`, `sm_80+`), macOS `15.0+` Apple Silicon only, Node.js `>=24` (pure ESM).
+- **Newest-only stack:** Rust Edition 2024 (`rust-version = "1.99"`), C++23, Python `>=3.15` (`abi3-py315`, `pathlib`, `pyright strict`, Ruff), Linux `manylinux_2_34` (`glibc >= 2.34`), CUDA `13.5+` (`driver >= 595`, `sm_80+`), macOS `15.0+` Apple Silicon only, Node.js `>=26` (pure ESM).
 - **Zero-patch `llama.cpp`:** Never fork or patch `llama.cpp` directly. Keep all integration inside `crates/layerstream-core/cpp/` (isolating internal `llama-model.h` access in `llama_compat.hpp`), track upstream PRs/issues in `docs/UPSTREAM_LLAMA_CPP.md`, and keep `flake.nix` and `.github/workflows/*.yml` pinned to the same `llama.cpp` `master` commit SHA.
 - **Rust safety & lints:** Enforced via `[workspace.lints.clippy]` (`unwrap_used`, `undocumented_unsafe_blocks`, `dbg_macro`, `todo`) with `-D warnings` — no `.unwrap()` in production code and every `unsafe` block/impl requires a `// SAFETY:` comment.
 - **7 synced version manifests:** `Cargo.toml`, `plugin.toml`, `bindings/python/Cargo.toml`, `bindings/python/pyproject.toml`, `bindings/python-cuda13/pyproject.toml`, `bindings/node/Cargo.toml`, and `bindings/node/package.json` must match (`cargo xtask check-versions` / `cargo xtask bump X.Y.Z`).

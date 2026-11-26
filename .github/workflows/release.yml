@@ -23,7 +23,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             features: "--features vulkan,dynamic-backends"
             archive: tar.gz
-          - os: macos-15
+          - os: macos-latest
             target: aarch64-apple-darwin
             features: "--features metal"
             archive: tar.gz
@@ -175,7 +175,7 @@ jobs:
             manylinux: "2_34"
             vulkan_sdk: "/opt/vk"
             args: "--auditwheel skip --locked --release --out dist --features vulkan,dynamic-backends"
-          - os: macos-15
+          - os: macos-latest
             target: aarch64-apple-darwin
             container: ""
             manylinux: ""
@@ -373,7 +373,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             napi_triple: linux-arm64-gnu
             features: ""
-          - os: macos-15
+          - os: macos-latest
             target: aarch64-apple-darwin
             napi_triple: darwin-arm64
             features: "metal"
@@ -403,7 +403,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24"
+          node-version: "26"
 
       - name: Build native Node addon, run smoke tests, and record SHA-256
         working-directory: bindings/node
@@ -565,7 +565,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: vars.NPM_PUBLISH == 'true'
         with:
-          node-version: "24"
+          node-version: "26"
           registry-url: "https://registry.npmjs.org"
 
       - name: Stage native addons and verify npm tarball
