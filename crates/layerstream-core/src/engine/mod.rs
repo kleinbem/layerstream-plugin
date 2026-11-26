@@ -1835,5 +1835,11 @@ mod mtp_guard_tests {
         assert_eq!(effective_mtp_draft_cap(4, 16, 95, 5), 4); // >= 90% hot cache -> full speed
         assert_eq!(effective_mtp_draft_cap(4, 16, 80, 20), 1); // 80% mid-band -> cap to 1
         assert_eq!(effective_mtp_draft_cap(4, 16, 20, 80), 2); // 20% low-band -> cap to 2
+
+        let cfg = EngineConfig::streaming("demo.gguf");
+        assert!(cfg.io_threads.is_none());
+        assert!(cfg.expert_cache_bytes.is_none());
+        let ref_cfg = EngineConfig::reference("demo.gguf");
+        assert!(ref_cfg.full_resident_reference);
     }
 }
