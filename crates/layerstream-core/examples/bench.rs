@@ -589,6 +589,18 @@ fn main() -> Result<()> {
         } else {
             None
         };
+        let draft_acceptance_rate = if last.drafted_tokens > 0 {
+            Some(round3(
+                last.accepted_tokens as f64 / last.drafted_tokens as f64,
+            ))
+        } else {
+            None
+        };
+        let tokens_per_sweep = if last.sweeps > 0 {
+            Some(round3(last.completion_tokens as f64 / last.sweeps as f64))
+        } else {
+            None
+        };
 
         let record = serde_json::json!({
             "engine": "layerstream-plugin",
@@ -628,6 +640,8 @@ fn main() -> Result<()> {
             "sweeps": last.sweeps,
             "drafted_tokens": last.drafted_tokens,
             "accepted_tokens": last.accepted_tokens,
+            "draft_acceptance_rate": draft_acceptance_rate,
+            "tokens_per_sweep": tokens_per_sweep,
             "io_mib_read": round2(last.io_mib_read),
             "pread_mib_s": round1(med_pread_mib_s),
             "effective_io_mib_s": round1(med_eff_io_mib_s),
@@ -665,7 +679,10 @@ fn main() -> Result<()> {
             "uma_zero_copy": stats.is_uma_zero_copy,
             "is_unified_memory": stats.is_unified_memory,
             "using_gpu": stats.using_gpu,
+            "backend_name": stats.backend_name_str(),
             "can_speculate": stats.can_speculate,
+            "mtp_layers": stats.mtp_layers,
+            "rs_rollback_max": stats.rs_rollback_max,
             "output_preview": last.output_preview,
         });
         results.push(record);
