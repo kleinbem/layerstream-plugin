@@ -127,6 +127,8 @@ typedef struct ls_engine_stats {
     bool is_unified_memory;
     bool using_gpu;
     bool can_speculate;
+    /** Recurrent-state rollback window from llama_n_rs_seq() (0 on standard Transformers). */
+    uint32_t rs_rollback_max;
     char backend_name[32];
 } ls_engine_stats;
 

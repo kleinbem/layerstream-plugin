@@ -105,6 +105,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         cparams.n_ctx = n_ctx;
         cparams.n_batch = n_batch;
         cparams.n_ubatch = n_batch;
+        cparams.n_rs_seq = 16;
         cparams.n_threads = static_cast<int32_t>(n_threads);
         cparams.n_threads_batch = static_cast<int32_t>(n_threads);
         if (!cfg->use_gpu) {
@@ -134,7 +135,10 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
             return nullptr;
         }
         llama_memory_t mem = llama_get_memory(eng->ctx);
-        eng->can_speculate = mem != nullptr && llama_memory_can_shift(mem) && llama_memory_seq_rm(mem, 0, 1, -1);
+        eng->rs_rollback_max = llama_n_rs_seq(eng->ctx);
+        const bool can_kv_trim =
+            mem != nullptr && llama_memory_can_shift(mem) && llama_memory_seq_rm(mem, 0, 1, -1);
+        eng->can_speculate = can_kv_trim || eng->rs_rollback_max > 0;
         return eng;
     }
 
@@ -845,6 +849,7 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     cparams.n_ctx = n_ctx;
     cparams.n_batch = n_batch;
     cparams.n_ubatch = n_batch;
+    cparams.n_rs_seq = 16;
     cparams.n_threads = static_cast<int32_t>(n_threads);
     cparams.n_threads_batch = static_cast<int32_t>(n_threads);
     if (!eng->using_gpu) {
@@ -879,7 +884,10 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     }
 
     llama_memory_t mem = llama_get_memory(eng->ctx);
-    eng->can_speculate = mem != nullptr && llama_memory_can_shift(mem) && llama_memory_seq_rm(mem, 0, 1, -1);
+    eng->rs_rollback_max = llama_n_rs_seq(eng->ctx);
+    const bool can_kv_trim =
+        mem != nullptr && llama_memory_can_shift(mem) && llama_memory_seq_rm(mem, 0, 1, -1);
+    eng->can_speculate = can_kv_trim || eng->rs_rollback_max > 0;
     return eng;
 }
 
@@ -1001,6 +1009,7 @@ void ls_engine_get_stats(const ls_engine * eng, ls_engine_stats * out) {
     out->is_unified_memory = eng->is_unified_memory;
     out->using_gpu = eng->using_gpu;
     out->can_speculate = eng->can_speculate;
+    out->rs_rollback_max = eng->rs_rollback_max;
     std::memset(out->backend_name, 0, sizeof(out->backend_name));
     const size_t bn_len = std::min(sizeof(out->backend_name) - 1, eng->backend_name.size());
     std::memcpy(out->backend_name, eng->backend_name.data(), bn_len);

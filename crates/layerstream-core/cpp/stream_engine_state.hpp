@@ -158,6 +158,7 @@ struct ls_engine {
     bool is_unified_memory = true;
     bool is_cuda_backend = false;
     bool can_speculate = false;
+    uint32_t rs_rollback_max = 0;
     bool head_streamed = false;
     bool moe_active_streaming = false;
     std::string backend_name = "CPU";

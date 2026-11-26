@@ -99,6 +99,7 @@ pub struct LsEngineStats {
     pub is_unified_memory: bool,
     pub using_gpu: bool,
     pub can_speculate: bool,
+    pub rs_rollback_max: u32,
     pub backend_name: [c_char; 32],
 }
 
