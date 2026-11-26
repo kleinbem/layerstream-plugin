@@ -221,15 +221,40 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Pure-Rust crate coverage (json-schema-gbnf, gguf-direct-io, hf-gguf)
+      - name: Pure-Rust crate coverage (json-schema-gbnf, gguf-direct-io, hf-gguf; per-crate gates)
         run: |
           set -o pipefail
           {
             echo "### Rust Bundle A Coverage (pure-Rust crates)"
             echo '```'
-            cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --summary-only --show-missing-lines --fail-under-lines 90 -- --test-threads 1 | tee /dev/stderr
+            cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --summary-only --show-missing-lines --fail-under-lines 90.7 -- --test-threads 1 | tee /tmp/cov_a.txt /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import re, sys
+          gates = {
+              "gguf-direct-io": 91.4,
+              "hf-gguf": 87.9,
+              "json-schema-gbnf": 92.8,
+          }
+          totals = {k: [0, 0] for k in gates}
+          pat = re.compile(r"^([a-z0-9_-]+)/src/\S+\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+\d+\s+[\d.]+%\s+(\d+)\s+(\d+)\s+")
+          for line in open("/tmp/cov_a.txt"):
+              m = pat.match(line.strip())
+              if m and m.group(1) in totals:
+                  lines_total, lines_missed = int(m.group(2)), int(m.group(3))
+                  totals[m.group(1)][0] += lines_total - lines_missed
+                  totals[m.group(1)][1] += lines_total
+          failures = []
+          for crate, gate in gates.items():
+              hit, total = totals[crate]
+              pct = 100.0 * hit / total if total else 0.0
+              print(f"Per-crate gate {crate:20s}: {hit:4d}/{total:4d} ({pct:5.2f}%) >= {gate:.1f}%")
+              if pct < gate:
+                  failures.append(f"{crate} {pct:.2f}% < {gate:.1f}%")
+          if failures:
+              sys.exit("Per-crate coverage gate failed: " + ", ".join(failures))
+          PY
 
   coverage-cpp:
     runs-on: ubuntu-latest
@@ -250,7 +275,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
-      - name: C++ gcov coverage (crates/layerstream-core/cpp/, gate >= 65%)
+      - name: C++ gcov coverage (crates/layerstream-core/cpp/, per-file + total >= 67.9%)
         env:
           LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
           LAYERSTREAM_CPP_COVERAGE: "1"
@@ -272,20 +297,34 @@ jobs:
                   for l in f["lines"]:
                       n = l["line_number"]
                       rec[n] = max(rec.get(n, 0), l["count"])
-          print("### C++ Coverage (`crates/layerstream-core/cpp/`, gate >= 65%)")
+          file_gates = {
+              "cpp/backend_loader.cpp": 58.9,
+              "cpp/llama_compat.hpp": 100.0,
+              "cpp/stream_engine.cpp": 68.8,
+              "cpp/stream_engine_state.hpp": 66.7,
+          }
+          print("### C++ Coverage (`crates/layerstream-core/cpp/`, per-file + total >= 67.9%)")
           print("```")
           th = ta = 0
+          failures = []
           for k, m in sorted(by_file.items()):
               h = sum(c > 0 for c in m.values())
               a = len(m)
               th += h
               ta += a
-              print(f"{k:32s} {h:4d}/{a:4d} ({100*h/a:5.2f}%)")
+              fpct = 100.0 * h / a if a else 0.0
+              gate = file_gates.get(k)
+              suffix = f" (gate >= {gate:.1f}%)" if gate is not None else ""
+              print(f"{k:32s} {h:4d}/{a:4d} ({fpct:5.2f}%){suffix}")
+              if gate is not None and fpct < gate:
+                  failures.append(f"{k} {fpct:.2f}% < {gate:.1f}%")
           pct = 100.0 * th / ta if ta else 0.0
-          print(f"TOTAL                            {th:4d}/{ta:4d} ({pct:5.2f}%)")
+          print(f"TOTAL                            {th:4d}/{ta:4d} ({pct:5.2f}%) (gate >= 67.9%)")
           print("```")
-          if pct < 65.0:
-              sys.exit(f"C++ coverage {pct:.2f}% is below gate 65.00%")
+          if pct < 67.9:
+              failures.append(f"TOTAL {pct:.2f}% < 67.9%")
+          if failures:
+              sys.exit("C++ coverage gate failed: " + ", ".join(failures))
           PY
 
   coverage-rust-core:
@@ -313,7 +352,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Rust Bundle B coverage (layerstream-core, server, ffi, plugin; gate >= 82%)
+      - name: Rust Bundle B coverage (layerstream-core, server, ffi, plugin; per-crate gates)
         env:
           LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
         run: |
@@ -321,6 +360,32 @@ jobs:
           {
             echo "### Rust Bundle B Coverage (core, server, ffi, plugin)"
             echo '```'
-            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 82 -- --test-threads 1 | tee /dev/stderr
+            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 83.8 -- --test-threads 1 | tee /tmp/cov_b.txt /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import re, sys
+          gates = {
+              "layerstream-core": 83.1,
+              "layerstream-ffi": 90.4,
+              "layerstream-plugin": 83.9,
+              "layerstream-server": 84.1,
+          }
+          totals = {k: [0, 0] for k in gates}
+          pat = re.compile(r"^([a-z0-9_-]+)/src/\S+\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+\d+\s+[\d.]+%\s+(\d+)\s+(\d+)\s+")
+          for line in open("/tmp/cov_b.txt"):
+              m = pat.match(line.strip())
+              if m and m.group(1) in totals:
+                  lines_total, lines_missed = int(m.group(2)), int(m.group(3))
+                  totals[m.group(1)][0] += lines_total - lines_missed
+                  totals[m.group(1)][1] += lines_total
+          failures = []
+          for crate, gate in gates.items():
+              hit, total = totals[crate]
+              pct = 100.0 * hit / total if total else 0.0
+              print(f"Per-crate gate {crate:20s}: {hit:4d}/{total:4d} ({pct:5.2f}%) >= {gate:.1f}%")
+              if pct < gate:
+                  failures.append(f"{crate} {pct:.2f}% < {gate:.1f}%")
+          if failures:
+              sys.exit("Per-crate coverage gate failed: " + ", ".join(failures))
+          PY

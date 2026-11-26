@@ -93,6 +93,30 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Benchmark local storage & I/O scheduling knobs (quality-preserving) and persist the best profile.
+    Tune {
+        /// Optional local `.gguf` model file to sweep against (defaults to a temporary 32 MiB probe file in --cache-dir).
+        #[arg(long)]
+        model: Option<std::path::PathBuf>,
+        /// Probe directory used when --model is omitted.
+        #[arg(long, env = "LAYERSTREAM_CACHE_DIR")]
+        cache_dir: Option<std::path::PathBuf>,
+        /// Hardware/OS profile override: auto, edge, balanced, or performance.
+        #[arg(long, env = "LAYERSTREAM_HARDWARE_PROFILE", default_value = "auto")]
+        profile: String,
+        /// Directory where tuned profiles are persisted (defaults to `$XDG_CONFIG_HOME/layerstream/tuning`).
+        #[arg(long)]
+        tuning_dir: Option<std::path::PathBuf>,
+        /// Do not persist the tuned profile to disk.
+        #[arg(long, default_value_t = false)]
+        no_save: bool,
+        /// Disable GPU probing during tuning.
+        #[arg(long, default_value_t = false)]
+        no_gpu: bool,
+        /// Emit machine-readable JSON output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Internal on-demand isolated GPU worker subprocess (spawned automatically by parent coordinator).
     #[command(name = "_worker", hide = true)]
     Worker,
@@ -250,6 +274,48 @@ fn run_check_command(engine: EngineArgs) -> Result<()> {
     run_preflight_checks(&server_cfg.registry, use_gpu, allow_slow, true)
 }
 
+fn run_tune_command(
+    model: Option<std::path::PathBuf>,
+    cache_dir: Option<std::path::PathBuf>,
+    profile_arg: &str,
+    tuning_dir: Option<std::path::PathBuf>,
+    no_save: bool,
+    no_gpu: bool,
+    json: bool,
+) -> Result<String> {
+    let profile_override: layerstream_core::ProfileOverride = profile_arg
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --profile: {e}"))?;
+    let probe_dir = cache_dir.unwrap_or_else(hf::default_cache_dir);
+    let probe_path = model.as_deref().unwrap_or(probe_dir.as_path());
+    let hw_profile =
+        layerstream_core::HardwareProfile::detect(probe_path, !no_gpu, false, profile_override);
+
+    let tuned = if let Some(ref model_path) = model {
+        layerstream_core::run_storage_sweep(model_path, &hw_profile)?
+    } else {
+        layerstream_core::run_dir_storage_sweep(&probe_dir, &hw_profile)?
+    };
+
+    let saved_path = if no_save {
+        None
+    } else {
+        let dir = tuning_dir.unwrap_or_else(layerstream_core::default_tuning_dir);
+        Some(tuned.save(&dir)?)
+    };
+
+    let output = if json {
+        serde_json::to_string_pretty(&tuned)?
+    } else {
+        tuned.format_report(saved_path.as_deref())
+    };
+    print!("{output}");
+    if json {
+        println!();
+    }
+    Ok(output)
+}
+
 fn validate_api_key(api_key: Option<&str>) -> Result<()> {
     if let Some(k) = api_key
         && k.trim().is_empty()
@@ -307,6 +373,22 @@ fn main() -> Result<()> {
 
     if let Some(Command::Check { engine }) = cli.command {
         run_check_command(engine)?;
+        return Ok(());
+    }
+
+    if let Some(Command::Tune {
+        model,
+        cache_dir,
+        profile,
+        tuning_dir,
+        no_save,
+        no_gpu,
+        json,
+    }) = cli.command
+    {
+        let _ = run_tune_command(
+            model, cache_dir, &profile, tuning_dir, no_save, no_gpu, json,
+        )?;
         return Ok(());
     }
 
@@ -378,7 +460,8 @@ fn main() -> Result<()> {
                 Command::Pull { .. }
                 | Command::Inspect { .. }
                 | Command::Check { .. }
-                | Command::Recommend { .. },
+                | Command::Recommend { .. }
+                | Command::Tune { .. },
             ) => {
                 unreachable!()
             }
@@ -551,6 +634,40 @@ mod tests {
                 false
             )
             .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tune_command_sweeps_local_file_formats_text_and_json_and_saves() {
+        let dir = std::env::temp_dir().join(format!("ls-tune-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let probe = dir.join("probe.gguf");
+        std::fs::write(&probe, vec![0x42u8; 4 * 1024 * 1024]).expect("write 4 MiB probe");
+        let tune_dir = dir.join("tuning");
+
+        let text = run_tune_command(
+            Some(probe.clone()),
+            None,
+            "auto",
+            Some(tune_dir.clone()),
+            false,
+            true,
+            false,
+        )
+        .expect("tune text + save");
+        assert!(text.contains("Hardware profile:"));
+        assert!(text.contains("Saved tuned profile:"));
+
+        let json = run_tune_command(Some(probe), None, "edge", None, true, true, true)
+            .expect("tune json + no_save");
+        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"best_n_batch\": 256"));
+
+        assert!(
+            run_tune_command(None, Some(dir.clone()), "bogus", None, true, true, false).is_err()
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -219,13 +219,27 @@ impl EngineArgs {
             .map(|m| m.path.as_path())
             .unwrap_or(cache_root.as_path());
         let hw_profile = HardwareProfile::detect(probe_path, use_gpu, false, effective_override);
+        let fp = layerstream_core::hardware_fingerprint(&hw_profile);
+        let saved_tuning =
+            layerstream_core::TunedProfile::load(&layerstream_core::default_tuning_dir(), &fp)
+                .ok()
+                .flatten();
+        let prefer_direct_io = saved_tuning
+            .as_ref()
+            .map(|t| t.best_prefer_direct_io)
+            .unwrap_or(true);
         let n_batch = self.batch_size.unwrap_or(hw_profile.recommended_n_batch);
         let cpu_embeddings = self.low_vram || hw_profile.recommended_cpu_embeddings;
         let stream_head = self.low_vram || hw_profile.recommended_stream_head;
         tracing::info!(
             profile = %hw_profile.label(),
             n_batch,
-            recommended_io_threads = hw_profile.recommended_io_threads,
+            recommended_io_threads = saved_tuning
+                .as_ref()
+                .map(|t| t.best_io_threads)
+                .unwrap_or(hw_profile.recommended_io_threads),
+            prefer_direct_io,
+            tuned_profile_loaded = saved_tuning.is_some(),
             cpu_embeddings,
             stream_head,
             "resolved hardware/OS capability profile"
@@ -242,7 +256,7 @@ impl EngineArgs {
                 vram_budget_auto,
                 kv_cache_type,
                 use_gpu,
-                prefer_direct_io: true,
+                prefer_direct_io,
                 cpu_embeddings,
                 cpu_head: false,
                 stream_head,
