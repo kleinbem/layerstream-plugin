@@ -84,9 +84,10 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
         if (!cfg->use_gpu && g_cpu_only_devs[0] != nullptr) {
             mparams.devices = g_cpu_only_devs;
         } else if (cfg->use_gpu && ref_gpu_dev != nullptr) {
+            // Pass only the GPU device: llama.cpp automatically adds CPU as a fallback
+            // and treats every entry in mparams.devices as a layer-split compute target.
             active_devs[0] = ref_gpu_dev;
-            active_devs[1] = g_cpu_only_devs[0];
-            active_devs[2] = nullptr;
+            active_devs[1] = nullptr;
             mparams.devices = active_devs;
         }
 
@@ -187,9 +188,10 @@ ls_engine * ls_engine_create(const ls_engine_config * cfg, char * err_buf, size_
     if (!eng->using_gpu && g_cpu_only_devs[0] != nullptr) {
         mparams.devices = g_cpu_only_devs;
     } else if (eng->using_gpu && chosen_gpu_dev != nullptr) {
+        // Pass only the GPU device: llama.cpp automatically adds CPU as a fallback
+        // and treats every entry in mparams.devices as a layer-split compute target.
         active_devs[0] = chosen_gpu_dev;
-        active_devs[1] = g_cpu_only_devs[0];
-        active_devs[2] = nullptr;
+        active_devs[1] = nullptr;
         mparams.devices = active_devs;
     }
 
