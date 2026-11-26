@@ -564,6 +564,65 @@ fn sdk_pull_model_recommend_repo_and_worker_spawn_edges() {
     .unwrap();
     assert!(p3.is_file());
 
+    // 5. pull_model invalid non-hf, non-slash spec hits fallback error branch
+    assert!(
+        pull_model(
+            "invalid-spec-no-slash",
+            Some(cache_dir.path().to_path_buf()),
+            None,
+            None,
+            None,
+        )
+        .is_err()
+    );
+
+    // 6. recommend_repo with default RAM fallback & live dir storage probe (free_ram_gb=None, nvme_mib_s=None)
+    let (resolved_repo2, recs2) = recommend_repo(
+        "org/demo",
+        RecommendOptions {
+            free_ram_gb: None,
+            nvme_mib_s: None,
+            cache_dir: Some(cache_dir.path().to_path_buf()),
+            use_gpu: false,
+            ..RecommendOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(resolved_repo2, "org/demo-GGUF");
+    assert_eq!(recs2.len(), 1);
+
+    // 7. check_model & LoadedSession::open with draft_model="auto" on local GGUF + default ctx/batch
+    let local_gguf = write_tiny_llama_gguf(64, false);
+    let local_str = local_gguf.path().to_string_lossy().into_owned();
+    let auto_check = check_model(
+        &local_str,
+        CheckOptions {
+            draft_model: Some("auto".to_string()),
+            cache_dir: Some(cache_dir.path().to_path_buf()),
+            use_gpu: false,
+            allow_slow: true,
+            ..CheckOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(auto_check.ok);
+    assert!(auto_check.draft_model_path.is_none());
+
+    let auto_sess = LoadedSession::open(
+        &local_str,
+        OpenSessionOptions {
+            draft_model: Some("auto".to_string()),
+            cache_dir: Some(cache_dir.path().to_path_buf()),
+            ctx_size: 0,
+            batch_size: 0,
+            use_gpu: false,
+            ..OpenSessionOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(auto_sess.draft.is_none());
+    assert_eq!(auto_sess.stats_snapshot().n_layers, 2);
+
     // Restore HF_ENDPOINT
     // SAFETY: test runs with `--test-threads 1`.
     unsafe {
