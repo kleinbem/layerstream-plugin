@@ -634,3 +634,82 @@ fn sdk_pull_model_recommend_repo_and_worker_spawn_edges() {
     }
     drop(srv);
 }
+
+#[cfg(all(unix, feature = "hf"))]
+#[test]
+fn worker_ipc_subprocess_child_entry() {
+    let Ok(port_str) = std::env::var("LAYERSTREAM_TEST_WORKER_PORT") else {
+        return;
+    };
+    let port: u16 = port_str.parse().expect("valid worker port");
+    layerstream_core::worker_ipc::run_worker_server(port).expect("run_worker_server");
+}
+
+#[cfg(all(unix, feature = "hf"))]
+#[test]
+fn worker_ipc_subprocess_spawn_handshake_generate_and_unload() {
+    use layerstream_core::worker_ipc::{WorkerClient, WorkerGenParams, WorkerOpenParams};
+
+    let gguf = write_tiny_llama_gguf(64, false);
+    let exe = std::env::current_exe().expect("current_exe");
+    let exe_str = exe.to_string_lossy().into_owned();
+    let spawn_args = vec![
+        "-c".to_string(),
+        "LAYERSTREAM_TEST_WORKER_PORT=$3 exec \"$1\" --exact worker_ipc_subprocess_child_entry --nocapture"
+            .to_string(),
+        "_".to_string(),
+        exe_str.clone(),
+    ];
+
+    // 1. Happy path: spawn real subprocess, perform token handshake, open model, generate, unload.
+    let open: WorkerOpenParams = serde_json::from_value(serde_json::json!({
+        "model": gguf.path().to_string_lossy(),
+        "ctx_size": 128,
+        "batch_size": 32,
+        "threads": 2,
+        "use_gpu": false,
+        "prefer_direct_io": false
+    }))
+    .expect("open params");
+    let client = WorkerClient::spawn("/bin/sh", &spawn_args, open, None).expect("spawn worker");
+    assert!(client.is_loaded());
+    assert!(client.worker_pid().is_some());
+    assert!(client.model_path().is_some());
+    let stats = client.stats().expect("stats");
+    assert_eq!(stats.n_layers, 2);
+
+    let (out, _sum) = client
+        .generate(
+            "a",
+            &WorkerGenParams {
+                max_tokens: 2,
+                temperature: 0.0,
+                seed: 42,
+                ..WorkerGenParams::default()
+            },
+        )
+        .expect("generate");
+    assert!(!out.is_empty());
+    assert!(client.last_summary().is_some());
+
+    client.unload();
+    assert!(!client.is_loaded());
+    assert!(client.worker_pid().is_none());
+    assert!(client.model_path().is_none());
+    assert!(client.stats().is_err());
+
+    // 2. Early child exit during startup fails cleanly.
+    let early_exit_args = vec!["-c".to_string(), "exit 1".to_string(), "_".to_string()];
+    let dummy_open: WorkerOpenParams =
+        serde_json::from_value(serde_json::json!({"model": "unused", "use_gpu": false}))
+            .expect("dummy open");
+    assert!(WorkerClient::spawn("/bin/sh", &early_exit_args, dummy_open, None).is_err());
+
+    // 3. Handshake succeeds but `open` fails on missing model -> cleans up child & returns Err.
+    let bad_open: WorkerOpenParams = serde_json::from_value(serde_json::json!({
+        "model": "/nonexistent/layerstream_missing_model.gguf",
+        "use_gpu": false
+    }))
+    .expect("bad open");
+    assert!(WorkerClient::spawn("/bin/sh", &spawn_args, bad_open, None).is_err());
+}

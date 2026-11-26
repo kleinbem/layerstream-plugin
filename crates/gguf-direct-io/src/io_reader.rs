@@ -878,8 +878,8 @@ impl LayerIoPool {
             }
         }
 
-        // Resolve each request's tensor location once so expert cache lookup and span planning
-        // share the same `ResolvedTensorLoc` without double-hashing tensor names.
+        // Resolve each request's tensor location once and validate slice bounds before cache lookup
+        // so out-of-bounds requests always fail closed even if a matching file offset is cached.
         let mut resolved_reqs: Vec<(ResolvedTensorLoc, u64, usize, usize, u32)> =
             Vec::with_capacity(requests.len());
         for &(name, src_off, dst_off, len, tidx) in requests {
@@ -889,6 +889,30 @@ impl LayerIoPool {
                 .get(name)
                 .ok_or_else(|| GgufIoError::MissingTensor(name.to_string()))?
                 .resolved();
+            let rel_end = src_off.checked_add(len as u64).ok_or_else(|| {
+                GgufIoError::OutOfBounds(format!(
+                    "slice offset overflow for tensor '{name}' ({src_off} + {len})"
+                ))
+            })?;
+            if let Some(tensor_bytes) = loc.encoded_byte_len
+                && rel_end > tensor_bytes
+            {
+                return Err(GgufIoError::OutOfBounds(format!(
+                    "slice [{src_off}..{rel_end}) exceeds tensor '{name}' byte length {tensor_bytes}"
+                )));
+            }
+            let abs_end = loc.abs_offset.checked_add(rel_end).ok_or_else(|| {
+                GgufIoError::OutOfBounds(format!(
+                    "absolute slice offset overflow for tensor '{name}'"
+                ))
+            })?;
+            let shard_size = self.index.shard_sizes[loc.shard_idx];
+            if abs_end > shard_size {
+                return Err(GgufIoError::OutOfBounds(format!(
+                    "slice end {abs_end} exceeds shard {} size {shard_size}",
+                    loc.shard_idx
+                )));
+            }
             resolved_reqs.push((loc, src_off, dst_off, len, tidx));
         }
 
@@ -1570,9 +1594,27 @@ pub fn probe_dir_storage_mib_per_s(dir: &std::path::Path) -> Option<f64> {
         }
     }
 
-    let tmp_path = dir.join(format!(".layerstream-probe-{}.tmp", std::process::id()));
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let mut created: Option<(std::path::PathBuf, File)> = None;
+    for _ in 0..32 {
+        let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(".layerstream-probe-{pid}-{seq}.tmp"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                created = Some((candidate, f));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    let (tmp_path, mut f) = created?;
     let _cleanup = TempCleanup(tmp_path.clone());
-    let mut f = File::create(&tmp_path).ok()?;
     let chunk = vec![0xA5u8; 1024 * 1024];
     use std::io::Write;
     for _ in 0..16 {

@@ -32,7 +32,7 @@ pub(crate) struct UringReadOp {
 }
 
 pub(crate) struct UringReader {
-    ring: IoUring,
+    ring: Option<IoUring>,
 }
 
 // SAFETY: `UringReader` is always accessed behind `parking_lot::Mutex` inside `LayerIoPool`,
@@ -56,7 +56,7 @@ impl UringReader {
                     entries = URING_ENTRIES,
                     "enabled Linux io_uring batched reader"
                 );
-                Some(Self { ring })
+                Some(Self { ring: Some(ring) })
             }
             Err(err) => {
                 // coverage: only hit on kernels < 5.1 or seccomp sandboxes denying io_uring_setup.
@@ -102,6 +102,15 @@ impl UringReader {
         self.read_batch(&ops).is_ok()
     }
 
+    fn ring_mut(&mut self) -> Result<&mut IoUring> {
+        self.ring.as_mut().ok_or_else(|| {
+            GgufIoError::io(
+                "io_uring disabled after previous submission error",
+                std::io::Error::other("io_uring poisoned"),
+            )
+        })
+    }
+
     /// Submits a batch of disjoint read operations and reaps all completions,
     /// transparently retrying any short reads (or `EINTR` / `EAGAIN`).
     /// Returns total bytes read across all operations.
@@ -109,6 +118,7 @@ impl UringReader {
         if ops.is_empty() {
             return Ok(0);
         }
+        let _ = self.ring_mut()?;
 
         struct Pending {
             fd: RawFd,
@@ -150,10 +160,11 @@ impl UringReader {
                     .offset(st.offset)
                     .build()
                     .user_data(idx as u64);
+                let ring = self.ring_mut()?;
                 // SAFETY: Every `Pending` buffer pointer remains valid and disjoint until
-                // `submit_and_wait(submitted)` reaps its corresponding CQE below.
+                // `submit_and_wait(submitted)` reaps its corresponding CQE (or drops the ring on error).
                 unsafe {
-                    if self.ring.submission().push(&sqe).is_err() {
+                    if ring.submission().push(&sqe).is_err() {
                         // coverage: batch size is bounded by `URING_ENTRIES`, so SQ never overflows.
                         queue.push(idx);
                         break;
@@ -167,10 +178,13 @@ impl UringReader {
             }
 
             loop {
-                match self.ring.submit_and_wait(submitted) {
+                match self.ring_mut()?.submit_and_wait(submitted) {
                     Ok(_) => break,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => {
+                        // Drop the ring immediately so the kernel cancels any in-flight SQEs
+                        // before caller buffers are dropped or reused; future reads fall back to pread.
+                        self.ring = None;
                         return Err(GgufIoError::io("io_uring submit_and_wait failed", e));
                     }
                 }
@@ -178,7 +192,7 @@ impl UringReader {
 
             let mut reaped = 0usize;
             while reaped < submitted {
-                let mut cq = self.ring.completion();
+                let mut cq = self.ring_mut()?.completion();
                 for cqe in &mut cq {
                     reaped += 1;
                     let idx = cqe.user_data() as usize;
@@ -223,9 +237,16 @@ impl UringReader {
                     }
                 }
                 drop(cq);
-                if reaped < submitted {
+                if reaped < submitted
+                    && let Some(ring) = self.ring.as_mut()
+                {
                     // coverage: only hit if kernel returned early before all CQEs arrived.
-                    let _ = self.ring.submit_and_wait(submitted - reaped);
+                    if let Err(e) = ring.submit_and_wait(submitted - reaped)
+                        && e.kind() != std::io::ErrorKind::Interrupted
+                    {
+                        self.ring = None;
+                        return Err(GgufIoError::io("io_uring submit_and_wait failed", e));
+                    }
                 }
             }
 
@@ -330,6 +351,10 @@ mod tests {
             offset: size as u64,
             min_valid: 16,
         }];
+        assert!(reader.read_batch(&eof_op).is_err());
+
+        // 5. Poisoned ring (ring == None) fails closed immediately.
+        reader.ring = None;
         assert!(reader.read_batch(&eof_op).is_err());
 
         // 4. Invalid fd returns EBADF error.

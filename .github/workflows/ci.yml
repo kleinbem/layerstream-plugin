@@ -208,6 +208,14 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           lockfile-path: bindings/node/Cargo.lock
 
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-deny
+
+      - name: Check licenses, bans, advisories, and sources (cargo-deny)
+        run: cargo deny --locked check
+
   coverage:
     runs-on: ubuntu-latest
     steps:
@@ -227,15 +235,15 @@ jobs:
           {
             echo "### Rust Bundle A Coverage (pure-Rust crates)"
             echo '```'
-            cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --summary-only --show-missing-lines --fail-under-lines 90.7 -- --test-threads 1 | tee /tmp/cov_a.txt /dev/stderr
+            cargo llvm-cov --locked -p json-schema-gbnf -p gguf-direct-io -p hf-gguf --summary-only --show-missing-lines --fail-under-lines 90.8 -- --test-threads 1 | tee /tmp/cov_a.txt /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY'
           import re, sys
           gates = {
               "gguf-direct-io": 91.5,
-              "hf-gguf": 87.9,
-              "json-schema-gbnf": 92.8,
+              "hf-gguf": 88.3,
+              "json-schema-gbnf": 92.9,
           }
           totals = {k: [0, 0] for k in gates}
           pat = re.compile(r"^([a-z0-9_-]+)/src/\S+\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+\d+\s+[\d.]+%\s+(\d+)\s+(\d+)\s+")
@@ -360,15 +368,15 @@ jobs:
           {
             echo "### Rust Bundle B Coverage (core, server, ffi, plugin)"
             echo '```'
-            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 85.4 -- --test-threads 1 | tee /tmp/cov_b.txt /dev/stderr
+            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 86.7 -- --test-threads 1 | tee /tmp/cov_b.txt /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY'
           import re, sys
           gates = {
-              "layerstream-core": 84.3,
+              "layerstream-core": 86.1,
               "layerstream-ffi": 90.4,
-              "layerstream-plugin": 85.7,
+              "layerstream-plugin": 86.8,
               "layerstream-server": 87.9,
           }
           totals = {k: [0, 0] for k in gates}
