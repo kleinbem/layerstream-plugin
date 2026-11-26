@@ -1,0 +1,1897 @@
+//! Unified isolated-worker IPC client and server shared across the Python and
+//! Node.js bindings.
+//!
+//! Running `LoadedSession` inside a dedicated child process guarantees the
+//! parent process (e.g., PyTorch, Jupyter, FastAPI, Node) never initializes
+//! CUDA/Vulkan/Metal drivers. Calling `WorkerClient::unload()` (or dropping the
+//! client) terminates and reaps the child so the OS kernel immediately reclaims
+//! 100% of VRAM/UMA, CUDA driver contexts, and C++ heap arenas.
+
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow, bail};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::chat_parse::{
+    IncomingChatMessage, ParsedAssistantOutput, inject_tools_into_messages, parse_assistant_output,
+};
+use crate::engine::{GenerateOptions, GenerateSummary, KvCacheType, PromptTooLongError};
+use crate::ffi::LsSampleParams;
+use crate::hf::{DownloadProgress, ProgressCallback};
+use crate::sdk::{EngineStatsSnapshot, LoadedSession, OpenSessionOptions};
+
+/// Error returned across the worker IPC boundary with a structured error kind
+/// so Python and Node bindings can map it to native exception types.
+#[derive(Debug, Clone)]
+pub struct WorkerError {
+    pub kind: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for WorkerError {}
+
+impl WorkerError {
+    pub fn new(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Serializable model-open parameters sent from parent to isolated worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerOpenParams {
+    pub model: String,
+    #[serde(default)]
+    pub draft_model: Option<String>,
+    #[serde(default)]
+    pub quant: Option<String>,
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    pub vram_budget_auto: bool,
+    #[serde(default)]
+    pub vram_budget_bytes: u64,
+    #[serde(default)]
+    pub resident_layers: Option<u32>,
+    #[serde(default = "default_ctx_size")]
+    pub ctx_size: u32,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: u32,
+    #[serde(default)]
+    pub threads: Option<u32>,
+    #[serde(default)]
+    pub kv_cache_type: KvCacheType,
+    #[serde(default = "default_true")]
+    pub use_gpu: bool,
+    #[serde(default = "default_true")]
+    pub prefer_direct_io: bool,
+    #[serde(default)]
+    pub cpu_embeddings: bool,
+    #[serde(default)]
+    pub cpu_head: bool,
+    #[serde(default)]
+    pub stream_head: bool,
+    #[serde(default = "default_true")]
+    pub moe_active_streaming: bool,
+    #[serde(default = "default_max_draft_tokens")]
+    pub max_draft_tokens: usize,
+    #[serde(default)]
+    pub verbose: bool,
+    #[serde(default)]
+    pub stream_progress: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_ctx_size() -> u32 {
+    4096
+}
+fn default_batch_size() -> u32 {
+    512
+}
+fn default_max_draft_tokens() -> usize {
+    5
+}
+fn default_max_tokens() -> usize {
+    256
+}
+fn default_top_p() -> f32 {
+    0.95
+}
+fn default_top_k() -> i32 {
+    40
+}
+fn default_repeat_penalty() -> f32 {
+    1.0
+}
+fn default_penalty_last_n() -> i32 {
+    64
+}
+fn default_seed() -> u32 {
+    42
+}
+
+/// Serializable generation / chat parameters sent from parent to isolated worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerGenParams {
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+    #[serde(default)]
+    pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default)]
+    pub min_p: f32,
+    #[serde(default = "default_top_k")]
+    pub top_k: i32,
+    #[serde(default = "default_repeat_penalty")]
+    pub repeat_penalty: f32,
+    #[serde(default)]
+    pub frequency_penalty: f32,
+    #[serde(default)]
+    pub presence_penalty: f32,
+    #[serde(default = "default_penalty_last_n")]
+    pub penalty_last_n: i32,
+    #[serde(default = "default_seed")]
+    pub seed: u32,
+    #[serde(default)]
+    pub stop: Vec<String>,
+    #[serde(default = "default_true")]
+    pub add_generation_prompt: bool,
+    #[serde(default = "default_true")]
+    pub ngram_speculation: bool,
+    #[serde(default)]
+    pub max_draft_tokens: Option<usize>,
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
+    #[serde(default)]
+    pub grammar: Option<String>,
+    #[serde(default)]
+    pub parse_output: bool,
+}
+
+impl Default for WorkerGenParams {
+    fn default() -> Self {
+        Self {
+            max_tokens: default_max_tokens(),
+            temperature: 0.0,
+            top_p: default_top_p(),
+            min_p: 0.0,
+            top_k: default_top_k(),
+            repeat_penalty: default_repeat_penalty(),
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            penalty_last_n: default_penalty_last_n(),
+            seed: default_seed(),
+            stop: Vec::new(),
+            add_generation_prompt: true,
+            ngram_speculation: true,
+            max_draft_tokens: None,
+            tools: None,
+            grammar: None,
+            parse_output: false,
+        }
+    }
+}
+
+impl WorkerGenParams {
+    fn to_generate_options(&self, default_max_draft: usize) -> Result<GenerateOptions> {
+        let sample = LsSampleParams {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            top_k: self.top_k,
+            repeat_penalty: self.repeat_penalty,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            penalty_last_n: self.penalty_last_n,
+            seed: self.seed,
+        };
+        sample.validate().map_err(|msg| anyhow!("{msg}"))?;
+        Ok(GenerateOptions {
+            max_tokens: self.max_tokens,
+            sample,
+            stop: self.stop.clone(),
+            enable_ngram_speculation: self.ngram_speculation,
+            max_draft_tokens: self.max_draft_tokens.unwrap_or(default_max_draft).max(1),
+            grammar: self.grammar.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum WorkerStreamEvent {
+    Chunk(String),
+    Done(Option<GenerateSummary>),
+    Error(WorkerError),
+}
+
+fn send_json_line(stream: &mut TcpStream, msg: &Value) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(msg).map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    stream.flush()
+}
+
+fn generate_auth_token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow!("getrandom failed: {e}"))?;
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    Ok(hex)
+}
+
+fn classify_error(err: &anyhow::Error) -> (&'static str, String) {
+    let msg = format!("{err:#}");
+    if err.downcast_ref::<PromptTooLongError>().is_some() {
+        return ("ValueError", msg);
+    }
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::NotFound
+        {
+            return ("FileNotFoundError", msg);
+        }
+    }
+    if msg.contains("not found") || msg.contains("No such file") {
+        ("FileNotFoundError", msg)
+    } else if msg.contains("invalid ") || msg.contains("must be ") || msg.contains("unknown ") {
+        ("ValueError", msg)
+    } else {
+        ("RuntimeError", msg)
+    }
+}
+
+struct WorkerState {
+    child: Option<Child>,
+    child_stdin: Option<ChildStdin>,
+    sock_writer: Option<TcpStream>,
+    reader_thread: Option<JoinHandle<()>>,
+    loaded: bool,
+    model_path: Option<String>,
+    last_summary: Option<GenerateSummary>,
+    next_id: u64,
+    pending_rpc: HashMap<u64, mpsc::Sender<Value>>,
+    active_streams: HashMap<u64, mpsc::Sender<WorkerStreamEvent>>,
+}
+
+impl WorkerState {
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn is_child_alive(&mut self) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
+        matches!(child.try_wait(), Ok(None))
+    }
+
+    fn child_pid(&mut self) -> Option<u32> {
+        if self.is_child_alive() {
+            self.child.as_ref().map(Child::id)
+        } else {
+            None
+        }
+    }
+}
+
+/// Parent-side handle to an isolated worker subprocess.
+pub struct WorkerClient {
+    state: Arc<Mutex<WorkerState>>,
+    send_lock: Arc<Mutex<()>>,
+}
+
+impl WorkerClient {
+    /// Spawn a worker subprocess running `program args... --worker-port <port>`,
+    /// perform the loopback TCP token handshake, and open the model.
+    pub fn spawn(
+        program: &str,
+        args: &[String],
+        open: WorkerOpenParams,
+        on_progress: Option<ProgressCallback>,
+    ) -> Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .context("failed to bind loopback TCP listener for isolated worker")?;
+        let port = listener.local_addr()?.port();
+        listener
+            .set_nonblocking(true)
+            .context("failed to set worker listener nonblocking")?;
+
+        let token = generate_auth_token()?;
+
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .arg("--worker-port")
+            .arg(port.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn isolated worker '{program}'"))?;
+
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("isolated worker stdin pipe missing"))?;
+        writeln!(child_stdin, "{token}").context("failed to write auth token to worker stdin")?;
+        child_stdin
+            .flush()
+            .context("failed to flush auth token to worker stdin")?;
+
+        // Accept TCP connection with a 30s deadline while watching for early child exit.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let stream = loop {
+            match listener.accept() {
+                Ok((s, _addr)) => break s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        bail!("isolated worker exited during startup (status: {status})");
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        bail!(
+                            "timed out waiting for isolated worker to connect on 127.0.0.1:{port}"
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e).context("accepting isolated worker connection failed");
+                }
+            }
+        };
+        drop(listener);
+
+        stream.set_nonblocking(false)?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut hello_line = String::new();
+        reader
+            .read_line(&mut hello_line)
+            .context("failed to read worker handshake line")?;
+        let hello: Value = serde_json::from_str(&hello_line)
+            .context("invalid JSON in isolated worker handshake")?;
+        if hello.get("token").and_then(Value::as_str) != Some(token.as_str()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("isolated worker auth token mismatch");
+        }
+        reader.get_ref().set_read_timeout(None)?;
+
+        let state = Arc::new(Mutex::new(WorkerState {
+            child: Some(child),
+            child_stdin: Some(child_stdin),
+            sock_writer: Some(stream),
+            reader_thread: None,
+            loaded: true,
+            model_path: None,
+            last_summary: None,
+            next_id: 1,
+            pending_rpc: HashMap::new(),
+            active_streams: HashMap::new(),
+        }));
+
+        let reader_state = Arc::clone(&state);
+        let reader_thread = thread::Builder::new()
+            .name("layerstream-worker-reader".to_string())
+            .spawn(move || reader_loop(reader, reader_state))?;
+
+        {
+            let mut st = state.lock();
+            st.reader_thread = Some(reader_thread);
+        }
+
+        let client = Self {
+            state,
+            send_lock: Arc::new(Mutex::new(())),
+        };
+
+        let mut open_params = open;
+        open_params.stream_progress = on_progress.is_some();
+        let open_val = serde_json::to_value(&open_params)?;
+
+        match client.rpc_internal("open", open_val, on_progress) {
+            Ok((res, _)) => {
+                let model_path = res
+                    .get("model_path")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                {
+                    let mut st = client.state.lock();
+                    st.model_path = model_path;
+                }
+                Ok(client)
+            }
+            Err(err) => {
+                client.unload();
+                Err(err)
+            }
+        }
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        let mut st = self.state.lock();
+        st.loaded && st.is_child_alive()
+    }
+
+    pub fn worker_pid(&self) -> Option<u32> {
+        let mut st = self.state.lock();
+        if !st.loaded {
+            return None;
+        }
+        st.child_pid()
+    }
+
+    pub fn model_path(&self) -> Option<String> {
+        let st = self.state.lock();
+        if st.loaded {
+            st.model_path.clone()
+        } else {
+            None
+        }
+    }
+
+    pub fn last_summary(&self) -> Option<GenerateSummary> {
+        let st = self.state.lock();
+        st.last_summary.clone()
+    }
+
+    fn send_cmd(&self, msg: &Value) -> Result<()> {
+        let _send_guard = self.send_lock.lock();
+        let mut st = self.state.lock();
+        if !st.loaded {
+            return Err(anyhow!(WorkerError::new(
+                "RuntimeError",
+                "model has been unloaded"
+            )));
+        }
+        let sock = st
+            .sock_writer
+            .as_mut()
+            .ok_or_else(|| WorkerError::new("RuntimeError", "model has been unloaded"))?;
+        send_json_line(sock, msg).map_err(|e| {
+            anyhow!(WorkerError::new(
+                "RuntimeError",
+                format!("worker IPC send failed: {e}")
+            ))
+        })
+    }
+
+    fn rpc_internal(
+        &self,
+        op: &str,
+        params: Value,
+        on_progress: Option<ProgressCallback>,
+    ) -> Result<(Value, Option<GenerateSummary>)> {
+        let (req_id, rx) = {
+            let mut st = self.state.lock();
+            if !st.loaded || st.sock_writer.is_none() {
+                return Err(anyhow!(WorkerError::new(
+                    "RuntimeError",
+                    "model has been unloaded"
+                )));
+            }
+            let req_id = st.alloc_id();
+            let (tx, rx) = mpsc::channel();
+            st.pending_rpc.insert(req_id, tx);
+            (req_id, rx)
+        };
+
+        let send_res = self.send_cmd(&json!({"id": req_id, "op": op, "params": params}));
+        if let Err(err) = send_res {
+            let mut st = self.state.lock();
+            st.pending_rpc.remove(&req_id);
+            return Err(err);
+        }
+
+        let resp = loop {
+            match rx.recv() {
+                Ok(msg) => {
+                    if msg.get("event").and_then(Value::as_str) == Some("progress") {
+                        if let Some(ref cb) = on_progress
+                            && let Some(p_val) = msg.get("progress")
+                            && let Ok(p) = serde_json::from_value::<DownloadProgress>(p_val.clone())
+                        {
+                            let _ = cb(&p);
+                        }
+                        continue;
+                    }
+                    break msg;
+                }
+                Err(_) => {
+                    let mut st = self.state.lock();
+                    st.pending_rpc.remove(&req_id);
+                    return Err(anyhow!(WorkerError::new(
+                        "RuntimeError",
+                        "isolated worker process terminated unexpectedly"
+                    )));
+                }
+            }
+        };
+
+        {
+            let mut st = self.state.lock();
+            st.pending_rpc.remove(&req_id);
+        }
+
+        if !resp.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let kind = resp
+                .get("err_type")
+                .and_then(Value::as_str)
+                .unwrap_or("RuntimeError");
+            let msg = resp
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("worker request failed");
+            return Err(anyhow!(WorkerError::new(kind, msg)));
+        }
+
+        let summary: Option<GenerateSummary> = resp
+            .get("summary")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        if let Some(ref sum) = summary {
+            let mut st = self.state.lock();
+            st.last_summary = Some(sum.clone());
+        }
+        Ok((resp.get("result").cloned().unwrap_or(Value::Null), summary))
+    }
+
+    pub fn stats(&self) -> Result<EngineStatsSnapshot> {
+        let (res, _) = self.rpc_internal("stats", json!({}), None)?;
+        let mut snap: EngineStatsSnapshot = serde_json::from_value(res)?;
+        snap.isolated_worker = true;
+        Ok(snap)
+    }
+
+    pub fn tokenize(&self, text: &str, add_special: bool, parse_special: bool) -> Result<Vec<i32>> {
+        let (res, _) = self.rpc_internal(
+            "tokenize",
+            json!({
+                "text": text,
+                "add_special": add_special,
+                "parse_special": parse_special,
+            }),
+            None,
+        )?;
+        Ok(serde_json::from_value(
+            res.get("tokens").cloned().unwrap_or_else(|| json!([])),
+        )?)
+    }
+
+    pub fn detokenize(&self, tokens: &[i32]) -> Result<String> {
+        let (res, _) = self.rpc_internal("detokenize", json!({"tokens": tokens}), None)?;
+        Ok(res
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+
+    pub fn apply_chat_template(
+        &self,
+        messages: &[IncomingChatMessage],
+        add_generation_prompt: bool,
+        tools: Option<&[Value]>,
+    ) -> Result<String> {
+        let (res, _) = self.rpc_internal(
+            "apply_chat_template",
+            json!({
+                "messages": messages,
+                "add_generation_prompt": add_generation_prompt,
+                "tools": tools,
+            }),
+            None,
+        )?;
+        Ok(res
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+
+    pub fn kv_clear(&self) -> Result<()> {
+        let _ = self.rpc_internal("kv_clear", json!({}), None)?;
+        Ok(())
+    }
+
+    pub fn kv_trim(&self, pos_min: usize) -> Result<bool> {
+        let (res, _) = self.rpc_internal("kv_trim", json!({"pos_min": pos_min}), None)?;
+        Ok(res.get("trimmed").and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    pub fn save_state(&self, path: &str) -> Result<usize> {
+        let (res, _) = self.rpc_internal("save_state", json!({"path": path}), None)?;
+        Ok(res.get("tokens").and_then(Value::as_u64).unwrap_or(0) as usize)
+    }
+
+    pub fn load_state(&self, path: &str) -> Result<usize> {
+        let (res, _) = self.rpc_internal("load_state", json!({"path": path}), None)?;
+        Ok(res.get("tokens").and_then(Value::as_u64).unwrap_or(0) as usize)
+    }
+
+    pub fn generate(
+        &self,
+        prompt: &str,
+        params: &WorkerGenParams,
+    ) -> Result<(String, Option<GenerateSummary>)> {
+        let (res, summary) = self.rpc_internal(
+            "generate",
+            json!({"prompt": prompt, "params": params}),
+            None,
+        )?;
+        let text = res
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Ok((text, summary))
+    }
+
+    pub fn chat(
+        &self,
+        messages: &[IncomingChatMessage],
+        params: &WorkerGenParams,
+    ) -> Result<(
+        String,
+        Option<ParsedAssistantOutput>,
+        Option<GenerateSummary>,
+    )> {
+        let (res, summary) = self.rpc_internal(
+            "chat",
+            json!({"messages": messages, "params": params}),
+            None,
+        )?;
+        let text = res
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let parsed: Option<ParsedAssistantOutput> = res
+            .get("parsed")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        Ok((text, parsed, summary))
+    }
+
+    pub fn generate_stream(&self, prompt: &str, params: &WorkerGenParams) -> Result<WorkerStream> {
+        self.start_stream(
+            "generate_stream",
+            json!({"prompt": prompt, "params": params}),
+        )
+    }
+
+    pub fn chat_stream(
+        &self,
+        messages: &[IncomingChatMessage],
+        params: &WorkerGenParams,
+    ) -> Result<WorkerStream> {
+        self.start_stream(
+            "chat_stream",
+            json!({"messages": messages, "params": params}),
+        )
+    }
+
+    fn start_stream(&self, op: &str, params: Value) -> Result<WorkerStream> {
+        let (req_id, rx) = {
+            let mut st = self.state.lock();
+            if !st.loaded || st.sock_writer.is_none() {
+                return Err(anyhow!(WorkerError::new(
+                    "RuntimeError",
+                    "model has been unloaded"
+                )));
+            }
+            let req_id = st.alloc_id();
+            let (tx, rx) = mpsc::channel();
+            st.active_streams.insert(req_id, tx);
+            (req_id, rx)
+        };
+
+        if let Err(err) = self.send_cmd(&json!({"id": req_id, "op": op, "params": params})) {
+            let mut st = self.state.lock();
+            st.active_streams.remove(&req_id);
+            return Err(err);
+        }
+
+        Ok(WorkerStream {
+            state: Arc::clone(&self.state),
+            send_lock: Arc::clone(&self.send_lock),
+            req_id,
+            rx,
+            done: false,
+            summary: None,
+        })
+    }
+
+    /// Gracefully shut down, kill if necessary, and reap the isolated worker process.
+    pub fn unload(&self) {
+        let (child_opt, stdin_opt, reader_opt) = {
+            let _send_guard = self.send_lock.lock();
+            let mut st = self.state.lock();
+            st.loaded = false;
+            if let Some(mut sock) = st.sock_writer.take() {
+                let _ =
+                    send_json_line(&mut sock, &json!({"id": 0, "op": "shutdown", "params": {}}));
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+            st.pending_rpc.clear();
+            st.active_streams.clear();
+            // Keep `child_stdin` open while waiting for graceful exit so the child's
+            // parent-death watchdog does not race `std::process::exit(0)` against
+            // native GPU/Vulkan teardown on the engine thread.
+            (
+                st.child.take(),
+                st.child_stdin.take(),
+                st.reader_thread.take(),
+            )
+        };
+
+        if let Some(mut child) = child_opt {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(15));
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                }
+            }
+        }
+        drop(stdin_opt);
+
+        if let Some(handle) = reader_opt {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for WorkerClient {
+    fn drop(&mut self) {
+        self.unload();
+    }
+}
+
+/// Active streaming token iterator backed by an isolated worker subprocess.
+pub struct WorkerStream {
+    state: Arc<Mutex<WorkerState>>,
+    send_lock: Arc<Mutex<()>>,
+    req_id: u64,
+    rx: mpsc::Receiver<WorkerStreamEvent>,
+    done: bool,
+    summary: Option<GenerateSummary>,
+}
+
+/// Thread-safe handle that cancels an active `WorkerStream` even while another thread
+/// holds the stream inside `next_chunk()`.
+#[derive(Clone)]
+pub struct WorkerCancelHandle {
+    state: Arc<Mutex<WorkerState>>,
+    send_lock: Arc<Mutex<()>>,
+    req_id: u64,
+}
+
+impl WorkerCancelHandle {
+    /// Sends a non-blocking cancel RPC to the isolated worker for this stream's request ID.
+    pub fn cancel(&self) -> bool {
+        let _send_guard = self.send_lock.lock();
+        let mut st = self.state.lock();
+        let cancel_id = st.alloc_id();
+        if let Some(sock) = st.sock_writer.as_mut() {
+            send_json_line(
+                sock,
+                &json!({"id": cancel_id, "op": "cancel", "params": {"target_id": self.req_id}}),
+            )
+            .is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+impl WorkerStream {
+    /// Returns a lock-free-of-stream handle that can cancel this stream during a pending read.
+    pub fn cancel_handle(&self) -> WorkerCancelHandle {
+        WorkerCancelHandle {
+            state: Arc::clone(&self.state),
+            send_lock: Arc::clone(&self.send_lock),
+            req_id: self.req_id,
+        }
+    }
+
+    pub fn summary(&self) -> Option<GenerateSummary> {
+        self.summary.clone()
+    }
+
+    pub fn next_chunk(&mut self) -> Result<Option<String>> {
+        if self.done {
+            return Ok(None);
+        }
+        match self.rx.recv() {
+            Ok(WorkerStreamEvent::Chunk(text)) => Ok(Some(text)),
+            Ok(WorkerStreamEvent::Done(summary)) => {
+                self.done = true;
+                self.summary = summary.clone();
+                let mut st = self.state.lock();
+                st.active_streams.remove(&self.req_id);
+                if let Some(sum) = summary {
+                    st.last_summary = Some(sum);
+                }
+                Ok(None)
+            }
+            Ok(WorkerStreamEvent::Error(err)) => {
+                self.done = true;
+                let mut st = self.state.lock();
+                st.active_streams.remove(&self.req_id);
+                Err(anyhow!(err))
+            }
+            Err(_) => {
+                self.done = true;
+                let mut st = self.state.lock();
+                st.active_streams.remove(&self.req_id);
+                Ok(None)
+            }
+        }
+    }
+
+    pub fn close(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+
+        let cancel_sent = {
+            let _send_guard = self.send_lock.lock();
+            let mut st = self.state.lock();
+            let cancel_id = st.alloc_id();
+            if let Some(sock) = st.sock_writer.as_mut() {
+                send_json_line(
+                    sock,
+                    &json!({"id": cancel_id, "op": "cancel", "params": {"target_id": self.req_id}}),
+                )
+                .is_ok()
+            } else {
+                false
+            }
+        };
+
+        if cancel_sent {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match self.rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(WorkerStreamEvent::Done(summary)) => {
+                        self.summary = summary.clone();
+                        if let Some(sum) = summary {
+                            let mut st = self.state.lock();
+                            st.last_summary = Some(sum);
+                        }
+                        break;
+                    }
+                    Ok(WorkerStreamEvent::Error(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break;
+                    }
+                    Ok(WorkerStreamEvent::Chunk(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        }
+
+        let mut st = self.state.lock();
+        st.active_streams.remove(&self.req_id);
+    }
+}
+
+impl Drop for WorkerStream {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn reader_loop(mut reader: BufReader<TcpStream>, state: Arc<Mutex<WorkerState>>) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(req_id) = msg.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+
+        let st = state.lock();
+        if let Some(tx) = st.pending_rpc.get(&req_id).cloned() {
+            drop(st);
+            let _ = tx.send(msg);
+            continue;
+        }
+        if let Some(tx) = st.active_streams.get(&req_id).cloned() {
+            drop(st);
+            let ev = match msg.get("event").and_then(Value::as_str) {
+                Some("chunk") => WorkerStreamEvent::Chunk(
+                    msg.get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                Some("done") => {
+                    let sum = msg
+                        .get("summary")
+                        .filter(|v| !v.is_null())
+                        .and_then(|v| serde_json::from_value(v.clone()).ok());
+                    WorkerStreamEvent::Done(sum)
+                }
+                Some("error") => WorkerStreamEvent::Error(WorkerError::new(
+                    msg.get("err_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("RuntimeError"),
+                    msg.get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("worker stream failed"),
+                )),
+                _ => continue,
+            };
+            let _ = tx.send(ev);
+        }
+    }
+
+    // Wake any blocked callers if the worker disconnected unexpectedly.
+    let mut st = state.lock();
+    st.loaded = false;
+    for (_, tx) in st.pending_rpc.drain() {
+        let _ = tx.send(json!({
+            "ok": false,
+            "err_type": "RuntimeError",
+            "message": "isolated worker process terminated unexpectedly",
+        }));
+    }
+    for (_, tx) in st.active_streams.drain() {
+        let _ = tx.send(WorkerStreamEvent::Error(WorkerError::new(
+            "RuntimeError",
+            "isolated worker process terminated unexpectedly",
+        )));
+    }
+}
+
+type CancelState = Arc<Mutex<(HashSet<u64>, HashMap<u64, Arc<AtomicBool>>)>>;
+
+/// Child-side entrypoint for an isolated worker subprocess.
+///
+/// Reads the one-time auth token from stdin, monitors stdin EOF to self-exit if
+/// the parent dies, connects to `127.0.0.1:<port>`, and serves `LoadedSession`
+/// requests until `shutdown` or disconnect.
+pub fn run_worker_server(port: u16) -> Result<()> {
+    let mut stdin = std::io::stdin();
+    let mut token_line = String::new();
+    {
+        let mut reader = BufReader::new(&mut stdin);
+        reader.read_line(&mut token_line)?;
+    }
+    let token = token_line.trim().to_string();
+    if token.is_empty() {
+        bail!("missing worker auth token on stdin");
+    }
+
+    // Exit if parent dies unexpectedly and closes stdin pipe, without racing
+    // `std::process::exit(0)` against normal engine/GPU teardown on clean shutdown.
+    let clean_shutdown = Arc::new(AtomicBool::new(false));
+    let watchdog_shutdown = Arc::clone(&clean_shutdown);
+    thread::Builder::new()
+        .name("layerstream-parent-watchdog".to_string())
+        .spawn(move || {
+            let mut buf = [0u8; 64];
+            let mut stdin = std::io::stdin();
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        // Brief grace window in case stdin closed right before TCP shutdown/EOF.
+                        for _ in 0..10 {
+                            if watchdog_shutdown.load(Ordering::Acquire) {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        if watchdog_shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::process::exit(0);
+                    }
+                    Ok(_) => {}
+                }
+            }
+        })?;
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let stream = TcpStream::connect(addr)
+        .with_context(|| format!("failed to connect to parent worker socket on {addr}"))?;
+    stream.set_nodelay(true)?;
+
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    {
+        let mut w = writer.lock();
+        send_json_line(&mut w, &json!({"token": token}))?;
+    }
+
+    let cancel_state: CancelState = Arc::new(Mutex::new((HashSet::new(), HashMap::new())));
+
+    let (work_tx, work_rx) = mpsc::channel::<Option<Value>>();
+
+    let loop_writer = Arc::clone(&writer);
+    let loop_cancel = Arc::clone(&cancel_state);
+    let engine_thread = thread::Builder::new()
+        .name("layerstream-worker-engine".to_string())
+        .spawn(move || worker_engine_loop(work_rx, loop_writer, loop_cancel))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let op = msg.get("op").and_then(Value::as_str).unwrap_or("");
+        if op == "shutdown" {
+            break;
+        }
+        if op == "cancel" {
+            if let Some(target_id) = msg
+                .get("params")
+                .and_then(|p| p.get("target_id"))
+                .and_then(Value::as_u64)
+            {
+                let mut cs = cancel_state.lock();
+                cs.0.insert(target_id);
+                if let Some(flag) = cs.1.get(&target_id) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+            continue;
+        }
+        if work_tx.send(Some(msg)).is_err() {
+            break;
+        }
+    }
+
+    clean_shutdown.store(true, Ordering::Release);
+    {
+        let cs = cancel_state.lock();
+        for flag in cs.1.values() {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+    let _ = work_tx.send(None);
+    let _ = engine_thread.join();
+    Ok(())
+}
+
+fn worker_engine_loop(
+    work_rx: mpsc::Receiver<Option<Value>>,
+    writer: Arc<Mutex<TcpStream>>,
+    cancel_state: CancelState,
+) {
+    let mut session: Option<LoadedSession> = None;
+
+    let send = |msg: &Value| {
+        let mut w = writer.lock();
+        let _ = send_json_line(&mut w, msg);
+    };
+
+    while let Ok(Some(cmd)) = work_rx.recv() {
+        let req_id = cmd.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let op = cmd
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let params = cmd.get("params").cloned().unwrap_or_else(|| json!({}));
+
+        let already_cancelled = {
+            let mut cs = cancel_state.lock();
+            cs.0.remove(&req_id)
+        };
+        if already_cancelled {
+            if op == "generate_stream" || op == "chat_stream" {
+                send(&json!({"id": req_id, "event": "done", "summary": Value::Null}));
+            } else {
+                send(&json!({"id": req_id, "ok": true, "result": {}, "summary": Value::Null}));
+            }
+            continue;
+        }
+
+        let res: Result<()> = (|| {
+            match op.as_str() {
+                "open" => {
+                    let open: WorkerOpenParams = serde_json::from_value(params)?;
+                    crate::engine::StreamEngine::set_log_verbose(open.verbose);
+                    let on_progress: Option<ProgressCallback> = if open.stream_progress {
+                        let pw = Arc::clone(&writer);
+                        Some(Arc::new(move |ev: &DownloadProgress| {
+                            let mut w = pw.lock();
+                            let _ = send_json_line(
+                                &mut w,
+                                &json!({"id": req_id, "event": "progress", "progress": ev}),
+                            );
+                            Ok(())
+                        }))
+                    } else {
+                        None
+                    };
+                    let opts = OpenSessionOptions {
+                        draft_model: open.draft_model,
+                        quant: open.quant,
+                        revision: open.revision,
+                        cache_dir: open.cache_dir,
+                        vram_budget_auto: open.vram_budget_auto,
+                        vram_budget_bytes: open.vram_budget_bytes,
+                        resident_layers: open.resident_layers,
+                        ctx_size: open.ctx_size,
+                        batch_size: open.batch_size,
+                        threads: open.threads,
+                        kv_cache_type: open.kv_cache_type,
+                        use_gpu: open.use_gpu,
+                        prefer_direct_io: open.prefer_direct_io,
+                        cpu_embeddings: open.cpu_embeddings,
+                        cpu_head: open.cpu_head,
+                        stream_head: open.stream_head,
+                        moe_active_streaming: open.moe_active_streaming,
+                        max_draft_tokens: open.max_draft_tokens,
+                        on_progress,
+                    };
+                    let loaded = LoadedSession::open(&open.model, opts)?;
+                    let model_path = loaded.model_path.to_string_lossy().into_owned();
+                    session = Some(loaded);
+                    send(&json!({"id": req_id, "ok": true, "result": {"model_path": model_path}}));
+                }
+                _ => {
+                    let Some(sess) = session.as_mut() else {
+                        bail!("model has been unloaded");
+                    };
+                    match op.as_str() {
+                        "stats" => {
+                            let snap = sess.stats_snapshot();
+                            send(&json!({"id": req_id, "ok": true, "result": snap}));
+                        }
+                        "tokenize" => {
+                            let text = params
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| anyhow!("invalid tokenize 'text'"))?;
+                            let add_special = params
+                                .get("add_special")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            let parse_special = params
+                                .get("parse_special")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            let tokens = sess.engine.tokenize(text, add_special, parse_special)?;
+                            send(&json!({"id": req_id, "ok": true, "result": {"tokens": tokens}}));
+                        }
+                        "detokenize" => {
+                            let tokens: Vec<i32> = serde_json::from_value(
+                                params.get("tokens").cloned().unwrap_or_else(|| json!([])),
+                            )?;
+                            let text = sess.engine.detokenize(&tokens)?;
+                            send(&json!({"id": req_id, "ok": true, "result": {"text": text}}));
+                        }
+                        "apply_chat_template" => {
+                            let msgs: Vec<IncomingChatMessage> = serde_json::from_value(
+                                params.get("messages").cloned().unwrap_or_else(|| json!([])),
+                            )?;
+                            let add_gen = params
+                                .get("add_generation_prompt")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true);
+                            let tools: Option<Vec<Value>> = params
+                                .get("tools")
+                                .filter(|v| !v.is_null())
+                                .map(|v| serde_json::from_value(v.clone()))
+                                .transpose()?;
+                            let chat_msgs = build_chat_messages(&msgs, tools.as_deref())?;
+                            let prompt = sess.engine.apply_chat_template(&chat_msgs, add_gen)?;
+                            send(&json!({"id": req_id, "ok": true, "result": {"prompt": prompt}}));
+                        }
+                        "kv_clear" => {
+                            sess.engine.kv_clear();
+                            send(&json!({"id": req_id, "ok": true, "result": {}}));
+                        }
+                        "kv_trim" => {
+                            let pos_min = params
+                                .get("pos_min")
+                                .and_then(Value::as_u64)
+                                .ok_or_else(|| anyhow!("invalid kv_trim 'pos_min'"))?
+                                as i32;
+                            let trimmed = sess.engine.kv_trim(pos_min);
+                            send(
+                                &json!({"id": req_id, "ok": true, "result": {"trimmed": trimmed}}),
+                            );
+                        }
+                        "save_state" => {
+                            let path = params
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| anyhow!("invalid save_state 'path'"))?;
+                            let tokens = sess.engine.save_state(path)?;
+                            send(&json!({"id": req_id, "ok": true, "result": {"tokens": tokens}}));
+                        }
+                        "load_state" => {
+                            let path = params
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| anyhow!("invalid load_state 'path'"))?;
+                            let tokens = sess.engine.load_state(path)?;
+                            send(&json!({"id": req_id, "ok": true, "result": {"tokens": tokens}}));
+                        }
+                        "generate" | "chat" | "generate_stream" | "chat_stream" => {
+                            let is_chat = op == "chat" || op == "chat_stream";
+                            let is_stream = op == "generate_stream" || op == "chat_stream";
+                            let gp: WorkerGenParams = serde_json::from_value(
+                                params.get("params").cloned().unwrap_or_else(|| json!({})),
+                            )?;
+                            let prompt = if is_chat {
+                                let msgs: Vec<IncomingChatMessage> = serde_json::from_value(
+                                    params.get("messages").cloned().unwrap_or_else(|| json!([])),
+                                )?;
+                                let chat_msgs = build_chat_messages(&msgs, gp.tools.as_deref())?;
+                                sess.engine
+                                    .apply_chat_template(&chat_msgs, gp.add_generation_prompt)?
+                            } else {
+                                params
+                                    .get("prompt")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| anyhow!("invalid generate 'prompt'"))?
+                                    .to_string()
+                            };
+
+                            let cancel_flag = Arc::new(AtomicBool::new(false));
+                            {
+                                let mut cs = cancel_state.lock();
+                                if cs.0.remove(&req_id) {
+                                    cancel_flag.store(true, Ordering::Relaxed);
+                                }
+                                cs.1.insert(req_id, Arc::clone(&cancel_flag));
+                            }
+
+                            let gen_opts = gp.to_generate_options(sess.default_max_draft_tokens)?;
+                            let mut collected = String::new();
+                            let gen_res = sess.engine.generate_stream_with_cancel(
+                                &prompt,
+                                &gen_opts,
+                                sess.draft.as_mut(),
+                                Some(&cancel_flag),
+                                |_tok, piece| {
+                                    if cancel_flag.load(Ordering::Relaxed) {
+                                        return false;
+                                    }
+                                    if is_stream {
+                                        send(
+                                            &json!({"id": req_id, "event": "chunk", "text": piece}),
+                                        );
+                                    } else {
+                                        collected.push_str(piece);
+                                    }
+                                    true
+                                },
+                            );
+
+                            {
+                                let mut cs = cancel_state.lock();
+                                cs.1.remove(&req_id);
+                                cs.0.remove(&req_id);
+                            }
+
+                            let summary = gen_res?;
+                            sess.last_summary = Some(summary.clone());
+
+                            if is_stream {
+                                send(&json!({"id": req_id, "event": "done", "summary": summary}));
+                            } else {
+                                let parsed = if is_chat && gp.parse_output {
+                                    Some(parse_assistant_output(&collected))
+                                } else {
+                                    None
+                                };
+                                send(&json!({
+                                    "id": req_id,
+                                    "ok": true,
+                                    "result": {"text": collected, "parsed": parsed},
+                                    "summary": summary,
+                                }));
+                            }
+                        }
+                        other => bail!("unknown worker op '{other}'"),
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = res {
+            let (err_type, message) = classify_error(&err);
+            if op == "generate_stream" || op == "chat_stream" {
+                send(&json!({
+                    "id": req_id,
+                    "event": "error",
+                    "err_type": err_type,
+                    "message": message,
+                }));
+            } else {
+                send(&json!({
+                    "id": req_id,
+                    "ok": false,
+                    "err_type": err_type,
+                    "message": message,
+                }));
+            }
+        }
+    }
+
+    drop(session);
+}
+
+fn build_chat_messages(
+    incoming: &[IncomingChatMessage],
+    tools: Option<&[Value]>,
+) -> Result<Vec<crate::engine::ChatMessage>> {
+    let mut out = Vec::with_capacity(incoming.len());
+    for msg in incoming {
+        out.push(
+            msg.to_chat_message()
+                .map_err(|e| anyhow!("invalid chat message: {e}"))?,
+        );
+    }
+    if let Some(t) = tools
+        && !t.is_empty()
+    {
+        inject_tools_into_messages(&mut out, t);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_token_is_64_lowercase_hex_chars_and_unique() {
+        let a = generate_auth_token().expect("token a");
+        let b = generate_auth_token().expect("token b");
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn worker_gen_params_roundtrip_defaults() {
+        let p = WorkerGenParams::default();
+        let v = serde_json::to_value(&p).expect("serialize");
+        let p2: WorkerGenParams = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(p2.max_tokens, 256);
+        assert_eq!(p2.top_k, 40);
+        assert_eq!(p2.seed, 42);
+        assert!(p2.add_generation_prompt);
+        assert!(p2.ngram_speculation);
+    }
+
+    #[test]
+    fn classify_error_maps_not_found_and_value_errors() {
+        let nf = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing file",
+        ));
+        assert_eq!(classify_error(&nf).0, "FileNotFoundError");
+
+        let ptl = anyhow::Error::new(PromptTooLongError {
+            prompt_tokens: 5000,
+            n_ctx: 4096,
+        });
+        assert_eq!(classify_error(&ptl).0, "ValueError");
+
+        let unk = anyhow!("unknown worker op 'bogus'");
+        assert_eq!(classify_error(&unk).0, "ValueError");
+
+        let rt = anyhow!("engine exploded");
+        assert_eq!(classify_error(&rt).0, "RuntimeError");
+    }
+
+    fn write_tiny_llama_gguf(path: &std::path::Path) {
+        const N_VOCAB: u64 = 64;
+        const N_EMBD: u64 = 64;
+        const N_HEAD: u32 = 2;
+        const N_FF: u64 = 128;
+        const N_LAYERS: u32 = 2;
+        const ALIGN: usize = 32;
+
+        let write_str = |buf: &mut Vec<u8>, s: &str| {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        };
+        let kv_str = |buf: &mut Vec<u8>, k: &str, v: &str| {
+            write_str(buf, k);
+            buf.extend_from_slice(&8u32.to_le_bytes());
+            write_str(buf, v);
+        };
+        let kv_u32 = |buf: &mut Vec<u8>, k: &str, v: u32| {
+            write_str(buf, k);
+            buf.extend_from_slice(&4u32.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        };
+        let kv_f32 = |buf: &mut Vec<u8>, k: &str, v: f32| {
+            write_str(buf, k);
+            buf.extend_from_slice(&6u32.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        };
+        let kv_bool = |buf: &mut Vec<u8>, k: &str, v: bool| {
+            write_str(buf, k);
+            buf.extend_from_slice(&7u32.to_le_bytes());
+            buf.push(u8::from(v));
+        };
+
+        let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next_f32 = |scale: f32| -> f32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let u = ((seed >> 40) as f32) / ((1u32 << 24) as f32);
+            (u * 2.0 - 1.0) * scale
+        };
+
+        struct TSpec {
+            name: String,
+            dims: Vec<u64>,
+            bytes: Vec<u8>,
+            rel_offset: u64,
+        }
+        let mut tensors: Vec<TSpec> = Vec::new();
+        let mut push_t = |name: String, dims: Vec<u64>, is_norm: bool| {
+            let nelems: usize = dims.iter().map(|&d| d as usize).product();
+            let mut bytes = Vec::with_capacity(nelems * 4);
+            for _ in 0..nelems {
+                let v = if is_norm {
+                    1.0 + next_f32(0.05)
+                } else {
+                    next_f32(0.15)
+                };
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            tensors.push(TSpec {
+                name,
+                dims,
+                bytes,
+                rel_offset: 0,
+            });
+        };
+
+        push_t("token_embd.weight".into(), vec![N_EMBD, N_VOCAB], false);
+        push_t("output_norm.weight".into(), vec![N_EMBD], true);
+        push_t("output.weight".into(), vec![N_EMBD, N_VOCAB], false);
+        for il in 0..N_LAYERS {
+            push_t(format!("blk.{il}.attn_norm.weight"), vec![N_EMBD], true);
+            push_t(
+                format!("blk.{il}.attn_q.weight"),
+                vec![N_EMBD, N_EMBD],
+                false,
+            );
+            push_t(
+                format!("blk.{il}.attn_k.weight"),
+                vec![N_EMBD, N_EMBD],
+                false,
+            );
+            push_t(
+                format!("blk.{il}.attn_v.weight"),
+                vec![N_EMBD, N_EMBD],
+                false,
+            );
+            push_t(
+                format!("blk.{il}.attn_output.weight"),
+                vec![N_EMBD, N_EMBD],
+                false,
+            );
+            push_t(format!("blk.{il}.ffn_norm.weight"), vec![N_EMBD], true);
+            push_t(
+                format!("blk.{il}.ffn_gate.weight"),
+                vec![N_EMBD, N_FF],
+                false,
+            );
+            push_t(format!("blk.{il}.ffn_up.weight"), vec![N_EMBD, N_FF], false);
+            push_t(
+                format!("blk.{il}.ffn_down.weight"),
+                vec![N_FF, N_EMBD],
+                false,
+            );
+        }
+
+        let mut cur_off = 0usize;
+        for t in &mut tensors {
+            cur_off = (cur_off + ALIGN - 1) & !(ALIGN - 1);
+            t.rel_offset = cur_off as u64;
+            cur_off += t.bytes.len();
+        }
+
+        let mut kv = Vec::new();
+        let mut kv_n = 0u64;
+        kv_str(&mut kv, "general.architecture", "llama");
+        kv_n += 1;
+        kv_str(&mut kv, "general.name", "tiny-ipc-test");
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.block_count", N_LAYERS);
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.context_length", 128);
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.embedding_length", N_EMBD as u32);
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.feed_forward_length", N_FF as u32);
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.attention.head_count", N_HEAD);
+        kv_n += 1;
+        kv_u32(&mut kv, "llama.attention.head_count_kv", N_HEAD);
+        kv_n += 1;
+        kv_f32(&mut kv, "llama.attention.layer_norm_rms_epsilon", 1e-5);
+        kv_n += 1;
+        kv_f32(&mut kv, "llama.rope.freq_base", 10_000.0);
+        kv_n += 1;
+        kv_str(&mut kv, "tokenizer.ggml.model", "gpt2");
+        kv_n += 1;
+        kv_str(&mut kv, "tokenizer.ggml.pre", "default");
+        kv_n += 1;
+        write_str(&mut kv, "tokenizer.ggml.merges");
+        kv.extend_from_slice(&9u32.to_le_bytes());
+        kv.extend_from_slice(&8u32.to_le_bytes());
+        kv.extend_from_slice(&0u64.to_le_bytes());
+        kv_n += 1;
+        write_str(&mut kv, "tokenizer.ggml.tokens");
+        kv.extend_from_slice(&9u32.to_le_bytes());
+        kv.extend_from_slice(&8u32.to_le_bytes());
+        kv.extend_from_slice(&N_VOCAB.to_le_bytes());
+        for i in 0..N_VOCAB {
+            let tok = match i {
+                0 => "<bos>".to_string(),
+                1 => "<eos>".to_string(),
+                2 => " ".to_string(),
+                _ => {
+                    let ch = (b'a' + ((i - 3) % 26) as u8) as char;
+                    if i < 29 {
+                        ch.to_string()
+                    } else {
+                        format!("{ch}{i}")
+                    }
+                }
+            };
+            write_str(&mut kv, &tok);
+        }
+        kv_n += 1;
+        write_str(&mut kv, "tokenizer.ggml.token_type");
+        kv.extend_from_slice(&9u32.to_le_bytes());
+        kv.extend_from_slice(&5u32.to_le_bytes());
+        kv.extend_from_slice(&N_VOCAB.to_le_bytes());
+        for i in 0..N_VOCAB {
+            let tt: i32 = if i < 2 { 3 } else { 1 };
+            kv.extend_from_slice(&tt.to_le_bytes());
+        }
+        kv_n += 1;
+        kv_u32(&mut kv, "tokenizer.ggml.bos_token_id", 0);
+        kv_n += 1;
+        kv_u32(&mut kv, "tokenizer.ggml.eos_token_id", 1);
+        kv_n += 1;
+        kv_bool(&mut kv, "tokenizer.ggml.add_bos_token", true);
+        kv_n += 1;
+
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(b"GGUF");
+        hdr.extend_from_slice(&3u32.to_le_bytes());
+        hdr.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        hdr.extend_from_slice(&kv_n.to_le_bytes());
+        hdr.extend_from_slice(&kv);
+        for t in &tensors {
+            write_str(&mut hdr, &t.name);
+            hdr.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+            for &d in &t.dims {
+                hdr.extend_from_slice(&d.to_le_bytes());
+            }
+            hdr.extend_from_slice(&0u32.to_le_bytes());
+            hdr.extend_from_slice(&t.rel_offset.to_le_bytes());
+        }
+        let aligned = (hdr.len() + ALIGN - 1) & !(ALIGN - 1);
+        hdr.resize(aligned, 0);
+
+        let mut f = std::fs::File::create(path).expect("create temp gguf");
+        f.write_all(&hdr).expect("write hdr");
+        let mut written = 0usize;
+        for t in &tensors {
+            let pad = (t.rel_offset as usize).saturating_sub(written);
+            if pad > 0 {
+                f.write_all(&vec![0u8; pad]).expect("write pad");
+                written += pad;
+            }
+            f.write_all(&t.bytes).expect("write tensor");
+            written += t.bytes.len();
+        }
+        f.flush().expect("flush");
+    }
+
+    fn spawn_in_process_worker_pair() -> (WorkerClient, JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let srv_handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let writer = Arc::new(Mutex::new(stream.try_clone().expect("clone")));
+            let cancel_state: CancelState = Arc::new(Mutex::new((HashSet::new(), HashMap::new())));
+            let (work_tx, work_rx) = mpsc::channel::<Option<Value>>();
+            let eng_w = Arc::clone(&writer);
+            let eng_c = Arc::clone(&cancel_state);
+            let eng = thread::spawn(move || worker_engine_loop(work_rx, eng_w, eng_c));
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let op = msg.get("op").and_then(Value::as_str).unwrap_or("");
+                if op == "shutdown" {
+                    break;
+                }
+                if op == "cancel" {
+                    if let Some(tid) = msg
+                        .get("params")
+                        .and_then(|p| p.get("target_id"))
+                        .and_then(Value::as_u64)
+                    {
+                        let mut cs = cancel_state.lock();
+                        cs.0.insert(tid);
+                        if let Some(flag) = cs.1.get(&tid) {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    continue;
+                }
+                if work_tx.send(Some(msg)).is_err() {
+                    break;
+                }
+            }
+            let _ = work_tx.send(None);
+            let _ = eng.join();
+        });
+
+        let stream = TcpStream::connect(addr).expect("connect");
+        let reader = BufReader::new(stream.try_clone().expect("clone"));
+        let state = Arc::new(Mutex::new(WorkerState {
+            child: None,
+            child_stdin: None,
+            sock_writer: Some(stream),
+            reader_thread: None,
+            loaded: true,
+            model_path: None,
+            last_summary: None,
+            next_id: 1,
+            pending_rpc: HashMap::new(),
+            active_streams: HashMap::new(),
+        }));
+        let rs = Arc::clone(&state);
+        let rt = thread::spawn(move || reader_loop(reader, rs));
+        state.lock().reader_thread = Some(rt);
+        let client = WorkerClient {
+            state,
+            send_lock: Arc::new(Mutex::new(())),
+        };
+        (client, srv_handle)
+    }
+
+    #[test]
+    fn worker_ipc_in_process_full_rpc_and_streaming_lifecycle() {
+        let dir = std::env::temp_dir().join(format!("ls-worker-ipc-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let gguf = dir.join("tiny.gguf");
+        let kv_state = dir.join("kv.state");
+        write_tiny_llama_gguf(&gguf);
+
+        let (client, srv) = spawn_in_process_worker_pair();
+        assert!(!client.is_loaded()); // no Child handle in in-process harness
+        assert!(client.worker_pid().is_none());
+        assert!(client.model_path().is_none());
+        assert!(client.last_summary().is_none());
+
+        // Calling stats before open returns an error from worker_engine_loop.
+        let before_open = client.stats();
+        assert!(before_open.is_err());
+
+        // Open with missing file -> FileNotFoundError.
+        let bad_open = serde_json::to_value(WorkerOpenParams {
+            model: dir
+                .join("does-not-exist.gguf")
+                .to_string_lossy()
+                .into_owned(),
+            draft_model: None,
+            quant: None,
+            revision: None,
+            cache_dir: None,
+            vram_budget_auto: false,
+            vram_budget_bytes: 0,
+            resident_layers: Some(0),
+            ctx_size: 128,
+            batch_size: 32,
+            threads: Some(2),
+            kv_cache_type: KvCacheType::F16,
+            use_gpu: false,
+            prefer_direct_io: false,
+            cpu_embeddings: false,
+            cpu_head: false,
+            stream_head: false,
+            moe_active_streaming: true,
+            max_draft_tokens: 2,
+            verbose: false,
+            stream_progress: true,
+        })
+        .expect("serialize bad open");
+        let err = client.rpc_internal("open", bad_open, None).unwrap_err();
+        let we = err.downcast_ref::<WorkerError>().expect("WorkerError");
+        assert_eq!(we.kind, "FileNotFoundError");
+        assert!(!format!("{we}").is_empty());
+
+        // Open valid synthetic GGUF.
+        let good_open = serde_json::to_value(WorkerOpenParams {
+            model: gguf.to_string_lossy().into_owned(),
+            draft_model: None,
+            quant: None,
+            revision: None,
+            cache_dir: None,
+            vram_budget_auto: false,
+            vram_budget_bytes: 0,
+            resident_layers: Some(0),
+            ctx_size: 128,
+            batch_size: 32,
+            threads: Some(2),
+            kv_cache_type: KvCacheType::F16,
+            use_gpu: false,
+            prefer_direct_io: false,
+            cpu_embeddings: false,
+            cpu_head: false,
+            stream_head: false,
+            moe_active_streaming: true,
+            max_draft_tokens: 2,
+            verbose: false,
+            stream_progress: false,
+        })
+        .expect("serialize good open");
+        let (open_res, _) = client.rpc_internal("open", good_open, None).expect("open");
+        assert!(open_res["model_path"].as_str().is_some());
+
+        // Stats, tokenize, detokenize, apply_chat_template.
+        let snap = client.stats().expect("stats");
+        assert!(snap.isolated_worker);
+        assert_eq!(snap.n_layers, 2);
+        let toks = client.tokenize("abc", true, false).expect("tokenize");
+        assert!(!toks.is_empty());
+        let detok = client.detokenize(&toks).expect("detokenize");
+        assert!(!detok.is_empty());
+
+        let msgs = vec![IncomingChatMessage {
+            role: "user".to_string(),
+            content: json!("abc"),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "get_weather", "description": "desc", "parameters": {"type": "object"}}
+        })];
+        let tmpl = client
+            .apply_chat_template(&msgs, true, Some(&tools))
+            .expect("apply_chat_template");
+        assert!(!tmpl.is_empty());
+
+        // Generate + chat (with parse_output) + invalid sampling params error.
+        let gp = WorkerGenParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            parse_output: true,
+            tools: Some(tools.clone()),
+            ..WorkerGenParams::default()
+        };
+        let (gen_txt, gen_sum) = client.generate("abc", &gp).expect("generate");
+        assert!(!gen_txt.is_empty());
+        assert!(gen_sum.is_some());
+        assert!(client.last_summary().is_some());
+
+        let (chat_txt, parsed, chat_sum) = client.chat(&msgs, &gp).expect("chat");
+        assert!(!chat_txt.is_empty());
+        assert!(parsed.is_some());
+        assert!(chat_sum.is_some());
+
+        let bad_gp = WorkerGenParams {
+            temperature: -1.0,
+            ..WorkerGenParams::default()
+        };
+        assert!(client.generate("abc", &bad_gp).is_err());
+
+        // Streaming generate + streaming chat with cancel & close.
+        let mut gs = client.generate_stream("abc", &gp).expect("generate_stream");
+        let mut chunks = Vec::new();
+        while let Some(c) = gs.next_chunk().expect("next_chunk") {
+            chunks.push(c);
+        }
+        assert!(!chunks.is_empty());
+        assert!(gs.summary().is_some());
+        assert!(gs.next_chunk().expect("done next").is_none());
+
+        let long_gp = WorkerGenParams {
+            max_tokens: 16,
+            ..gp.clone()
+        };
+        let mut cs = client.chat_stream(&msgs, &long_gp).expect("chat_stream");
+        let cancel_h = cs.cancel_handle();
+        let _ = cs.next_chunk();
+        assert!(cancel_h.cancel());
+        cs.close();
+
+        // Repopulate KV after cancelled stream, then exercise save_state / kv_trim / kv_clear / load_state.
+        let _ = client.generate("abc", &gp).expect("repopulate kv");
+        let saved = client
+            .save_state(&kv_state.to_string_lossy())
+            .expect("save_state");
+        assert!(saved > 0);
+        let _ = client.kv_trim(1).expect("kv_trim");
+        client.kv_clear().expect("kv_clear");
+        let loaded = client
+            .load_state(&kv_state.to_string_lossy())
+            .expect("load_state");
+        assert_eq!(loaded, saved);
+        assert!(client.rpc_internal("bogus_op", json!({}), None).is_err());
+
+        // Unload cleanly and verify post-unload calls fail.
+        client.unload();
+        assert!(client.stats().is_err());
+        assert!(client.generate_stream("abc", &gp).is_err());
+        let _ = srv.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
