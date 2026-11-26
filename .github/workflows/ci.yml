@@ -360,15 +360,15 @@ jobs:
           {
             echo "### Rust Bundle B Coverage (core, server, ffi, plugin)"
             echo '```'
-            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 83.8 -- --test-threads 1 | tee /tmp/cov_b.txt /dev/stderr
+            cargo llvm-cov --locked -p layerstream-core -p layerstream-server -p layerstream-ffi -p layerstream-plugin --summary-only --show-missing-lines --fail-under-lines 83.9 -- --test-threads 1 | tee /tmp/cov_b.txt /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY'
           import re, sys
           gates = {
-              "layerstream-core": 83.1,
+              "layerstream-core": 83.2,
               "layerstream-ffi": 90.4,
-              "layerstream-plugin": 83.9,
+              "layerstream-plugin": 84.0,
               "layerstream-server": 84.1,
           }
           totals = {k: [0, 0] for k in gates}

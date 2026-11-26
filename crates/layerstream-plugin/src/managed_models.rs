@@ -689,4 +689,66 @@ mod tests {
         let plans = build_managed_model_plans(&[default_zero, t60, t15]).unwrap();
         assert_eq!(effective_managed_idle_timeout_secs(&plans), Some(15));
     }
+
+    #[test]
+    fn option_parsers_gguf_validation_and_shard_selection_cover_error_paths() {
+        let bad_str = parse_config(json!({
+            "model": "org/a",
+            "provider": "layerstream",
+            "options": { "alias": 123, "file": "   " }
+        }));
+        assert!(optional_non_empty_str(&bad_str, "alias").is_err());
+        assert!(optional_non_empty_str(&bad_str, "file").is_err());
+
+        let bad_list_type = parse_config(json!({
+            "model": "org/a",
+            "provider": "layerstream",
+            "options": { "files": "not-an-array" }
+        }));
+        assert!(optional_non_empty_str_list(&bad_list_type, "files").is_err());
+
+        let empty_list = parse_config(json!({
+            "model": "org/a",
+            "provider": "layerstream",
+            "options": { "files": [] }
+        }));
+        assert!(optional_non_empty_str_list(&empty_list, "files").is_err());
+
+        let non_str_entry = parse_config(json!({
+            "model": "org/a",
+            "provider": "layerstream",
+            "options": { "files": [42] }
+        }));
+        assert!(optional_non_empty_str_list(&non_str_entry, "files").is_err());
+
+        let blank_entry = parse_config(json!({
+            "model": "org/a",
+            "provider": "layerstream",
+            "options": { "files": ["   "] }
+        }));
+        assert!(optional_non_empty_str_list(&blank_entry, "files").is_err());
+
+        assert!(ensure_gguf_filename("org/a", "file", "model.bin").is_err());
+        assert!(ensure_gguf_filename("org/a", "file", ".gguf").is_err());
+        assert!(ensure_gguf_filename("org/a", "file", "ok.gguf").is_ok());
+
+        assert!(!is_secondary_shard_name("readme.md"));
+        assert!(!is_secondary_shard_name("m-00001-of-00003.GGUF"));
+        assert!(is_secondary_shard_name("dir/m-00002-of-00003.GGUF"));
+        assert!(!is_secondary_shard_name("single.gguf"));
+
+        assert!(select_primary_gguf(&["readme.md".to_string()]).is_err());
+        assert_eq!(
+            select_primary_gguf(&[
+                "m-00002-of-00002.gguf".to_string(),
+                "m-00001-of-00002.gguf".to_string(),
+            ])
+            .unwrap(),
+            "m-00001-of-00002.gguf"
+        );
+        assert_eq!(
+            select_primary_gguf(&["m-00002-of-00002.gguf".to_string()]).unwrap(),
+            "m-00002-of-00002.gguf"
+        );
+    }
 }

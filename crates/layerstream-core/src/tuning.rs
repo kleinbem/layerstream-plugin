@@ -394,6 +394,18 @@ mod tests {
         assert!(report.contains("Hardware profile:"));
         assert!(report.contains("Selected: n_batch="));
         assert!(report.contains("Saved tuned profile:"));
+        assert!(!tuned.format_report(None).contains("Saved tuned profile:"));
+
+        // Temporary-file directory sweep cleans up after itself
+        let dir_tuned = run_dir_storage_sweep(&dir, &prof).expect("dir storage sweep");
+        assert!(dir_tuned.measured_mib_per_s > 0.0);
+        assert!(
+            !dir.join(format!(
+                ".layerstream-tune-probe-{}.tmp",
+                std::process::id()
+            ))
+            .exists()
+        );
 
         // Absent fingerprint returns Ok(None)
         assert!(
