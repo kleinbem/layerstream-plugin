@@ -291,7 +291,14 @@ fn model_registry_from_sources_shards_aliases_and_draft_validation() {
     let corrupt = dir.path().join("corrupt.gguf");
 
     write_tiny_llama_gguf(&shard1, 64, false);
-    write_tiny_llama_gguf(&shard2, 64, false);
+    // Secondary shard carries no duplicate tensors (minimal valid 0-tensor GGUF v3 header).
+    let mut shard2_bytes = Vec::with_capacity(32);
+    shard2_bytes.extend_from_slice(b"GGUF");
+    shard2_bytes.extend_from_slice(&3u32.to_le_bytes());
+    shard2_bytes.extend_from_slice(&0u64.to_le_bytes());
+    shard2_bytes.extend_from_slice(&0u64.to_le_bytes());
+    shard2_bytes.resize(32, 0);
+    std::fs::write(&shard2, &shard2_bytes).unwrap();
     write_tiny_llama_gguf(&draft, 64, false);
     write_tiny_llama_gguf(&incompat, 64, true);
     std::fs::write(&corrupt, b"NOT_GGUF").unwrap();
