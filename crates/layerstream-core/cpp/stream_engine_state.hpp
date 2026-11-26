@@ -1067,14 +1067,20 @@ struct ls_engine {
         using Clock = std::chrono::steady_clock;
         auto t0 = profile_enabled ? Clock::now() : Clock::time_point{};
 
-        // If the OTHER slot still holds an un-uploaded Vulkan `pin_buf` entry (e.g. a layer
-        // was skipped), drop it so `worker_thread` isn't blocked from filling `pin_buf` for `slot`.
+        // If either slot still holds an un-uploaded deferred `pin_buf` entry for a different
+        // layer (e.g. after a cancelled pass or skipped layer), drop it so `worker_thread`
+        // isn't blocked from filling `pin_buf` for `slot`.
         if (uses_deferred_eval_h2d()) {
             const int other = 1 - slot;
             bool woke = false;
             {
                 std::lock_guard<std::mutex> wlk(worker_mu);
                 std::lock_guard<std::mutex> slk(slot_mu);
+                if (slot_loaded_layer[slot] != layer_idx && slot_needs_h2d[slot]) {
+                    slot_loaded_layer[slot] = -1;
+                    slot_needs_h2d[slot] = false;
+                    woke = true;
+                }
                 if (slot_loaded_layer[slot] != layer_idx && slot_needs_h2d[other]) {
                     slot_loaded_layer[other] = -1;
                     slot_needs_h2d[other] = false;

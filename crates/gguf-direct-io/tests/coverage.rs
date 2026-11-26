@@ -418,3 +418,64 @@ fn gguf_index_scalar_types_overflow_and_vocab_error_paths() {
     std::fs::write(&corrupt, b"NOT_GGUF_DATA").unwrap();
     assert!(gguf_direct_io::check_gguf_draft_compatible(&corrupt, &ok_path).is_err());
 }
+
+#[test]
+fn warm_expert_profile_skips_oob_and_oversized_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let model_path = dir.path().join("warm_bounds.gguf");
+    let mut buf = Vec::new();
+    let mut kv = Vec::new();
+    let write_str = |out: &mut Vec<u8>, s: &str| {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    };
+    write_str(&mut kv, "general.architecture");
+    kv.extend_from_slice(&8u32.to_le_bytes());
+    write_str(&mut kv, "llama");
+    buf.extend_from_slice(b"GGUF");
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(&1u64.to_le_bytes());
+    buf.extend_from_slice(&kv);
+    buf.resize(8192, 0x5A);
+    std::fs::write(&model_path, &buf).unwrap();
+
+    let idx = GgufIndex::open(&model_path).unwrap();
+    let pool = LayerIoPool::new_with_options(idx, false, None, Some(4096)).unwrap();
+
+    let profile_path = dir.path().join("profile.lsep");
+    let entries = vec![
+        // Valid entry within both shard_len (8192) and budget/2 (2048)
+        gguf_direct_io::expert_profile::HotSliceEntry {
+            shard_idx: 0,
+            file_offset: 0,
+            len: 512,
+        },
+        // Oversized (> budget/2 = 2048)
+        gguf_direct_io::expert_profile::HotSliceEntry {
+            shard_idx: 0,
+            file_offset: 0,
+            len: 4096,
+        },
+        // Out of shard bounds
+        gguf_direct_io::expert_profile::HotSliceEntry {
+            shard_idx: 0,
+            file_offset: 8000,
+            len: 512,
+        },
+        // Arithmetic overflow
+        gguf_direct_io::expert_profile::HotSliceEntry {
+            shard_idx: 0,
+            file_offset: u64::MAX - 8,
+            len: 64,
+        },
+        // Invalid shard index
+        gguf_direct_io::expert_profile::HotSliceEntry {
+            shard_idx: 9,
+            file_offset: 0,
+            len: 64,
+        },
+    ];
+    gguf_direct_io::expert_profile::write_expert_profile(&profile_path, &entries).unwrap();
+    assert_eq!(pool.warm_expert_profile(&profile_path).unwrap(), 1);
+}

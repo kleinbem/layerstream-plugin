@@ -170,6 +170,7 @@ fn format_recommend_report(
     free_vram_bytes: u64,
     storage_bw: f64,
     no_draft: bool,
+    header_peek: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -199,14 +200,12 @@ fn format_recommend_report(
         ));
     }
     if let Some(best) = recs.iter().find(|r| r.recommended) {
-        if let Ok(parsed) = hf::HfSpec::parse(&best.hf_uri)
-            && let Ok(meta) = hf::inspect_remote_gguf(&parsed)
-        {
+        if let Some(summary) = header_peek {
             out.push_str(&format!(
                 "\nHeader peek ({}):\n",
                 best.candidate.primary_file
             ));
-            out.push_str(&format!("  {}\n", meta.summary_line()));
+            out.push_str(&format!("  {summary}\n"));
         }
         out.push_str("\nRecommended pull command:\n");
         out.push_str(&format!("  layerstream-plugin pull {}\n", best.hf_uri));
@@ -258,7 +257,19 @@ fn run_recommend_command(
     let output = if json {
         serde_json::to_string_pretty(&recs)?
     } else {
-        format_recommend_report(&recs, free_vram_bytes, storage_bw, no_draft)
+        let header_peek = recs.iter().find(|r| r.recommended).and_then(|best| {
+            let parsed = hf::HfSpec::parse(&best.hf_uri).ok()?;
+            hf::inspect_remote_gguf(&parsed)
+                .ok()
+                .map(|meta| meta.summary_line())
+        });
+        format_recommend_report(
+            &recs,
+            free_vram_bytes,
+            storage_bw,
+            no_draft,
+            header_peek.as_deref(),
+        )
     };
     print!("{output}");
     if json {
@@ -617,9 +628,16 @@ mod tests {
             2400.0,
             true,
         );
-        let report = format_recommend_report(&recs, 6 * 1024 * 1024 * 1024, 2400.0, false);
+        let report = format_recommend_report(
+            &recs,
+            6 * 1024 * 1024 * 1024,
+            2400.0,
+            false,
+            Some("llama | 32L | ctx=4096"),
+        );
         assert!(report.contains("Hardware profile: 6.0 GiB"));
         assert!(report.contains("Q4_K_M"));
+        assert!(report.contains("Header peek (model-Q4_K_M.gguf):"));
         assert!(report.contains("Recommended pull command:"));
 
         // Recommend error path for invalid repo
