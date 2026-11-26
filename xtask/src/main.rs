@@ -379,7 +379,7 @@ fn cmd_lint_cpp(root: &Path) -> Result<(), String> {
     nix_develop(
         root,
         None,
-        r#"clang-tidy crates/layerstream-core/cpp/backend_loader.cpp crates/layerstream-core/cpp/stream_engine.cpp -- -std=c++20 -Icrates/layerstream-core/cpp -isystem"$LLAMA_CPP_DIR/include" -isystem"$LLAMA_CPP_DIR/src" -isystem"$LLAMA_CPP_DIR/ggml/include" -isystem"$LLAMA_CPP_DIR/ggml/src""#,
+        r#"clang-tidy crates/layerstream-core/cpp/backend_loader.cpp crates/layerstream-core/cpp/stream_engine.cpp -- -std=c++23 -Icrates/layerstream-core/cpp -isystem"$LLAMA_CPP_DIR/include" -isystem"$LLAMA_CPP_DIR/src" -isystem"$LLAMA_CPP_DIR/ggml/include" -isystem"$LLAMA_CPP_DIR/ggml/src""#,
     )
 }
 
