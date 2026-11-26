@@ -553,4 +553,99 @@ fn load_slices_into_rejects_oob_and_overflow_before_cache_lookup() {
         pool.load_slices_into(&[("near_end", 0, 0, 128, 0)], &mut dst),
         Err(GgufIoError::OutOfBounds(_))
     ));
+
+    // 4. Absolute offset overflow (`abs_offset + rel_end` overflows u64).
+    let mut overflow_tensors = HashMap::new();
+    overflow_tensors.insert(
+        "huge_off".to_string(),
+        TensorLocation {
+            name: "huge_off".to_string(),
+            shard_idx: 0,
+            abs_offset: u64::MAX - 8,
+            ggml_type: 999,
+            dims: vec![16],
+        },
+    );
+    let idx_ov = GgufIndex {
+        shards: vec![dir.path().join("oob.gguf")],
+        shard_sizes: vec![4096],
+        meta: ModelMeta {
+            architecture: "llama".to_string(),
+            name: None,
+            n_layers: 1,
+            context_length: None,
+            total_file_bytes: 4096,
+        },
+        tensors: overflow_tensors,
+    };
+    let pool_ov = LayerIoPool::new_with_options(idx_ov, false, None, Some(65536)).unwrap();
+    assert!(matches!(
+        pool_ov.load_slices_into(&[("huge_off", 0, 0, 32, 0)], &mut dst),
+        Err(GgufIoError::OutOfBounds(_))
+    ));
+
+    // 5. `save_expert_profile` on empty cache (returns 0), then after populating cache (returns 1).
+    let empty_prof = dir.path().join("empty.lsep");
+    assert_eq!(pool.save_expert_profile(&empty_prof).unwrap(), 0);
+    assert!(
+        pool.load_slices_into(&[("small", 0, 0, 64, 0)], &mut dst)
+            .is_ok()
+    );
+    let pop_prof = dir.path().join("pop.lsep");
+    assert_eq!(pool.save_expert_profile(&pop_prof).unwrap(), 1);
+
+    // 6. `load_layer_direct_into` with `prefer_direct_io = false` exercises the buffered `pread_all`
+    //    fallback, and a truncated shard triggers `pread_all` unexpected-EOF cleanly.
+    let mut aligned_buf = gguf_direct_io::AlignedBuf::new(8192).unwrap();
+    let pin_buf = aligned_buf.as_mut_slice(8192);
+    let mut out_slices = vec![
+        gguf_direct_io::DirectSpanSlice {
+            src_offset: 0,
+            dst_offset: 0,
+            len: 0,
+            tensor_idx: 0,
+        };
+        2
+    ];
+    let n = pool
+        .load_layer_direct_into(0, Some(&[("small", 0, 64)]), pin_buf, &mut out_slices)
+        .unwrap();
+    assert_eq!(n, 1);
+
+    let trunc_shard = dir.path().join("trunc.gguf");
+    std::fs::write(&trunc_shard, vec![0xBBu8; 16]).unwrap();
+    let mut trunc_tensors = HashMap::new();
+    trunc_tensors.insert(
+        "t".to_string(),
+        TensorLocation {
+            name: "t".to_string(),
+            shard_idx: 0,
+            abs_offset: 0,
+            ggml_type: 0,
+            dims: vec![1024], // 4096 bytes, larger than 16-byte file on disk
+        },
+    );
+    let idx_trunc = GgufIndex {
+        shards: vec![trunc_shard],
+        shard_sizes: vec![4096],
+        meta: ModelMeta {
+            architecture: "llama".to_string(),
+            name: None,
+            n_layers: 1,
+            context_length: None,
+            total_file_bytes: 4096,
+        },
+        tensors: trunc_tensors,
+    };
+    let pool_trunc = LayerIoPool::new(idx_trunc, false).unwrap();
+    assert!(
+        pool_trunc
+            .load_layer_direct_into(0, Some(&[("t", 0, 4096)]), pin_buf, &mut out_slices)
+            .is_err()
+    );
+
+    // 7. `write_expert_profile` fails cleanly when target path is a directory (removes temp file).
+    let as_dir = dir.path().join("is_a_dir");
+    std::fs::create_dir_all(&as_dir).unwrap();
+    assert!(gguf_direct_io::expert_profile::write_expert_profile(&as_dir, &[]).is_err());
 }
