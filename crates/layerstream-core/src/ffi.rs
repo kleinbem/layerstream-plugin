@@ -100,6 +100,7 @@ pub struct LsEngineStats {
     pub using_gpu: bool,
     pub can_speculate: bool,
     pub rs_rollback_max: u32,
+    pub mtp_layers: u32,
     pub backend_name: [c_char; 32],
 }
 
@@ -274,6 +275,18 @@ unsafe extern "C" {
     pub fn ls_engine_kv_clear(eng: *mut LsEngine);
 
     pub fn ls_engine_kv_trim(eng: *mut LsEngine, pos_min: i32) -> bool;
+
+    pub fn ls_engine_mtp_draft(
+        eng: *mut LsEngine,
+        last_token: i32,
+        pos0: i32,
+        max_draft: i32,
+        out_tokens: *mut i32,
+        err_buf: *mut c_char,
+        err_cap: usize,
+    ) -> i32;
+
+    pub fn ls_engine_mtp_accept(eng: *mut LsEngine, n_accepted: i32);
 
     pub fn ls_engine_save_state(
         eng: *mut LsEngine,

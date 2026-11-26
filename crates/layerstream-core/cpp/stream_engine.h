@@ -129,6 +129,8 @@ typedef struct ls_engine_stats {
     bool can_speculate;
     /** Recurrent-state rollback window from llama_n_rs_seq() (0 on standard Transformers). */
     uint32_t rs_rollback_max;
+    /** Number of built-in MTP/NextN speculative draft layers (0 when model has no MTP heads). */
+    uint32_t mtp_layers;
     char backend_name[32];
 } ls_engine_stats;
 
@@ -200,6 +202,23 @@ bool ls_engine_token_is_eog(const ls_engine * eng, int32_t token);
 
 void ls_engine_kv_clear(ls_engine * eng);
 bool ls_engine_kv_trim(ls_engine * eng, int32_t pos_min);
+
+/**
+ * Draft up to `max_draft` tokens using the target model's built-in MTP/NextN head(s).
+ * Returns the number of drafted tokens (>= 0), 0 if the model has no MTP head, or < 0 on error.
+ */
+int32_t ls_engine_mtp_draft(
+    ls_engine * eng,
+    int32_t last_token,
+    int32_t pos0,
+    int32_t max_draft,
+    int32_t * out_tokens,
+    char * err_buf,
+    size_t err_cap
+);
+
+/** Advances the MTP hidden-state cursor after `n_accepted` draft tokens were accepted. */
+void ls_engine_mtp_accept(ls_engine * eng, int32_t n_accepted);
 
 /** Saves full KV memory state + `tokens[0..n_tokens)` to `path` via `llama_state_save_file`. */
 int ls_engine_save_state(

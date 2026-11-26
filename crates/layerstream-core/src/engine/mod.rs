@@ -11,10 +11,11 @@ use crate::ffi::{
     ls_engine_apply_chat_template, ls_engine_create, ls_engine_eval_greedy, ls_engine_eval_sample,
     ls_engine_eval_verify_greedy, ls_engine_eval_verify_sample, ls_engine_eval_verify_with_grammar,
     ls_engine_eval_with_grammar, ls_engine_free, ls_engine_get_stats, ls_engine_kv_clear,
-    ls_engine_kv_trim, ls_engine_load_state, ls_engine_n_ctx, ls_engine_save_state,
-    ls_engine_set_cancel_cb, ls_engine_token_is_eog, ls_engine_token_to_piece, ls_engine_tokenize,
-    ls_engine_vocab_size, ls_grammar_accept, ls_grammar_create, ls_grammar_free,
-    ls_probe_gpu_device, ls_probe_gpu_memory, ls_set_log_verbose,
+    ls_engine_kv_trim, ls_engine_load_state, ls_engine_mtp_accept, ls_engine_mtp_draft,
+    ls_engine_n_ctx, ls_engine_save_state, ls_engine_set_cancel_cb, ls_engine_token_is_eog,
+    ls_engine_token_to_piece, ls_engine_tokenize, ls_engine_vocab_size, ls_grammar_accept,
+    ls_grammar_create, ls_grammar_free, ls_probe_gpu_device, ls_probe_gpu_memory,
+    ls_set_log_verbose,
 };
 use crate::gguf_index::{GgufIndex, MAX_DRAFT_VOCAB_PAD_DELTA};
 use crate::io_reader::{IoStats, LayerIoPool};
@@ -570,6 +571,44 @@ impl StreamEngine {
     /// Returns the number of committed tokens currently tracked in the engine's KV prefix cache.
     pub fn cached_kv_len(&self) -> usize {
         self.cached_kv_tokens.len()
+    }
+
+    /// Drafts up to `max_draft` tokens using the target model's built-in MTP/NextN head(s).
+    /// Returns an empty `Vec` when the loaded model has no MTP layers.
+    pub fn mtp_draft(&mut self, last_token: i32, pos0: i32, max_draft: usize) -> Result<Vec<i32>> {
+        if max_draft == 0 || self.stats().mtp_layers == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = vec![0i32; max_draft];
+        let mut err_buf = [0 as c_char; 512];
+        // SAFETY: `self.raw` is a live `LsEngine` handle; `out` and `err_buf` are valid writable buffers.
+        let n = unsafe {
+            ls_engine_mtp_draft(
+                self.raw.as_ptr(),
+                last_token,
+                pos0,
+                max_draft as i32,
+                out.as_mut_ptr(),
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if n < 0 {
+            // SAFETY: C++ always NUL-terminates `err_buf` on error.
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }.to_string_lossy();
+            bail!("ls_engine_mtp_draft failed (rc={n}): {msg}");
+        }
+        out.truncate(n as usize);
+        Ok(out)
+    }
+
+    /// Advances the built-in MTP hidden-state cursor after `n_accepted` draft tokens were accepted.
+    pub fn mtp_accept(&mut self, n_accepted: usize) {
+        if self.stats().mtp_layers == 0 {
+            return;
+        }
+        // SAFETY: `self.raw` is a live `LsEngine` handle.
+        unsafe { ls_engine_mtp_accept(self.raw.as_ptr(), n_accepted as i32) };
     }
 
     /// Saves the engine's current KV cache memory and committed token sequence to `path` on disk
@@ -1136,15 +1175,16 @@ impl StreamEngine {
         } else {
             opts.max_tokens
         };
+        let has_mtp = st.mtp_layers > 0;
         let rs_rollback_cap = if st.rs_rollback_max > 0 {
             st.rs_rollback_max as usize
         } else {
             usize::MAX
         };
-        let can_speculate =
-            st.can_speculate && (opts.enable_ngram_speculation || draft_proposer.is_some());
+        let can_speculate = st.can_speculate
+            && (opts.enable_ngram_speculation || draft_proposer.is_some() || has_mtp);
 
-        let min_adaptive_k = if draft_proposer.is_some() {
+        let min_adaptive_k = if draft_proposer.is_some() || has_mtp {
             opts.max_draft_tokens.clamp(6, 10)
         } else {
             3
@@ -1225,7 +1265,7 @@ impl StreamEngine {
                 // Cascade: when a neural draft model is active, only let n-gram override it
                 // on strong verbatim matches (min_n=4, e.g. code edits/copying) so noisy
                 // 2-token prose hits never preempt the smarter draft model.
-                let ngram = if draft_proposer.is_some() {
+                let ngram = if draft_proposer.is_some() || has_mtp {
                     NgramProposer {
                         min_n: 4,
                         max_n: 6,
@@ -1242,17 +1282,24 @@ impl StreamEngine {
                 } else {
                     Vec::new()
                 };
-                if draft.len() < 2
-                    && let Some(dp) = draft_proposer.as_deref_mut()
-                {
-                    draft = dp.propose_with_cancel(
-                        &history,
-                        max_step_draft.min(adaptive_draft_k),
-                        cancel,
-                    )?;
-                    if is_cancelled() {
-                        finish_reason = "cancelled".to_string();
-                        break;
+                if draft.len() < 2 {
+                    if let Some(dp) = draft_proposer.as_deref_mut() {
+                        draft = dp.propose_with_cancel(
+                            &history,
+                            max_step_draft.min(adaptive_draft_k),
+                            cancel,
+                        )?;
+                        if is_cancelled() {
+                            finish_reason = "cancelled".to_string();
+                            break;
+                        }
+                    } else if has_mtp {
+                        draft =
+                            self.mtp_draft(next_tok, pos, max_step_draft.min(adaptive_draft_k))?;
+                        if is_cancelled() {
+                            finish_reason = "cancelled".to_string();
+                            break;
+                        }
                     }
                 }
                 // Guard against padded-vocab draft models proposing an out-of-range token ID.
@@ -1376,6 +1423,9 @@ impl StreamEngine {
                         next_tok = corrected_or_bonus;
                     }
 
+                    if has_mtp {
+                        self.mtp_accept(accepted);
+                    }
                     if early_stop {
                         break 'gen_loop;
                     }
@@ -1384,7 +1434,11 @@ impl StreamEngine {
                     // (verifying extra tokens is nearly free compared to an NVMe sweep),
                     // and gently downward on misses without collapsing below `min_adaptive_k`.
                     if accepted == draft.len() {
-                        let step = if draft_proposer.is_some() { 4 } else { 2 };
+                        let step = if draft_proposer.is_some() || has_mtp {
+                            4
+                        } else {
+                            2
+                        };
                         adaptive_draft_k = (adaptive_draft_k + step).min(max_adaptive_k);
                     } else if accepted == 0 {
                         adaptive_draft_k = (adaptive_draft_k.saturating_sub(1)).max(min_adaptive_k);

@@ -159,6 +159,14 @@ struct ls_engine {
     bool is_cuda_backend = false;
     bool can_speculate = false;
     uint32_t rs_rollback_max = 0;
+    llama_context * ctx_mtp = nullptr;
+    uint32_t mtp_layers = 0;
+    int32_t mtp_n_embd = 0;
+    bool mtp_is_mem_shared = false;
+    bool mtp_chain_heads = false;
+    std::vector<float> mtp_pending_h;
+    std::vector<float> mtp_verify_h;
+    int32_t mtp_verify_rows = 0;
     bool head_streamed = false;
     bool moe_active_streaming = false;
     std::string backend_name = "CPU";
@@ -250,6 +258,133 @@ struct ls_engine {
     bool moe_upload_done = false;
     bool stop_worker = false;
     std::thread worker_thread;
+
+    void init_mtp_context(uint32_t n_ctx, uint32_t n_batch, uint32_t n_threads, int32_t kv_cache_type) {
+        if (!model || !ctx) {
+            return;
+        }
+        const int32_t n_mtp = llama_model_n_layer_nextn(model);
+        if (n_mtp <= 0) {
+            return;
+        }
+        const int32_t n_embd = llama_model_n_embd_out(model);
+        if (n_embd <= 0) {
+            return;
+        }
+
+        llama_context_params mp = llama_context_default_params();
+        mp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        mp.n_ctx = n_ctx;
+        mp.n_batch = n_batch;
+        mp.n_ubatch = n_batch;
+        mp.n_threads = static_cast<int32_t>(n_threads);
+        mp.n_threads_batch = static_cast<int32_t>(n_threads);
+        if (!using_gpu) {
+            mp.offload_kqv = false;
+            mp.op_offload = false;
+        }
+        if (kv_cache_type == 1) {
+            mp.type_k = GGML_TYPE_Q8_0;
+            mp.type_v = GGML_TYPE_Q8_0;
+            mp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        } else if (kv_cache_type == 2) {
+            mp.type_k = GGML_TYPE_Q4_0;
+            mp.type_v = GGML_TYPE_Q4_0;
+            mp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        } else {
+            mp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        }
+        mp.abort_callback = &ls_engine::abort_cb;
+        mp.abort_callback_data = this;
+
+        llama_context * mctx = llama_init_from_model(model, mp);
+        if (!mctx) {
+            return;
+        }
+        ctx_mtp = mctx;
+        mtp_layers = static_cast<uint32_t>(n_mtp);
+        mtp_n_embd = n_embd;
+        mtp_is_mem_shared = (llama_get_ctx_other(ctx_mtp) == ctx);
+        mtp_chain_heads = (n_mtp > 1 && !mtp_is_mem_shared);
+        llama_set_embeddings_nextn(ctx, true, mtp_is_mem_shared);
+        llama_set_embeddings_nextn(ctx_mtp, true, true);
+        mtp_pending_h.assign(static_cast<size_t>(mtp_n_embd), 0.0f);
+        mtp_verify_h.clear();
+        mtp_verify_rows = 0;
+    }
+
+    void mtp_reset_state() {
+        if (ctx_mtp && !mtp_is_mem_shared) {
+            llama_memory_clear(llama_get_memory(ctx_mtp), true);
+        }
+        std::fill(mtp_pending_h.begin(), mtp_pending_h.end(), 0.0f);
+        mtp_verify_rows = 0;
+    }
+
+    void mtp_on_target_decode(const int32_t * tokens, int32_t n_tokens, int32_t pos_start) {
+        if (!ctx_mtp || mtp_n_embd <= 0 || n_tokens <= 0 || !tokens) {
+            return;
+        }
+        const size_t n_embd_sz = static_cast<size_t>(mtp_n_embd);
+        const size_t row_bytes = n_embd_sz * sizeof(float);
+
+        if (!mtp_is_mem_shared) {
+            const float * h_tgt = llama_get_embeddings_nextn(ctx);
+            if (!h_tgt) {
+                return;
+            }
+            llama_batch_ext * mb = llama_batch_ext_init(ctx_mtp);
+            if (!mb) {
+                return;
+            }
+            for (int32_t k = 0; k < n_tokens; ++k) {
+                const int32_t idx = llama_batch_ext_add_token(mb, 0, tokens[k]);
+                if (idx < 0) {
+                    llama_batch_ext_free(mb);
+                    return;
+                }
+                const llama_pos p = pos_start + k;
+                llama_batch_ext_set_pos(mb, idx, &p);
+                llama_batch_ext_set_output_logits(mb, idx, false);
+                const float * h_row = (k == 0)
+                    ? mtp_pending_h.data()
+                    : h_tgt + static_cast<size_t>(k - 1) * n_embd_sz;
+                llama_batch_ext_set_embd_state(mb, idx, llama_embd{h_row, 1, n_embd_sz});
+            }
+
+            llama_memory_t mem_mtp = llama_get_memory(ctx_mtp);
+            const uint32_t heads = mtp_chain_heads ? mtp_layers : 1u;
+            for (uint32_t head = 0; head < heads; ++head) {
+                if (mtp_chain_heads) {
+                    llama_memory_seq_rm(mem_mtp, 0, pos_start, -1);
+                    llama_set_nextn_layer_offset(ctx_mtp, static_cast<int32_t>(head));
+                }
+                if (llama_process(ctx_mtp, LLAMA_PROCESS_TYPE_DECODE, mb) != 0) {
+                    break;
+                }
+            }
+            if (mtp_chain_heads) {
+                llama_set_nextn_layer_offset(ctx_mtp, 0);
+            }
+            llama_batch_ext_free(mb);
+        }
+
+        mtp_verify_rows = n_tokens;
+        mtp_verify_h.resize(static_cast<size_t>(n_tokens) * n_embd_sz);
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const float * h = llama_get_embeddings_nextn_ith(ctx, i);
+            if (h) {
+                std::memcpy(mtp_verify_h.data() + static_cast<size_t>(i) * n_embd_sz, h, row_bytes);
+            }
+        }
+        if (n_tokens > 0) {
+            std::memcpy(
+                mtp_pending_h.data(),
+                mtp_verify_h.data() + static_cast<size_t>(n_tokens - 1) * n_embd_sz,
+                row_bytes
+            );
+        }
+    }
 
     // Active decode pass tracking (accessed only from eval thread during llama_decode).
     int32_t active_stream_layer = -1;
