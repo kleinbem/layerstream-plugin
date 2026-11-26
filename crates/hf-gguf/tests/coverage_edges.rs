@@ -69,3 +69,92 @@ fn hub_tilde_cache_expansion_auth_header_and_invalid_json_paths() {
     );
     assert!(missing.is_err());
 }
+
+#[test]
+fn download_truncation_progress_callback_and_sha256_mismatch_paths() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Truncated download (advertises Content-Length: 1024, closes after 32 bytes)
+    let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a1 = l1.local_addr().unwrap();
+    let h1 = thread::spawn(move || {
+        if let Ok((mut s, _)) = l1.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n");
+            let _ = s.write_all(&[0xAB; 32]);
+            let _ = s.flush();
+        }
+    });
+    unsafe {
+        std::env::set_var("HF_ENDPOINT", format!("http://{a1}"));
+    }
+    let err_trunc = hf_gguf::ensure_hf_downloaded("hf://Org/Trunc:m.gguf", dir.path()).unwrap_err();
+    assert!(!format!("{err_trunc:#}").is_empty());
+    let _ = h1.join();
+
+    // 2. Slow chunked download triggers on_progress callback (>100ms between chunks)
+    let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a2 = l2.local_addr().unwrap();
+    let h2 = thread::spawn(move || {
+        if let Ok((mut s, _)) = l2.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n");
+            let _ = s.write_all(&[0x11; 32]);
+            let _ = s.flush();
+            thread::sleep(Duration::from_millis(130));
+            let _ = s.write_all(&[0x22; 32]);
+            let _ = s.flush();
+        }
+    });
+    unsafe {
+        std::env::set_var("HF_ENDPOINT", format!("http://{a2}"));
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_cb = calls.clone();
+    let cb: hf_gguf::ProgressCallback = Arc::new(move |_p| {
+        calls_cb.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+    let ok_path =
+        hf_gguf::ensure_hf_downloaded_with_progress("hf://Org/Slow:m.gguf", dir.path(), Some(&cb))
+            .unwrap();
+    assert!(ok_path.is_file());
+    assert!(calls.load(Ordering::Relaxed) >= 2);
+    let _ = h2.join();
+
+    // 3. SHA-256 mismatch via X-Linked-Etag removes corrupt .part file and errors
+    let l3 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a3 = l3.local_addr().unwrap();
+    let fake_sha = "0".repeat(64);
+    let h3 = thread::spawn(move || {
+        if let Ok((mut s, _)) = l3.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nX-Linked-Etag: \"{fake_sha}\"\r\nConnection: close\r\n\r\n"
+            );
+            let _ = s.write_all(hdr.as_bytes());
+            let _ = s.write_all(&[0x55; 16]);
+            let _ = s.flush();
+        }
+    });
+    unsafe {
+        std::env::set_var("HF_ENDPOINT", format!("http://{a3}"));
+    }
+    let err_sha = hf_gguf::ensure_hf_downloaded("hf://Org/BadSha:m.gguf", dir.path()).unwrap_err();
+    assert!(format!("{err_sha:#}").contains("SHA-256 mismatch"));
+    unsafe {
+        std::env::remove_var("HF_ENDPOINT");
+    }
+    let _ = h3.join();
+}

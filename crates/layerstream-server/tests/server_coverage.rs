@@ -613,3 +613,210 @@ async fn server_chat_text_streaming_unload_errors_and_graceful_serve() {
         let _ = h.await;
     }
 }
+
+#[tokio::test]
+async fn text_completions_and_resolve_model_error_branches_are_covered() {
+    let dir = std::env::temp_dir().join(format!("ls-srv-cov-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let model_path = dir.join("tiny.gguf");
+    write_tiny_llama_gguf(&model_path, 64, false);
+    let mut reg = ModelRegistry::default();
+    reg.register_file(&model_path, Some("tiny".to_string()), None)
+        .unwrap();
+
+    // Empty registry -> 404 on omitted model and unknown model
+    let empty_app = build_router(AppState::new(make_config(
+        ModelRegistry::default(),
+        Duration::from_secs(60),
+    )));
+    let r_empty = empty_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"prompt": "hi"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_empty.status(), StatusCode::NOT_FOUND);
+
+    let r_missing = empty_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "does-not-exist", "prompt": "hi"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_missing.status(), StatusCode::NOT_FOUND);
+
+    // Loading status (503) and loading error (500) on /v1/completions
+    let state = AppState::new(make_config(reg, Duration::from_secs(60)));
+    state.set_loading_status(Some("downloading 40%".to_string()));
+    let app = build_router(state.clone());
+    let r_loading = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "tiny", "prompt": "hi"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_loading.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    state.set_loading_failed("disk full".to_string());
+    let r_failed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "tiny", "prompt": "hi"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    state.set_loading_error(None);
+
+    // Invalid temperature -> 400 on /v1/completions
+    let r_bad_temp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "tiny", "prompt": "hi", "temperature": -1.0}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_bad_temp.status(), StatusCode::BAD_REQUEST);
+
+    // Invalid response_format -> 400 on /v1/completions
+    let r_bad_rf = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny",
+                        "prompt": "hi",
+                        "response_format": {"type": "json_schema"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_bad_rf.status(), StatusCode::BAD_REQUEST);
+
+    // PromptTooLongError on non-streaming and streaming /v1/completions and /v1/chat/completions
+    let huge_prompt = "a ".repeat(300);
+    let r_long_text = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "tiny", "prompt": huge_prompt, "max_tokens": 2}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_long_text.status(), StatusCode::BAD_REQUEST);
+
+    let r_long_text_sse = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "tiny", "prompt": huge_prompt, "max_tokens": 2, "stream": true})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_long_text_sse.status(), StatusCode::OK);
+    let sse_bytes = axum::body::to_bytes(r_long_text_sse.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&sse_bytes).contains("invalid_request_error"));
+
+    let r_long_chat = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny",
+                        "messages": [{"role": "user", "content": huge_prompt}],
+                        "max_tokens": 2
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_long_chat.status(), StatusCode::BAD_REQUEST);
+
+    let r_long_chat_sse = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny",
+                        "messages": [{"role": "user", "content": huge_prompt}],
+                        "max_tokens": 2,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_long_chat_sse.status(), StatusCode::OK);
+    let chat_sse_bytes = axum::body::to_bytes(r_long_chat_sse.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&chat_sse_bytes).contains("invalid_request_error"));
+}
