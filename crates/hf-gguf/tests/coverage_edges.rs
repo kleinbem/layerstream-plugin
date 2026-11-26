@@ -199,4 +199,22 @@ fn fuzz_gguf_header_and_hf_spec_parsers_never_panic() {
             assert!(!spec.filename.contains('\\'));
         }
     }
+
+    // 3. Incomplete multi-part shard groups (missing shard 2 or missing shard 1) are filtered out.
+    let entries: Vec<hf_gguf::HfTreeEntry> = serde_json::from_value(serde_json::json!([
+        {"type": "file", "path": "complete-Q4_K_M-00001-of-00002.gguf", "size": 1000},
+        {"type": "file", "path": "complete-Q4_K_M-00002-of-00002.gguf", "size": 2000},
+        {"type": "file", "path": "partial-Q8_0-00001-of-00002.gguf", "size": 3000},
+        {"type": "file", "path": "orphan-Q6_K-00002-of-00002.gguf", "size": 4000},
+        {"type": "file", "path": "badidx-Q4_0-00000-of-00002.gguf", "size": 500}
+    ]))
+    .unwrap();
+    let grouped = hf_gguf::group_gguf_tree_entries(&entries);
+    assert_eq!(grouped.len(), 1);
+    assert_eq!(
+        grouped[0].primary_file,
+        "complete-Q4_K_M-00001-of-00002.gguf"
+    );
+    assert_eq!(grouped[0].total_bytes, 3000);
+    assert_eq!(grouped[0].shard_count, 2);
 }

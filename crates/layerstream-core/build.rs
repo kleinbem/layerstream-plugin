@@ -307,6 +307,18 @@ fn main() {
         }
     }
 
+    if target_os == "linux"
+        && !dynamic_backends
+        && env::var("LAYERSTREAM_CPP_COVERAGE").ok().as_deref() != Some("1")
+    {
+        // Emit per-function/data sections in static C/C++ libraries so the linker's default
+        // `--gc-sections` pass can dead-strip unused llama.cpp/ggml symbols from final binaries.
+        cfg.cflag("-ffunction-sections")
+            .cflag("-fdata-sections")
+            .cxxflag("-ffunction-sections")
+            .cxxflag("-fdata-sections");
+    }
+
     let has_explicit_gen = env::var("CMAKE_GENERATOR")
         .ok()
         .is_some_and(|v| !v.trim().is_empty());

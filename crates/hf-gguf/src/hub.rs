@@ -191,7 +191,13 @@ pub(crate) fn quant_quality_rank(quant: &str) -> i32 {
 /// Groups Hugging Face tree entries into logical GGUF checkpoints, combining multi-part shards
 /// (`*-00001-of-0000N.gguf`) and filtering out `mmproj` vision projector files.
 pub fn group_gguf_tree_entries(entries: &[HfTreeEntry]) -> Vec<HfGgufCandidate> {
-    let mut grouped: BTreeMap<String, (String, u64, u32)> = BTreeMap::new();
+    struct ShardGroup {
+        primary_file: String,
+        total_bytes: u64,
+        shard_count: u32,
+        seen: std::collections::BTreeSet<u32>,
+    }
+    let mut grouped: BTreeMap<(String, u32), ShardGroup> = BTreeMap::new();
     for entry in entries {
         if entry.entry_type.as_deref().is_some_and(|t| t != "file") {
             continue;
@@ -212,6 +218,9 @@ pub fn group_gguf_tree_entries(entries: &[HfTreeEntry]) -> Vec<HfGgufCandidate> 
         };
         let stem = fname.strip_suffix(".gguf").unwrap_or(fname);
         if let Some((prefix, idx, total)) = strip_shard_suffix(stem) {
+            if idx == 0 || idx > total {
+                continue;
+            }
             let key = match dir_prefix {
                 Some(d) => format!("{d}/{prefix}"),
                 None => prefix.to_string(),
@@ -221,23 +230,44 @@ pub fn group_gguf_tree_entries(entries: &[HfTreeEntry]) -> Vec<HfGgufCandidate> 
                 Some(d) => format!("{d}/{shard1_name}"),
                 None => shard1_name,
             };
-            let slot = grouped.entry(key).or_insert((primary, 0, total));
-            slot.1 = slot.1.saturating_add(bytes);
-            if idx == 1 {
-                slot.0 = entry.path.clone();
+            let slot = grouped.entry((key, total)).or_insert_with(|| ShardGroup {
+                primary_file: primary,
+                total_bytes: 0,
+                shard_count: total,
+                seen: std::collections::BTreeSet::new(),
+            });
+            if slot.seen.insert(idx) {
+                slot.total_bytes = slot.total_bytes.saturating_add(bytes);
+                if idx == 1 {
+                    slot.primary_file = entry.path.clone();
+                }
             }
         } else {
-            grouped.insert(entry.path.clone(), (entry.path.clone(), bytes, 1));
+            let mut seen = std::collections::BTreeSet::new();
+            seen.insert(1);
+            grouped.insert(
+                (entry.path.clone(), 1),
+                ShardGroup {
+                    primary_file: entry.path.clone(),
+                    total_bytes: bytes,
+                    shard_count: 1,
+                    seen,
+                },
+            );
         }
     }
 
     let mut out: Vec<HfGgufCandidate> = grouped
         .into_values()
-        .map(|(primary_file, total_bytes, shard_count)| HfGgufCandidate {
-            quant: extract_quant_label(&primary_file),
-            primary_file,
-            total_bytes,
-            shard_count,
+        // Reject incomplete multi-part shard groups (missing any shard in 1..=shard_count).
+        .filter(|g| {
+            g.shard_count == 1 || (g.seen.len() as u32 == g.shard_count && g.seen.contains(&1))
+        })
+        .map(|g| HfGgufCandidate {
+            quant: extract_quant_label(&g.primary_file),
+            primary_file: g.primary_file,
+            total_bytes: g.total_bytes,
+            shard_count: g.shard_count,
         })
         .collect();
     out.sort_by_key(|c| c.total_bytes);
