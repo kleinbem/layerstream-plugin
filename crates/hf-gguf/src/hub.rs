@@ -300,6 +300,7 @@ pub fn list_hf_gguf_candidates(repo_id: &str, revision: &str) -> Result<Vec<HfGg
     let initial_origin = url_origin(&initial_url);
 
     let agent = ureq::Agent::config_builder()
+        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
         .timeout_recv_body(Some(Duration::from_secs(30)))
@@ -335,6 +336,8 @@ pub fn list_hf_gguf_candidates(repo_id: &str, revision: &str) -> Result<Vec<HfGg
         let candidate_next = parse_next_link_url(resp.headers(), &url);
         let body = resp
             .into_body()
+            .with_config()
+            .limit(16 * 1024 * 1024)
             .read_to_string()
             .map_err(|e| HfError::Http(format!("read Hugging Face tree JSON: {e}")))?;
         let page_entries: Vec<HfTreeEntry> =

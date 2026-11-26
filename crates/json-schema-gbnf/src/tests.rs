@@ -1030,3 +1030,32 @@ fn edge_case_gbnf_max_items_zero_const_enum_and_surrogates() {
     .unwrap();
     assert_all_gbnf_rules_defined(&excl);
 }
+
+#[test]
+fn rejects_excessive_nesting_depth_and_rule_explosion() {
+    // 80 nested array wrappers exceed MAX_COMPILE_DEPTH (64).
+    let mut deep = json!({"type": "integer"});
+    for _ in 0..80 {
+        deep = json!({"type": "array", "items": deep});
+    }
+    let err = json_schema_to_gbnf(&deep).unwrap_err();
+    assert!(
+        err.to_string().contains("nesting depth"),
+        "unexpected error: {err}"
+    );
+
+    // Wide object with thousands of distinct bounded-string properties exceeds MAX_GRAMMAR_RULES (4096).
+    let mut props = serde_json::Map::new();
+    for i in 0..4200 {
+        props.insert(
+            format!("p{i}"),
+            json!({"type": "string", "minLength": 1, "maxLength": 2}),
+        );
+    }
+    let wide = json!({"type": "object", "properties": props});
+    let err = json_schema_to_gbnf(&wide).unwrap_err();
+    assert!(
+        err.to_string().contains("rule budget"),
+        "unexpected error: {err}"
+    );
+}

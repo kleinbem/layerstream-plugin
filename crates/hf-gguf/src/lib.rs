@@ -674,14 +674,14 @@ fn extract_header_sha256(headers: &ureq::http::HeaderMap, key: &str) -> Option<S
     }
 }
 
-fn url_origin(url: &str) -> Option<String> {
+pub(crate) fn url_origin(url: &str) -> Option<String> {
     let parsed = url.parse::<ureq::http::Uri>().ok()?;
     let scheme = parsed.scheme_str()?;
     let authority = parsed.authority()?.as_str();
     Some(format!("{scheme}://{authority}"))
 }
 
-fn resolve_redirect_url(base_url: &str, location: &str) -> Result<String> {
+pub(crate) fn resolve_redirect_url(base_url: &str, location: &str) -> Result<String> {
     let loc = location.trim();
     if loc.starts_with("http://") || loc.starts_with("https://") {
         return Ok(loc.to_string());

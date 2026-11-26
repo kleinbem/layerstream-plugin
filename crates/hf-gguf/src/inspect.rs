@@ -327,23 +327,44 @@ pub fn inspect_local_gguf(path: &Path) -> Result<RemoteGgufMetadata> {
 
 fn fetch_remote_header_bytes(spec: &HfSpec, max_bytes: usize) -> Result<Vec<u8>> {
     let url = spec.download_url();
+    let initial_origin = crate::url_origin(&url);
     let token = load_hf_token();
+    // Handle redirects manually so `Authorization: Bearer` is only sent to the initial Hub origin
+    // and never leaked to redirected CDN hosts.
     let agent = ureq::Agent::config_builder()
+        .max_redirects(0)
         .timeout_global(Some(Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)))
         .http_status_as_error(false)
         .build()
         .new_agent();
 
-    let mut req = agent
-        .get(&url)
-        .header("Range", &format!("bytes=0-{}", max_bytes - 1));
-    if let Some(tok) = token.as_deref() {
-        req = req.header("Authorization", &format!("Bearer {tok}"));
-    }
+    let mut current_url = url.clone();
+    let mut resp = None;
+    for _hop in 0..10 {
+        let mut req = agent
+            .get(&current_url)
+            .header("Range", &format!("bytes=0-{}", max_bytes - 1));
+        if let Some(tok) = token.as_deref()
+            && crate::url_origin(&current_url) == initial_origin
+        {
+            req = req.header("Authorization", &format!("Bearer {tok}"));
+        }
 
-    let resp = req
-        .call()
-        .map_err(|e| HfError::Http(format!("remote GGUF inspect request failed: {e}")))?;
+        let r = req
+            .call()
+            .map_err(|e| HfError::Http(format!("remote GGUF inspect request failed: {e}")))?;
+        let code = r.status().as_u16();
+        if matches!(code, 301 | 302 | 303 | 307 | 308)
+            && let Some(loc) = r.headers().get("location").and_then(|v| v.to_str().ok())
+        {
+            current_url = crate::resolve_redirect_url(&current_url, loc)?;
+            continue;
+        }
+        resp = Some(r);
+        break;
+    }
+    let resp = resp
+        .ok_or_else(|| HfError::Http(format!("too many redirects inspecting remote GGUF {url}")))?;
     let status = resp.status().as_u16();
     if status == 404 {
         return Err(HfError::NotFound(format!(
@@ -353,7 +374,7 @@ fn fetch_remote_header_bytes(spec: &HfSpec, max_bytes: usize) -> Result<Vec<u8>>
     }
     if status != 200 && status != 206 {
         return Err(HfError::Http(format!(
-            "remote GGUF inspect HTTP {status} for {url}"
+            "remote GGUF inspect HTTP {status} for {current_url}"
         )));
     }
 
@@ -652,5 +673,86 @@ mod tests {
         // Stops cleanly without recursing past MAX_ARRAY_NESTING_DEPTH.
         let meta = parse_gguf_header_metadata(&buf).expect("gracefully stops on deep nesting");
         assert_eq!(meta.architecture, "llama");
+    }
+
+    #[test]
+    fn inspect_remote_gguf_strips_auth_on_cross_origin_redirect() {
+        let _env_guard = crate::tests::ENV_LOCK.lock().unwrap();
+        let cdn_listener = TcpListener::bind("127.0.0.1:0").expect("bind cdn");
+        let cdn_addr = cdn_listener.local_addr().expect("cdn addr");
+        let hub_listener = TcpListener::bind("127.0.0.1:0").expect("bind hub");
+        let hub_addr = hub_listener.local_addr().expect("hub addr");
+
+        let cdn_server = thread::spawn(move || {
+            let (mut stream, _) = cdn_listener.accept().expect("cdn accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut saw_auth = false;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                if line.to_ascii_lowercase().starts_with("authorization:") {
+                    saw_auth = true;
+                }
+                line.clear();
+            }
+            let payload = synthetic_glm4moe_mtp_header();
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&payload);
+            saw_auth
+        });
+
+        let hub_server = thread::spawn(move || {
+            let (mut stream, _) = hub_listener.accept().expect("hub accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut saw_auth = false;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                if line.to_ascii_lowercase().starts_with("authorization:") {
+                    saw_auth = true;
+                }
+                line.clear();
+            }
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{cdn_addr}/blob.gguf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            saw_auth
+        });
+
+        let prev_ep = std::env::var_os("HF_ENDPOINT");
+        let prev_tok = std::env::var_os("HF_TOKEN");
+        // SAFETY: serialized via ENV_LOCK around a single synchronous request.
+        unsafe {
+            std::env::set_var("HF_ENDPOINT", format!("http://{hub_addr}"));
+            std::env::set_var("HF_TOKEN", "hf_secret_test_token");
+        }
+        let spec = HfSpec::parse("hf://org/repo:model.gguf").unwrap();
+        let meta = inspect_remote_gguf(&spec).expect("redirected inspect");
+        match prev_ep {
+            Some(v) => {
+                // SAFETY: restores saved HF_ENDPOINT value.
+                unsafe { std::env::set_var("HF_ENDPOINT", v) }
+            }
+            None => {
+                // SAFETY: removes test-only HF_ENDPOINT override.
+                unsafe { std::env::remove_var("HF_ENDPOINT") }
+            }
+        }
+        match prev_tok {
+            Some(v) => {
+                // SAFETY: restores saved HF_TOKEN value.
+                unsafe { std::env::set_var("HF_TOKEN", v) }
+            }
+            None => {
+                // SAFETY: removes test-only HF_TOKEN override.
+                unsafe { std::env::remove_var("HF_TOKEN") }
+            }
+        }
+        assert!(hub_server.join().expect("hub join"));
+        assert!(!cdn_server.join().expect("cdn join"));
+        assert_eq!(meta.architecture, "glm4moe");
     }
 }

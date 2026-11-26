@@ -32,6 +32,8 @@ use serde_json::{Map, Value};
 
 const MAX_STRING_BOUND: u64 = 4096;
 const MAX_ARRAY_BOUND: u64 = 64;
+const MAX_COMPILE_DEPTH: usize = 64;
+const MAX_GRAMMAR_RULES: usize = 4096;
 
 const BASE_PRIMITIVE_RULES: &str = r#"ws ::= ([ \t\n\r])*
 json-hex4-bmp ::= [0-9a-ce-fA-CE-F] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2}
@@ -253,6 +255,7 @@ struct SchemaCompiler<'a> {
     ref_rules: BTreeMap<String, Option<String>>,
     active_refs: BTreeSet<String>,
     counter: usize,
+    depth: usize,
 }
 
 impl<'a> SchemaCompiler<'a> {
@@ -266,7 +269,15 @@ impl<'a> SchemaCompiler<'a> {
             ref_rules: BTreeMap::new(),
             active_refs: BTreeSet::new(),
             counter: 0,
+            depth: 0,
         })
+    }
+
+    fn check_rule_budget(&self, hint: &str) -> Result<()> {
+        if self.rules.len() >= MAX_GRAMMAR_RULES {
+            bail!("JSON Schema at '{hint}' exceeds maximum GBNF rule budget ({MAX_GRAMMAR_RULES})");
+        }
+        Ok(())
     }
 
     fn fresh_rule_name(&mut self, hint: &str) -> String {
@@ -371,6 +382,17 @@ impl<'a> SchemaCompiler<'a> {
 
     /// Compiles `node`, returning `Ok(None)` when the schema branch is unsatisfiable (`false`).
     fn compile_value(&mut self, node: &Value, hint: &str) -> Result<Option<String>> {
+        if self.depth >= MAX_COMPILE_DEPTH {
+            bail!("JSON Schema nesting depth at '{hint}' exceeds maximum ({MAX_COMPILE_DEPTH})");
+        }
+        self.check_rule_budget(hint)?;
+        self.depth += 1;
+        let res = self.compile_value_inner(node, hint);
+        self.depth -= 1;
+        res
+    }
+
+    fn compile_value_inner(&mut self, node: &Value, hint: &str) -> Result<Option<String>> {
         let obj = match node {
             Value::Bool(true) => return Ok(Some("json-value".to_string())),
             Value::Bool(false) => return Ok(None),
