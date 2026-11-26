@@ -240,22 +240,51 @@ impl ExpertSliceCache {
     }
 }
 
+/// Computes an adaptive TinyLFU hot-expert RAM cache budget from host total and
+/// available RAM:
+/// - **Edge (`<= 12 GiB` total):** reserves 1.5 GiB headroom and caps at 1 GiB
+///   (keeps 8 GB Jetson Orin Nano swap-free with lower peak RSS).
+/// - **Standard (`12..48 GiB` total):** reserves 2 GiB headroom and caps at 4 GiB.
+/// - **High (`>= 48 GiB` total):** reserves 4 GiB headroom and caps at 32 GiB
+///   (caches most/all hot experts on 64 GB unified-memory APUs & workstations).
+pub fn auto_expert_cache_budget_for_meminfo(total_bytes: u64, avail_bytes: u64) -> usize {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let (reserve, cap, num, den) = if total_bytes == 0 || total_bytes <= 12 * GIB {
+        (1536 * MIB, 1024 * MIB, 1, 2)
+    } else if total_bytes < 48 * GIB {
+        (2048 * MIB, 4096 * MIB, 3, 5)
+    } else {
+        (4096 * MIB, 32 * GIB, 1, 2)
+    };
+    let target = avail_bytes.saturating_sub(reserve).saturating_mul(num) / den;
+    target.min(cap) as usize
+}
+
 fn auto_expert_cache_budget_bytes() -> usize {
     #[cfg(target_os = "linux")]
     {
         if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+            let mut total_kb = 0u64;
+            let mut avail_kb = 0u64;
             for line in content.lines() {
-                if let Some(rest) = line.strip_prefix("MemAvailable:")
+                if let Some(rest) = line.strip_prefix("MemTotal:")
                     && let Some(val) = rest.split_whitespace().next()
                     && let Ok(kb) = val.parse::<u64>()
                 {
-                    let avail = kb.saturating_mul(1024);
-                    // Keep >= 1.25 GiB headroom for OS, CUDA/Vulkan scratch, and services.
-                    let reserve = 1280u64 * 1024 * 1024;
-                    let cap = 2048u64 * 1024 * 1024;
-                    let target = (avail.saturating_sub(reserve) * 3) / 5;
-                    return target.min(cap) as usize;
+                    total_kb = kb;
+                } else if let Some(rest) = line.strip_prefix("MemAvailable:")
+                    && let Some(val) = rest.split_whitespace().next()
+                    && let Ok(kb) = val.parse::<u64>()
+                {
+                    avail_kb = kb;
                 }
+            }
+            if avail_kb > 0 {
+                return auto_expert_cache_budget_for_meminfo(
+                    total_kb.saturating_mul(1024),
+                    avail_kb.saturating_mul(1024),
+                );
             }
         }
         0
@@ -452,6 +481,15 @@ pub struct LayerIoPool {
 
 impl LayerIoPool {
     pub fn new(index: GgufIndex, prefer_direct_io: bool) -> Result<Self> {
+        Self::new_with_options(index, prefer_direct_io, None, None)
+    }
+
+    pub fn new_with_options(
+        index: GgufIndex,
+        prefer_direct_io: bool,
+        io_threads_override: Option<usize>,
+        expert_cache_bytes_override: Option<usize>,
+    ) -> Result<Self> {
         let mut shards = Vec::with_capacity(index.shards.len());
         let mut all_direct = prefer_direct_io;
 
@@ -489,6 +527,7 @@ impl LayerIoPool {
         let io_threads = std::env::var("LAYERSTREAM_IO_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
+            .or(io_threads_override)
             .map(|n| n.clamp(1, 8))
             .unwrap_or(DEFAULT_IO_THREADS);
 
@@ -526,7 +565,8 @@ impl LayerIoPool {
         let explicit_expert_cache = std::env::var("LAYERSTREAM_EXPERT_CACHE_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .map(|mb| mb.saturating_mul(1024 * 1024));
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .or(expert_cache_bytes_override);
 
         let workers = ScopedWorkerPool::new(io_threads.max(moe_io_threads));
         #[cfg(target_os = "linux")]
@@ -1532,6 +1572,39 @@ pub fn probe_dir_storage_mib_per_s(dir: &std::path::Path) -> Option<f64> {
         .ok()
         .map(|(mib_s, _)| mib_s)
         .filter(|&bw| bw.is_finite() && bw > 0.0)
+}
+
+#[cfg(test)]
+mod adaptive_cache_tests {
+    use super::*;
+
+    #[test]
+    fn auto_expert_cache_budget_scales_by_memory_tier() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+        // 8 GiB edge host with 4 GiB available: reserve 1.5 GiB, 50% of 2.5 GiB = 1.25 GiB -> capped at 1 GiB
+        assert_eq!(
+            auto_expert_cache_budget_for_meminfo(8 * GIB, 4 * GIB),
+            (1024 * MIB) as usize
+        );
+        // Edge host with tight RAM (1 GiB available < 1.5 GiB reserve) -> 0
+        assert_eq!(auto_expert_cache_budget_for_meminfo(8 * GIB, GIB), 0);
+        // 24 GiB standard host with 16 GiB available -> capped at 4 GiB
+        assert_eq!(
+            auto_expert_cache_budget_for_meminfo(24 * GIB, 16 * GIB),
+            (4096 * MIB) as usize
+        );
+        // 64 GiB high-RAM APU with 48 GiB available -> (48 - 4) / 2 = 22 GiB
+        assert_eq!(
+            auto_expert_cache_budget_for_meminfo(64 * GIB, 48 * GIB),
+            (22 * GIB) as usize
+        );
+        // 128 GiB workstation with 100 GiB available -> capped at 32 GiB
+        assert_eq!(
+            auto_expert_cache_budget_for_meminfo(128 * GIB, 100 * GIB),
+            (32 * GIB) as usize
+        );
+    }
 }
 
 #[cfg(test)]

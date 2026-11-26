@@ -428,4 +428,41 @@ mod tests {
         assert!(!default_tuning_dir().as_os_str().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn default_tuning_dir_respects_xdg_home_and_temp_fallbacks() {
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: unit tests in coverage run with `--test-threads 1`.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "/tmp/ls-xdg-test");
+        }
+        assert_eq!(
+            default_tuning_dir(),
+            PathBuf::from("/tmp/ls-xdg-test/layerstream/tuning")
+        );
+        // SAFETY: unit tests in coverage run with `--test-threads 1`.
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::set_var("HOME", "/tmp/ls-home-test");
+        }
+        assert_eq!(
+            default_tuning_dir(),
+            PathBuf::from("/tmp/ls-home-test/.config/layerstream/tuning")
+        );
+        // SAFETY: unit tests in coverage run with `--test-threads 1`.
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        assert!(default_tuning_dir().ends_with(Path::new("layerstream").join("tuning")));
+        // SAFETY: restore original environment variables.
+        unsafe {
+            if let Some(v) = prev_xdg {
+                std::env::set_var("XDG_CONFIG_HOME", v);
+            }
+            if let Some(v) = prev_home {
+                std::env::set_var("HOME", v);
+            }
+        }
+    }
 }

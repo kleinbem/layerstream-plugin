@@ -295,6 +295,8 @@ pub(crate) fn start_server(
             cpu_head,
             stream_head,
             moe_active_streaming,
+            io_threads: None,
+            expert_cache_bytes: None,
             idle_timeout: Duration::from_secs(idle_timeout_secs),
             enable_ngram_speculation: true,
             max_draft_tokens: max_draft_tokens.max(1),

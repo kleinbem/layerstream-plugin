@@ -59,6 +59,10 @@ pub struct EngineArgs {
     #[arg(long, env = "LAYERSTREAM_HARDWARE_PROFILE", default_value = "auto")]
     pub profile: String,
 
+    /// Optional explicit TinyLFU hot-expert RAM cache cap in MiB (defaults to RAM-tier auto).
+    #[arg(long, env = "LAYERSTREAM_EXPERT_CACHE_MB")]
+    pub expert_cache_mb: Option<usize>,
+
     // Hidden internal/CI flags kept out of normal `--help` to prevent footguns.
     #[arg(long, hide = true)]
     pub batch_size: Option<u32>,
@@ -231,14 +235,19 @@ impl EngineArgs {
         let n_batch = self.batch_size.unwrap_or(hw_profile.recommended_n_batch);
         let cpu_embeddings = self.low_vram || hw_profile.recommended_cpu_embeddings;
         let stream_head = self.low_vram || hw_profile.recommended_stream_head;
+        let io_threads = saved_tuning
+            .as_ref()
+            .map(|t| t.best_io_threads)
+            .unwrap_or(hw_profile.recommended_io_threads);
+        let expert_cache_bytes = self
+            .expert_cache_mb
+            .map(|mb| mb.saturating_mul(1024 * 1024));
         tracing::info!(
             profile = %hw_profile.label(),
             n_batch,
-            recommended_io_threads = saved_tuning
-                .as_ref()
-                .map(|t| t.best_io_threads)
-                .unwrap_or(hw_profile.recommended_io_threads),
+            recommended_io_threads = io_threads,
             prefer_direct_io,
+            expert_cache_mb = ?self.expert_cache_mb,
             tuned_profile_loaded = saved_tuning.is_some(),
             cpu_embeddings,
             stream_head,
@@ -261,6 +270,8 @@ impl EngineArgs {
                 cpu_head: false,
                 stream_head,
                 moe_active_streaming: true,
+                io_threads: Some(io_threads),
+                expert_cache_bytes,
                 idle_timeout: Duration::from_secs(effective_idle_timeout_secs),
                 enable_ngram_speculation: true,
                 max_draft_tokens: self.max_draft_tokens,
@@ -421,6 +432,7 @@ mod tests {
             in_process: false,
             allow_slow: true,
             profile: "auto".to_string(),
+            expert_cache_mb: None,
             batch_size: Some(256),
             threads: None,
             no_gpu: true,

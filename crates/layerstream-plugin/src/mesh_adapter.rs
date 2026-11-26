@@ -454,6 +454,8 @@ mod tests {
             cpu_head: false,
             stream_head: false,
             moe_active_streaming: true,
+            io_threads: None,
+            expert_cache_bytes: None,
             idle_timeout: Duration::ZERO,
             enable_ngram_speculation: true,
             max_draft_tokens: 8,

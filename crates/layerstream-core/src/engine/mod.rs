@@ -99,6 +99,10 @@ pub struct EngineConfig {
     pub stream_head: bool,
     /// Enable per-expert active streaming for sparse MoE layers (default true).
     pub moe_active_streaming: bool,
+    /// Optional explicit I/O worker thread count (defaults to profile/env or 1).
+    pub io_threads: Option<usize>,
+    /// Optional explicit TinyLFU hot-expert RAM cache ceiling in bytes (None = RAM-tier auto).
+    pub expert_cache_bytes: Option<usize>,
 }
 
 impl EngineConfig {
@@ -121,6 +125,8 @@ impl EngineConfig {
             cpu_head: false,
             stream_head: false,
             moe_active_streaming: true,
+            io_threads: None,
+            expert_cache_bytes: None,
         }
     }
 
@@ -219,7 +225,12 @@ impl StreamEngine {
             None
         } else {
             let index = GgufIndex::open(&cfg.model_path)?;
-            let pool = LayerIoPool::new(index, cfg.prefer_direct_io)?;
+            let pool = LayerIoPool::new_with_options(
+                index,
+                cfg.prefer_direct_io,
+                cfg.io_threads,
+                cfg.expert_cache_bytes,
+            )?;
             Some(Box::into_raw(Box::new(pool)))
         };
 
@@ -1353,8 +1364,18 @@ impl StreamEngine {
                             break;
                         }
                     } else if has_mtp {
-                        draft =
-                            self.mtp_draft(next_tok, pos, max_step_draft.min(adaptive_draft_k))?;
+                        let io = self.io_stats();
+                        let mtp_cap = effective_mtp_draft_cap(
+                            max_step_draft.min(adaptive_draft_k),
+                            self.stats().moe_layers,
+                            io.cache_hits,
+                            io.cache_misses,
+                        );
+                        draft = if mtp_cap > 0 {
+                            self.mtp_draft(next_tok, pos, mtp_cap)?
+                        } else {
+                            Vec::new()
+                        };
                         if is_cancelled() {
                             finish_reason = "cancelled".to_string();
                             break;
@@ -1767,7 +1788,58 @@ impl Drop for StreamEngine {
     }
 }
 
+/// Routing-aware MTP break-even guard.
+///
+/// On dense models (`moe_layers == 0`), during cold-start (`hits + misses < 32`), or
+/// when the MoE hot-expert cache hit rate is high (`>= 90%`), MTP runs at full
+/// `base_cap`. When a sparse MoE is in the mid-range hit band (`45%..90%`), drafting
+/// many extra tokens pulls in too many cold experts from NVMe per sweep, so draft
+/// depth is capped to `1`. Below `45%`, it is capped to `2`.
+pub fn effective_mtp_draft_cap(
+    base_cap: usize,
+    moe_layers: u32,
+    cache_hits: u64,
+    cache_misses: u64,
+) -> usize {
+    if base_cap == 0 || moe_layers == 0 {
+        return base_cap;
+    }
+    let total = cache_hits.saturating_add(cache_misses);
+    if total < 32 {
+        return base_cap;
+    }
+    let hit_rate = cache_hits as f64 / total as f64;
+    if hit_rate >= 0.90 {
+        base_cap
+    } else if hit_rate >= 0.45 {
+        base_cap.min(1)
+    } else {
+        base_cap.min(2)
+    }
+}
+
 mod callbacks;
 use callbacks::{
     Utf8PieceAssembler, rust_load_layer_direct_cb, rust_load_slices_cb, rust_load_tensors_cb,
 };
+
+#[cfg(test)]
+mod mtp_guard_tests {
+    use super::*;
+
+    #[test]
+    fn effective_mtp_draft_cap_respects_dense_cold_and_moe_hit_bands() {
+        assert_eq!(effective_mtp_draft_cap(0, 16, 80, 20), 0);
+        assert_eq!(effective_mtp_draft_cap(4, 0, 50, 50), 4); // dense model
+        assert_eq!(effective_mtp_draft_cap(4, 16, 10, 10), 4); // cold start (< 32 samples)
+        assert_eq!(effective_mtp_draft_cap(4, 16, 95, 5), 4); // >= 90% hot cache -> full speed
+        assert_eq!(effective_mtp_draft_cap(4, 16, 80, 20), 1); // 80% mid-band -> cap to 1
+        assert_eq!(effective_mtp_draft_cap(4, 16, 20, 80), 2); // 20% low-band -> cap to 2
+
+        let cfg = EngineConfig::streaming("demo.gguf");
+        assert!(cfg.io_threads.is_none());
+        assert!(cfg.expert_cache_bytes.is_none());
+        let ref_cfg = EngineConfig::reference("demo.gguf");
+        assert!(ref_cfg.full_resident_reference);
+    }
+}

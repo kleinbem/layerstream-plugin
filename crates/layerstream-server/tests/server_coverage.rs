@@ -272,6 +272,8 @@ fn make_config(registry: ModelRegistry, idle_timeout: Duration) -> ServerConfig 
         cpu_head: false,
         stream_head: false,
         moe_active_streaming: true,
+        io_threads: None,
+        expert_cache_bytes: None,
         idle_timeout,
         enable_ngram_speculation: true,
         max_draft_tokens: 3,

@@ -24,7 +24,7 @@ pub use chat_parse::{
 };
 pub use engine::{
     CancelledError, ChatMessage, EngineConfig, GenerateOptions, GenerateSummary, KvCacheType,
-    PromptTooLongError, StopFilter, StreamEngine,
+    PromptTooLongError, StopFilter, StreamEngine, effective_mtp_draft_cap,
 };
 pub use ffi::{LsEngineStats, LsSampleParams};
 pub use gguf_index::{
