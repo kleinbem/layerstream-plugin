@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LayerStream Edge LLM Benchmarks & Live HF GGUF Fit Estimator</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --surface: #121a30;
+      --surface-2: #182340;
+      --border: #263558;
+      --text: #e6edf8;
+      --muted: #93a4c4;
+      --accent: #6366f1;
+      --accent-2: #38bdf8;
+      --good: #22c55e;
+      --warn: #f59e0b;
+      --radius: 12px;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); line-height: 1.5; }
+    a { color: var(--accent-2); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 1280px; margin: 0 auto; padding: 24px 20px 48px; }
+    header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 20px; }
+    h1 { margin: 0 0 6px; font-size: 1.65rem; letter-spacing: -0.02em; }
+    .subtitle { color: var(--muted); font-size: 0.95rem; margin: 0; }
+    .links { display: flex; flex-wrap: wrap; gap: 10px; }
+    .pill { background: var(--surface-2); border: 1px solid var(--border); padding: 6px 12px; border-radius: 999px; font-size: 0.85rem; color: var(--text); }
+    .pill:hover { border-color: var(--accent-2); text-decoration: none; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 22px; }
+    .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+    .kpi-label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .kpi-val { font-size: 1.45rem; font-weight: 700; margin: 4px 0 2px; color: #fff; }
+    .kpi-sub { font-size: 0.82rem; color: var(--good); }
+    .tabs { display: flex; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 18px; }
+    .tab-btn { background: transparent; color: var(--muted); border: 1px solid transparent; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 0.92rem; }
+    .tab-btn.active { background: var(--surface-2); color: #fff; border-color: var(--accent); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 16px; }
+    .controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 14px; }
+    label { display: flex; flex-direction: column; gap: 5px; font-size: 0.82rem; color: var(--muted); }
+    input, select { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 0.92rem; }
+    button.primary { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 9px 16px; font-weight: 600; cursor: pointer; }
+    button.primary:hover { filter: brightness(1.1); }
+    button.preset { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 999px; padding: 5px 11px; font-size: 0.8rem; cursor: pointer; }
+    button.preset:hover { border-color: var(--accent-2); }
+    .presets { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 14px; }
+    .chart { width: 100%; min-height: 380px; }
+    .table-wrap { overflow-x: auto; max-height: 520px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+    th { position: sticky; top: 0; background: var(--surface-2); color: var(--muted); font-weight: 600; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    pre { background: #080c18; border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 0.84rem; color: #dbeafe; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.76rem; background: var(--surface-2); border: 1px solid var(--border); }
+    .good { color: var(--good); }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>⚡ LayerStream Edge LLM Benchmarks & Live HF GGUF Estimator</h1>
+      <p class="subtitle">Bare-metal 8 GB NVIDIA Jetson Orin Nano · <span id="run-count">185</span> runs × 81 columns · 5 engines · Round 12 (<code>v0.6.3</code>)</p>
+    </div>
+    <div class="links">
+      <a class="pill" href="https://github.com/kleinbem/layerstream-plugin" target="_blank" rel="noopener">GitHub Repo</a>
+      <a class="pill" href="https://github.com/kleinbem/layerstream-plugin/releases/tag/v0.6.3" target="_blank" rel="noopener">v0.6.3 Release</a>
+      <a class="pill" href="https://huggingface.co/datasets/kleinbem/layerstream-orin-nano-benchmarks" target="_blank" rel="noopener">HF Dataset (Parquet)</a>
+      <a class="pill" href="https://huggingface.co/collections/kleinbem/layerstream-edge-out-of-core-llm-benchmarks-6b00a3f994c2e1c552883a46" target="_blank" rel="noopener">HF Collection</a>
+    </div>
+  </header>
+
+  <section class="kpi-grid">
+    <div class="kpi">
+      <div class="kpi-label">OLMoE-1B-7B (Sparse MoE)</div>
+      <div class="kpi-val">15.08 tok/s</div>
+      <div class="kpi-sub">1.04 J/tok · 100% cache hit · 0 MiB swap</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Qwen2.5-14B (8.37 GiB Dense)</div>
+      <div class="kpi-val">4.87 tok/s</div>
+      <div class="kpi-sub">code_edit · 3.49 J/tok · +100.6% prompt_heavy</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Qwen3-30B-A3B (17.3 GiB MoE)</div>
+      <div class="kpi-val">1.66 tok/s</div>
+      <div class="kpi-sub">9.09 J/tok · 0 MiB swap · beats llama.cpp & colibri</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Qwen2.5-32B (18.49 GiB, 2.53× RAM)</div>
+      <div class="kpi-val">1.59 tok/s</div>
+      <div class="kpi-sub">code_edit · +24.5% prompt_heavy · 0 MiB swap</div>
+    </div>
+  </section>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab-btn active" data-tab="pareto">1. Pareto & Round Progression</button>
+    <button class="tab-btn" data-tab="gguf">2. Live HF GGUF Fit Estimator</button>
+    <button class="tab-btn" data-tab="recommend">3. Edge Model Recommender</button>
+    <button class="tab-btn" data-tab="data">4. Data Explorer, Data Studio SQL & MCP</button>
+  </nav>
+
+  <!-- TAB 1 -->
+  <section id="tab-pareto" class="tab-panel active">
+    <div class="card">
+      <div class="controls">
+        <label>Model filter <input id="f-model" placeholder="e.g. 14B, OLMoE, 32B, Qwen3" /></label>
+        <label>Engine <select id="f-engine"><option value="all">all</option></select></label>
+        <label>Workload <select id="f-workload"><option value="all">all</option></select></label>
+        <label>Round <select id="f-round"><option value="all">all</option></select></label>
+      </div>
+      <div id="chart-rss" class="chart"></div>
+    </div>
+    <div class="chart-grid">
+      <div class="card"><div id="chart-energy" class="chart"></div></div>
+      <div class="card"><div id="chart-prog" class="chart"></div></div>
+    </div>
+  </section>
+
+  <!-- TAB 2 -->
+  <section id="tab-gguf" class="tab-panel">
+    <div class="card">
+      <p class="muted" style="margin-top:0">Paste <strong>any public Hugging Face GGUF repository</strong> — queries the HF Hub Tree API live in your browser (zero multi-GB download), groups multi-shard GGUFs, ranks quants for your VRAM + NVMe budget, and generates a ready-to-run <code>layerstream</code> snippet.</p>
+      <div class="presets">
+        <button class="preset" data-repo="Qwen/Qwen2.5-14B-Instruct-GGUF" data-vram="8">Qwen2.5-14B-GGUF (8 GB)</button>
+        <button class="preset" data-repo="allenai/OLMoE-1B-7B-0125-Instruct-GGUF" data-vram="8">OLMoE-1B-7B-GGUF (8 GB)</button>
+        <button class="preset" data-repo="unsloth/Qwen3-30B-A3B-GGUF" data-vram="8">Qwen3-30B-A3B-GGUF (8 GB)</button>
+        <button class="preset" data-repo="Qwen/Qwen2.5-32B-Instruct-GGUF" data-vram="12">Qwen2.5-32B-GGUF (12 GB)</button>
+      </div>
+      <div class="controls">
+        <label>Hugging Face GGUF Repo <input id="g-repo" value="Qwen/Qwen2.5-14B-Instruct-GGUF" /></label>
+        <label>GPU VRAM / Unified RAM (GiB) <input id="g-vram" type="number" min="4" max="128" step="1" value="8" /></label>
+        <label>NVMe Read BW (MiB/s) <input id="g-nvme" type="number" min="300" max="12000" step="100" value="2800" /></label>
+        <label>Memory Architecture
+          <select id="g-unified">
+            <option value="true" selected>Unified (Jetson / Apple Silicon / Strix Halo)</option>
+            <option value="false">Discrete GPU VRAM</option>
+          </select>
+        </label>
+        <label>Quant filter (optional) <input id="g-filter" placeholder="e.g. Q4_K" /></label>
+      </div>
+      <button id="g-run" class="primary">Inspect Repo & Estimate Fit</button>
+      <div id="g-result" style="margin-top:16px"></div>
+    </div>
+  </section>
+
+  <!-- TAB 3 -->
+  <section id="tab-recommend" class="tab-panel">
+    <div class="card">
+      <div class="controls">
+        <label>Target VRAM / Unified RAM (GiB)
+          <select id="r-vram">
+            <option value="4">4 GiB</option>
+            <option value="8" selected>8 GiB (Jetson Orin Nano / RTX 4060)</option>
+            <option value="12">12 GiB (RTX 3060 / 4070)</option>
+            <option value="16">16 GiB (Apple M-series / RTX 4060 Ti)</option>
+            <option value="24">24+ GiB (RTX 3090 / 4090)</option>
+          </select>
+        </label>
+        <label>Primary Use Case
+          <select id="r-use">
+            <option value="coding" selected>Coding & Structured Edits</option>
+            <option value="chat">General Chat</option>
+            <option value="reasoning">Deep Reasoning (MoE 30B-A3B)</option>
+            <option value="low_power">Ultra-Low Power / Max Speed (&lt;1.5 J/tok)</option>
+          </select>
+        </label>
+      </div>
+      <div id="r-output"></div>
+    </div>
+  </section>
+
+  <!-- TAB 4 -->
+  <section id="tab-data" class="tab-panel">
+    <div class="card">
+      <h3 style="margin-top:0">Benchmark Table (<span id="tbl-count">0</span> matching rows)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Round</th><th>Engine</th><th>Version</th><th>Model</th><th>Workload</th><th>Mode</th>
+              <th class="num">Decode (tok/s)</th><th class="num">TTFT (s)</th><th class="num">Peak RSS (MiB)</th><th class="num">Swap Δ</th><th class="num">J/tok</th>
+            </tr>
+          </thead>
+          <tbody id="tbl-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Run Live SQL in Hugging Face Data Studio / DuckDB</h3>
+      <pre><code>SELECT round, engine, model, workload,
+       ROUND(decode_tok_per_s, 3) AS tok_s,
+       ROUND(peak_rss_mib, 0) AS rss_mib,
+       ROUND(joules_per_tok, 2) AS j_per_tok
+FROM 'hf://datasets/kleinbem/layerstream-orin-nano-benchmarks/data/train-00000-of-00001.parquet'
+WHERE round = 'round12_v063'
+ORDER BY decode_tok_per_s DESC;</code></pre>
+      <h3>Run the Local Gradio 5 + MCP Server</h3>
+      <pre><code>git clone https://github.com/kleinbem/layerstream-plugin
+uv run --with "gradio[mcp]>=5.49,<6" --with plotly --with pandas --with huggingface_hub \
+  python layerstream-plugin/benchmarks/mcp_server.py</code></pre>
+    </div>
+  </section>
+</div>
+
+<script>
+const KNOWN_QUANTS = [
+  "UD-IQ1_S","UD-IQ1_M","UD-IQ2_XXS","UD-IQ2_XS","UD-IQ2_M","UD-IQ3_XXS",
+  "UD-Q2_K_XL","UD-Q3_K_XL","UD-Q4_K_XL","UD-Q5_K_XL","UD-Q6_K_XL","UD-Q8_K_XL",
+  "IQ1_S","IQ1_M","IQ2_XXS","IQ2_XS","IQ2_S","IQ2_M","IQ3_XXS","IQ3_XS","IQ3_S","IQ3_M",
+  "IQ4_XS","IQ4_NL","Q2_K_XL","Q2_K_L","Q2_K_S","Q2_K","Q3_K_XL","Q3_K_L","Q3_K_M","Q3_K_S",
+  "Q4_K_XL","Q4_K_L","Q4_K_M","Q4_K_S","Q4_1","Q4_0","Q5_K_XL","Q5_K_L","Q5_K_M","Q5_K_S",
+  "Q5_1","Q5_0","Q6_K_XL","Q6_K","Q8_0","BF16","F16","FP16"
+];
+const SHARD_RE = /^(.*)-(\d{5})-of-(\d{5})$/;
+let RECORDS = [];
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+}
+function roundNum(r) {
+  const m = String(r || "").match(/round(\d+)/);
+  return m ? Number(m[1]) : 0;
+}
+function fmt(v, d = 2) {
+  return (v === null || v === undefined || Number.isNaN(Number(v))) ? "—" : Number(v).toFixed(d);
+}
+
+// Tabs
+document.querySelectorAll(".tab-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+    if (btn.dataset.tab === "pareto") renderCharts();
+  });
+});
+
+function populateSelect(id, values) {
+  const el = document.getElementById(id);
+  values.forEach(v => {
+    const opt = document.createElement("option");
+    opt.value = v; opt.textContent = v;
+    el.appendChild(opt);
+  });
+}
+
+function filteredRecords() {
+  const m = document.getElementById("f-model").value.trim().toLowerCase();
+  const e = document.getElementById("f-engine").value;
+  const w = document.getElementById("f-workload").value;
+  const r = document.getElementById("f-round").value;
+  return RECORDS.filter(x => {
+    if (m && !String(x.model || "").toLowerCase().includes(m)) return false;
+    if (e !== "all" && x.engine !== e) return false;
+    if (w !== "all" && x.workload !== w) return false;
+    if (r !== "all" && x.round !== r) return false;
+    return true;
+  });
+}
+
+function renderCharts() {
+  const rows = filteredRecords();
+  renderTable(rows);
+  if (typeof Plotly === "undefined") return;
+  const valid = rows.filter(r => typeof r.decode_tok_per_s === "number");
+  const layoutBase = {
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "#0d1426",
+    font: { color: "#e6edf8", size: 12 },
+    margin: { t: 44, r: 20, b: 50, l: 55 },
+    xaxis: { gridcolor: "#1f2e4f" },
+    yaxis: { gridcolor: "#1f2e4f" }
+  };
+
+  // 1. Throughput vs Peak RSS by engine
+  const byEngine = {};
+  valid.filter(r => typeof r.peak_rss_mib === "number").forEach(r => {
+    (byEngine[r.engine] ||= []).push(r);
+  });
+  const tracesRss = Object.entries(byEngine).map(([eng, list]) => ({
+    name: eng,
+    type: "scatter",
+    mode: "markers",
+    x: list.map(r => r.peak_rss_mib),
+    y: list.map(r => r.decode_tok_per_s),
+    text: list.map(r => `${r.round} · ${r.model}<br>${r.mode} (${r.workload})<br>${fmt(r.decode_tok_per_s,3)} tok/s · ${fmt(r.peak_rss_mib,0)} MiB · ${fmt(r.joules_per_tok,2)} J/tok`),
+    hoverinfo: "text",
+    marker: { size: 10 }
+  }));
+  Plotly.newPlot("chart-rss", tracesRss, {
+    ...layoutBase,
+    title: "Throughput (tok/s) vs. Peak RSS (MiB)",
+    xaxis: { ...layoutBase.xaxis, title: "Peak RSS (MiB)" },
+    yaxis: { ...layoutBase.yaxis, title: "Decode Throughput (tok/s)" }
+  }, { responsive: true });
+
+  // 2. Energy efficiency (J/tok vs tok/s)
+  const byModel = {};
+  valid.filter(r => typeof r.joules_per_tok === "number").forEach(r => {
+    (byModel[r.model] ||= []).push(r);
+  });
+  const tracesEnergy = Object.entries(byModel).map(([mod, list]) => ({
+    name: mod.replace(".gguf", ""),
+    type: "scatter",
+    mode: "markers",
+    x: list.map(r => r.joules_per_tok),
+    y: list.map(r => r.decode_tok_per_s),
+    text: list.map(r => `${r.round} · ${r.engine}<br>${r.mode} (${r.workload})<br>${fmt(r.decode_tok_per_s,3)} tok/s · ${fmt(r.joules_per_tok,2)} J/tok`),
+    hoverinfo: "text",
+    marker: { size: 9 }
+  }));
+  Plotly.newPlot("chart-energy", tracesEnergy, {
+    ...layoutBase,
+    title: "Energy Efficiency: tok/s vs. Gross J/tok (left-top is best)",
+    xaxis: { ...layoutBase.xaxis, title: "Gross Energy (J/tok)" },
+    yaxis: { ...layoutBase.yaxis, title: "Decode (tok/s)" }
+  }, { responsive: true });
+
+  // 3. Round progression for layerstream-plugin
+  const ls = valid.filter(r => r.engine === "layerstream-plugin");
+  const bestByModelRound = {};
+  ls.forEach(r => {
+    const key = `${r.model}||${r.round}`;
+    if (!bestByModelRound[key] || r.decode_tok_per_s > bestByModelRound[key].decode_tok_per_s) {
+      bestByModelRound[key] = r;
+    }
+  });
+  const progByModel = {};
+  Object.values(bestByModelRound).forEach(r => {
+    (progByModel[r.model] ||= []).push(r);
+  });
+  const tracesProg = Object.entries(progByModel).map(([mod, list]) => {
+    list.sort((a, b) => roundNum(a.round) - roundNum(b.round));
+    return {
+      name: mod.replace(".gguf", ""),
+      type: "scatter",
+      mode: "lines+markers",
+      x: list.map(r => r.round),
+      y: list.map(r => r.decode_tok_per_s),
+      text: list.map(r => `${r.round} (${r.engine_version || "—"})<br>${r.mode}<br>${fmt(r.decode_tok_per_s,3)} tok/s`),
+      hoverinfo: "text"
+    };
+  });
+  Plotly.newPlot("chart-prog", tracesProg, {
+    ...layoutBase,
+    title: "Round-over-Round Peak Decode Throughput (R2 → R12 v0.6.3)",
+    xaxis: { ...layoutBase.xaxis, title: "Round" },
+    yaxis: { ...layoutBase.yaxis, title: "Peak Decode (tok/s)" }
+  }, { responsive: true });
+}
+
+function renderTable(rows) {
+  const sorted = [...rows].sort((a, b) => (b.decode_tok_per_s ?? -1) - (a.decode_tok_per_s ?? -1));
+  document.getElementById("tbl-count").textContent = sorted.length;
+  document.getElementById("tbl-body").innerHTML = sorted.map(r => `<tr>
+    <td><code>${esc(r.round)}</code></td>
+    <td><code>${esc(r.engine)}</code></td>
+    <td><code>${esc(r.engine_version || "—")}</code></td>
+    <td><code>${esc(r.model)}</code></td>
+    <td>${esc(r.workload)}</td>
+    <td><code>${esc(r.mode)}</code></td>
+    <td class="num"><strong>${fmt(r.decode_tok_per_s, 3)}</strong></td>
+    <td class="num">${r.workload === "multi_turn_prefix_reuse" ? `${fmt(r.turn1_ttft_s,1)}→${fmt(r.turn2_ttft_s,1)}` : fmt(r.ttft_s, 2)}</td>
+    <td class="num">${fmt(r.peak_rss_mib, 0)}</td>
+    <td class="num">${r.swap_delta_mib == null ? "—" : (r.swap_delta_mib >= 0 ? "+" : "") + fmt(r.swap_delta_mib, 1)}</td>
+    <td class="num">${fmt(r.joules_per_tok, 2)}</td>
+  </tr>`).join("");
+}
+
+function extractQuant(path) {
+  const fname = path.split("/").pop();
+  const stem = fname.endsWith(".gguf") ? fname.slice(0, -5) : fname;
+  const m = stem.match(SHARD_RE);
+  const upper = (m ? m[1] : stem).toUpperCase();
+  return KNOWN_QUANTS.find(q => upper.includes(q)) || "GGUF";
+}
+
+let ggufReqSeq = 0;
+let ggufAbort = null;
+
+async function runGgufEstimator() {
+  const reqId = ++ggufReqSeq;
+  if (ggufAbort) ggufAbort.abort();
+  ggufAbort = new AbortController();
+  const { signal } = ggufAbort;
+
+  const raw = document.getElementById("g-repo").value.trim()
+    .replace(/^hf:\/\//, "")
+    .replace(/^https?:\/\/huggingface\.co\//, "")
+    .replace(/^\/+|\/+$/g, "");
+  const vram = Number(document.getElementById("g-vram").value) || 8;
+  const nvme = Number(document.getElementById("g-nvme").value) || 2800;
+  const unified = document.getElementById("g-unified").value === "true";
+  const qf = document.getElementById("g-filter").value.trim().toUpperCase();
+  const out = document.getElementById("g-result");
+  out.innerHTML = `<p class="muted">Querying Hugging Face Hub API for <code>${esc(raw)}</code>…</p>`;
+
+  try {
+    const [treeResp, metaResp] = await Promise.all([
+      fetch(`https://huggingface.co/api/models/${raw}/tree/main?recursive=true`, { signal }),
+      fetch(`https://huggingface.co/api/models/${raw}`, { signal }).catch(() => null)
+    ]);
+    if (reqId !== ggufReqSeq) return;
+    if (!treeResp.ok) {
+      out.innerHTML = `<p style="color:#f87171">Hugging Face API returned HTTP ${treeResp.status} for <code>${esc(raw)}</code>.</p>`;
+      return;
+    }
+    const entries = await treeResp.json();
+    const modelMeta = metaResp && metaResp.ok ? await metaResp.json().catch(() => null) : null;
+    if (reqId !== ggufReqSeq) return;
+    const grouped = {};
+    for (const item of entries) {
+      if (item.type !== "file" || !String(item.path || "").toLowerCase().endsWith(".gguf")) continue;
+      const path = item.path;
+      const size = Number((item.lfs && item.lfs.size) || item.size || 0);
+      const stem = path.slice(0, -5);
+      const m = stem.match(SHARD_RE);
+      if (m) {
+        const key = m[1], idx = Number(m[2]), total = Number(m[3]);
+        if (!grouped[key]) grouped[key] = { primary: path, firstIdx: idx, bytes: 0, shards: total, quant: extractQuant(path) };
+        grouped[key].bytes += size;
+        if (idx < grouped[key].firstIdx) { grouped[key].firstIdx = idx; grouped[key].primary = path; }
+      } else {
+        grouped[path] = { primary: path, firstIdx: 1, bytes: size, shards: 1, quant: extractQuant(path) };
+      }
+    }
+    const cands = Object.values(grouped)
+      .filter(c => !qf || c.quant.toUpperCase().includes(qf) || c.primary.toUpperCase().includes(qf))
+      .sort((a, b) => a.bytes - b.bytes);
+    if (!cands.length) {
+      out.innerHTML = `<p class="muted">No matching <code>.gguf</code> files found in <code>${esc(raw)}</code>.</p>`;
+      return;
+    }
+
+    const ggufArch = String((modelMeta && modelMeta.gguf && modelMeta.gguf.architecture) || "");
+    const cfgExperts = Number((modelMeta && modelMeta.config && (modelMeta.config.num_local_experts || modelMeta.config.n_routed_experts || modelMeta.config.num_experts)) || 0);
+    const metaTags = Array.isArray(modelMeta && modelMeta.tags) ? modelMeta.tags.map(t => String(t).toLowerCase()) : [];
+    const isMoe = cfgExperts > 1 || /moe|mixtral|olmoe|deepseek/i.test(ggufArch) || metaTags.includes("moe") || /moe|a3b|a22b|mixtral|olmoe/i.test(raw);
+    const usableGib = Math.max(1.0, vram - (unified ? 2.2 : 1.2));
+    const nvmeGibS = Math.max(0.2, nvme / 1024);
+    let best = null, bestScore = -1e9;
+    const scored = cands.map(c => {
+      const sizeGib = c.bytes / (1024 ** 3);
+      let fit, resPct, low, high;
+      if (sizeGib <= usableGib * 0.92) {
+        fit = "Full GPU Resident"; resPct = 100;
+        low = Math.max(12, (unified ? 40 : 80) / Math.max(sizeGib, 0.5));
+        high = low * 1.35;
+      } else {
+        resPct = Math.min(90, Math.max(0, (usableGib / Math.max(sizeGib, 0.1)) * 75));
+        const streamGib = sizeGib * (1 - resPct / 100);
+        if (isMoe) {
+          fit = "Sparse MoE + TinyLFU";
+          const eff = Math.max(0.08, streamGib * 0.12);
+          low = Math.min(18, (nvmeGibS / eff) * 0.65);
+          high = Math.min(22, (nvmeGibS / eff) * 1.15);
+        } else {
+          fit = "Hybrid NVMe Stream + Draft";
+          const base = nvmeGibS / Math.max(streamGib, 0.15);
+          low = base * 1.4; high = base * 3.8;
+        }
+      }
+      const qBonus = c.quant.includes("Q4_K_M") ? 25 : (c.quant.includes("Q4_") ? 18 : (c.quant.includes("Q2_K") && isMoe ? 22 : 10));
+      const score = qBonus + Math.min(high, 15) * 1.5 - Math.max(0, sizeGib - usableGib * 3) * 4;
+      if (score > bestScore) { bestScore = score; best = c; }
+      return { ...c, sizeGib, fit, resPct, low, high };
+    });
+
+    const uri = `hf://${raw}:${best.primary}`;
+    out.innerHTML = `
+      <p><strong>${esc(raw)}</strong> · ${scored.length} GGUF checkpoint(s) · usable budget <code>~${usableGib.toFixed(1)} GiB</code> · NVMe <code>${nvme} MiB/s</code></p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Quant</th><th class="num">Size (GiB)</th><th class="num">Shards</th><th>Fit Mode</th><th class="num">Resident %</th><th class="num">Est. Decode (tok/s)</th><th>Pick</th></tr></thead>
+        <tbody>${scored.map(s => `<tr>
+          <td><code>${esc(s.quant)}</code></td><td class="num">${s.sizeGib.toFixed(2)}</td><td class="num">${s.shards}</td>
+          <td>${esc(s.fit)}</td><td class="num">${s.resPct.toFixed(0)}%</td>
+          <td class="num"><code>${s.low.toFixed(2)} - ${s.high.toFixed(2)}</code></td>
+          <td>${s.primary === best.primary ? "⭐" : ""}</td>
+        </tr>`).join("")}</tbody>
+      </table></div>
+      <h4 style="margin-bottom:6px">Quick Start (<code>layerstream-plugin v0.6.3</code>)</h4>
+      <pre><code>pip install layerstream layerstream-cuda13
+layerstream serve --model ${esc(uri)} --vram-budget-mb auto</code></pre>`;
+  } catch (err) {
+    if (err && err.name === "AbortError") return;
+    if (reqId !== ggufReqSeq) return;
+    out.innerHTML = `<p style="color:#f87171">Error querying Hugging Face API: ${esc(err.message)}</p>`;
+  }
+}
+
+function renderRecommender() {
+  const vram = Number(document.getElementById("r-vram").value);
+  const uc = document.getElementById("r-use").value;
+  let model, draft, why;
+  if (vram <= 6 || uc === "low_power") {
+    model = "allenai/OLMoE-1B-7B-0125-Instruct-GGUF:OLMoE-1B-7B-0125-Instruct-Q2_K.gguf";
+    draft = null;
+    why = "64-expert sparse MoE (2.5 GiB) with TinyLFU hot-expert cache (100% hit rate). Measured on 8 GB Orin Nano (R12 v0.6.3): <strong>15.03–15.08 tok/s</strong> at <strong>1.04–1.33 J/tok</strong>, 0 MiB swap.";
+  } else if (vram <= 10 && (uc === "coding" || uc === "chat")) {
+    model = "Qwen/Qwen2.5-14B-Instruct-GGUF:qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf";
+    draft = "Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_k_m.gguf";
+    why = "8.37 GiB dense 14B (Q4_K_M) streamed over NVMe with 0.5B speculative draft. Measured on 8 GB Orin Nano (R12 v0.6.3, b5400): <strong>4.873 tok/s</strong> code_edit (3.49 J/tok), <strong>1.702 tok/s</strong> open_ended, <strong>0.987 tok/s</strong> prompt_heavy.";
+  } else if (vram <= 10 && uc === "reasoning") {
+    model = "unsloth/Qwen3-30B-A3B-GGUF:Qwen3-30B-A3B-Q4_K_M.gguf";
+    draft = "Qwen/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q4_K_M.gguf";
+    why = "17.3 GiB 128-expert MoE (Q4_K_M) with parallel sparse expert streaming + 2 GiB Edge expert cache. Measured on 8 GB Orin Nano (R12 v0.6.3): <strong>1.662 tok/s</strong> open_ended (9.09 J/tok), <strong>0.864 tok/s</strong> code_edit, 0 MiB swap.";
+  } else {
+    model = "Qwen/Qwen2.5-32B-Instruct-GGUF:qwen2.5-32b-instruct-q4_k_m-00001-of-00005.gguf";
+    draft = "Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_k_m.gguf";
+    why = "18.49 GiB dense 32B (Q4_K_M) — runs even on 8 GB Orin Nano at <strong>1.588 tok/s</strong> code_edit (R12 v0.6.3) and scales linearly with higher VRAM residency on 12–24 GB GPUs.";
+  }
+  const cmd = `layerstream serve --model hf://${model} --vram-budget-mb auto` + (draft ? ` \\\n  --draft-model hf://${draft}` : "");
+  document.getElementById("r-output").innerHTML = `
+    <p><strong>Target:</strong> <code>hf://${esc(model)}</code></p>
+    <p><strong>Draft:</strong> ${draft ? `<code>hf://${esc(draft)}</code>` : "None needed"}</p>
+    <p>${why}</p>
+    <pre><code>${esc(cmd)}</code></pre>`;
+}
+
+document.getElementById("g-run").addEventListener("click", runGgufEstimator);
+document.querySelectorAll(".preset").forEach(b => b.addEventListener("click", () => {
+  document.getElementById("g-repo").value = b.dataset.repo;
+  document.getElementById("g-vram").value = b.dataset.vram;
+  document.getElementById("g-filter").value = "";
+  runGgufEstimator();
+}));
+["f-model","f-engine","f-workload","f-round"].forEach(id => {
+  document.getElementById(id).addEventListener("input", renderCharts);
+  document.getElementById(id).addEventListener("change", renderCharts);
+});
+["r-vram","r-use"].forEach(id => document.getElementById(id).addEventListener("change", renderRecommender));
+
+fetch("benchmarks.json")
+  .then(r => r.json())
+  .then(data => {
+    RECORDS = data;
+    document.getElementById("run-count").textContent = data.length;
+    populateSelect("f-engine", [...new Set(data.map(r => r.engine).filter(Boolean))].sort());
+    populateSelect("f-workload", [...new Set(data.map(r => r.workload).filter(Boolean))].sort());
+    populateSelect("f-round", [...new Set(data.map(r => r.round).filter(Boolean))].sort((a,b) => roundNum(b) - roundNum(a)));
+    renderRecommender();
+    renderTable(filteredRecords());
+    const waitPlotly = setInterval(() => {
+      if (typeof Plotly !== "undefined") { clearInterval(waitPlotly); renderCharts(); }
+    }, 50);
+  });
+</script>
+</body>
+</html>
