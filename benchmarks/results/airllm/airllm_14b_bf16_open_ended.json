@@ -1,0 +1,87 @@
+>>>> bitsandbytes installed
+using generic AirLLM streaming model for architecture: Qwen2ForCausalLM
+Loading shard 1/8
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.embed_tokens.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.0.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.1.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.2.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.3.safetensors
+Loading shard 2/8
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.10.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.4.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.5.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.6.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.7.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.8.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.9.safetensors
+Loading shard 3/8
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.11.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.12.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.13.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.14.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.15.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.16.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.17.safetensors
+Loading shard 4/8
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.18.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.19.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.20.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.21.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.22.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.23.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.24.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.25.safetensors
+Loading shard 5/8
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.26.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.27.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.28.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.29.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.30.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.31.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.32.safetensors
+Loading shard 6/8
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.33.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.34.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.35.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.36.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.37.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.38.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.39.safetensors
+Loading shard 7/8
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.40.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.41.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.42.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.43.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.44.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.45.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.46.safetensors
+Loading shard 8/8
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.layers.47.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/model.norm.safetensors
+saved as: /mnt/models/bench/airllm-shards-14b-bf16/splitted_model/lm_head.safetensors
+built empty Qwen2ForCausalLM via AutoModelForCausalLM (attn=sdpa)
+[
+  {
+    "engine": "airllm",
+    "engine_version": "4.0.0",
+    "mode": "airllm_none_prefetch",
+    "model": "Qwen/Qwen2.5-14B-Instruct",
+    "workload": "open_ended",
+    "load_time_s": 81.81,
+    "ttft_s": 45.413,
+    "decode_time_s": 131.774,
+    "total_time_s": 177.187,
+    "prompt_tokens": 31,
+    "completion_tokens": 4,
+    "decode_tok_per_s": 0.023,
+    "total_tok_per_s": 0.023,
+    "peak_rss_mib": 5217.6,
+    "current_rss_mib": 3489.7,
+    "avg_watts": 9.31,
+    "joules_per_tok": 412.35,
+    "cuda_max_allocated_mib": 1502.0,
+    "page_cache_delta_mib": -4310.7,
+    "page_cache_delta_since_start_mib": -3140.9,
+    "output_preview": " In the context of"
+  }
+]
