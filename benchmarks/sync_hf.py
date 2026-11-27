@@ -25,8 +25,6 @@ REPRO_SCRIPTS = (
     "bench_airllm.py",
     "bench_colibri.py",
     "export_hf_dataset.py",
-    "check_regressions.py",
-    "run_round.py",
 )
 
 

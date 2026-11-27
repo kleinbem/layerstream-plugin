@@ -209,7 +209,12 @@ impl HardwareProfile {
         } else {
             (default_os_topology(), default_gpu_backend().to_string())
         };
-        Self::from_inputs(total_ram_bytes, topology, storage, backend, override_mode)
+        let profile = Self::from_inputs(total_ram_bytes, topology, storage, backend, override_mode);
+        warn_if_high_zram(
+            MemoryTier::from_total_bytes(total_ram_bytes),
+            detect_zram_physical_used_bytes(),
+        );
+        profile
     }
 
     /// Compact human-readable identifier, e.g. `edge-unified-cuda-dmcrypt`.
@@ -261,6 +266,55 @@ pub fn parse_proc_memtotal_bytes(meminfo: &str) -> Option<u64> {
         }
     }
     None
+}
+
+fn warn_if_high_zram(tier: MemoryTier, zram_phys: u64) {
+    if tier == MemoryTier::Edge && zram_phys >= 256 * 1024 * 1024 {
+        tracing::warn!(
+            zram_phys_mib = zram_phys / (1024 * 1024),
+            "compressed zram is holding >= 256 MiB of physical RAM on an edge-memory host; \
+             reclaim swap on active zram devices if inference swaps"
+        );
+    }
+}
+
+/// Parses Linux `/sys/block/zram*/mm_stat` for `mem_used_total` (3rd column, bytes
+/// of physical RAM currently consumed by compressed zram pages).
+pub fn parse_zram_mm_stat_mem_used_bytes(mm_stat: &str) -> Option<u64> {
+    let mut parts = mm_stat.split_whitespace();
+    let _orig: u64 = parts.next()?.parse().ok()?;
+    let _compr: u64 = parts.next()?.parse().ok()?;
+    parts.next()?.parse().ok()
+}
+
+fn detect_zram_physical_used_bytes_in(sys_block_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(sys_block_dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("zram") {
+            continue;
+        }
+        if let Ok(raw) = std::fs::read_to_string(entry.path().join("mm_stat"))
+            && let Some(bytes) = parse_zram_mm_stat_mem_used_bytes(&raw)
+        {
+            total = total.saturating_add(bytes);
+        }
+    }
+    total
+}
+
+/// Returns total physical RAM (in bytes) currently held by Linux `zram*` devices.
+pub fn detect_zram_physical_used_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        detect_zram_physical_used_bytes_in(Path::new("/sys/block"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
 }
 
 fn detect_total_ram_bytes() -> u64 {
@@ -443,5 +497,30 @@ mod tests {
 
         let detected = HardwareProfile::detect(Path::new("/"), false, false, ProfileOverride::Auto);
         assert_eq!(detected.backend, "cpu");
+
+        assert_eq!(
+            parse_zram_mm_stat_mem_used_bytes(
+                "201850880 16567296 55889920 0 55889920 12 0 1234 5678\n"
+            ),
+            Some(55_889_920)
+        );
+        assert_eq!(parse_zram_mm_stat_mem_used_bytes("invalid"), None);
+        let _ = detect_zram_physical_used_bytes();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("zram0")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("nvme0n1")).unwrap();
+        std::fs::write(
+            tmp.path().join("zram0/mm_stat"),
+            "201850880 16567296 300000000 0 300000000 12 0 1234 5678\n",
+        )
+        .unwrap();
+        assert_eq!(detect_zram_physical_used_bytes_in(tmp.path()), 300_000_000);
+        assert_eq!(
+            detect_zram_physical_used_bytes_in(&tmp.path().join("missing")),
+            0
+        );
+        warn_if_high_zram(MemoryTier::Edge, 300_000_000);
+        warn_if_high_zram(MemoryTier::High, 300_000_000);
     }
 }

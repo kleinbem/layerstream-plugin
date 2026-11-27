@@ -3,6 +3,7 @@
 //! Replaces embedded bash/awk/Python recipes previously living in `Justfile`.
 //! Uses only the Rust standard library so it compiles in < 1s with zero dependencies.
 
+mod bench;
 mod wheel_audit;
 
 use std::env;
@@ -596,6 +597,8 @@ fn print_usage() {
            coverage-cpp        Measure C++ gcov line coverage for crates/layerstream-core/cpp/\n\
            gpu-smoke [backend] Run real GPU parity smoke test (vulkan | cuda)\n\
            audit-wheel-elf     Verify Linux wheel ELF symbols, RUNPATH, and PyPI 100 MiB cap\n\
+           bench-round         Run standardized bare-metal benchmark round (with zram/swap guard)\n\
+           check-regressions   Compare benchmark round JSONs and scan logs for GPU/NVMe issues\n\
            bump <version>      Bump semver across all manifests and refresh Cargo.lock files"
     );
 }
@@ -653,6 +656,8 @@ fn main() -> ExitCode {
             cmd_gpu_smoke(&root, backend)
         }
         Some("audit-wheel-elf") => wheel_audit::cmd_audit_wheel_elf(&args[1..]),
+        Some("bench-round") => bench::cmd_bench_round(&args[1..]),
+        Some("check-regressions") => bench::cmd_check_regressions(&args[1..]),
         Some("bump") => match args.get(1) {
             Some(ver) => cmd_bump(&root, ver),
             None => Err("usage: cargo xtask bump <major.minor.patch>".to_string()),
