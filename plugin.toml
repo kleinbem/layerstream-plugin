@@ -1,4 +1,4 @@
 name = "layerstream"
-version = "0.6.2"
+version = "0.6.3"
 description = "Out-of-core GGUF layer-streaming inference plugin for mesh-llm."
 command = "layerstream"

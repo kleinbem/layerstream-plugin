@@ -734,6 +734,8 @@ fn main() -> Result<()> {
 
         results.push(serde_json::json!({
             "engine": "layerstream-plugin",
+            "engine_version": env!("CARGO_PKG_VERSION"),
+            "git_rev": git_rev,
             "mode": format!("{mode}_multiturn"),
             "model": model_path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown"),
             "workload": "multi_turn_prefix_reuse",
