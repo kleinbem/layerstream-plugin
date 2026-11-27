@@ -88,6 +88,148 @@ fn read_manifest_version(root: &Path, rel: &str, is_json: bool) -> Result<String
     ver.ok_or_else(|| format!("version field not found in {rel}"))
 }
 
+fn extract_flake_llama_sha(flake_nix: &str) -> Option<String> {
+    let marker = "github:ggml-org/llama.cpp/";
+    let idx = flake_nix.find(marker)?;
+    let rest = &flake_nix[idx + marker.len()..];
+    let sha: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    (sha.len() == 40).then_some(sha)
+}
+
+fn extract_flake_lock_llama_locked_rev(flake_lock: &str) -> Option<String> {
+    let node_idx = flake_lock.find("\"llama-cpp-src\"")?;
+    let after_node = &flake_lock[node_idx..];
+    let locked_idx = after_node.find("\"locked\"")?;
+    let after_locked = &after_node[locked_idx..];
+    let open_brace = after_locked.find('{')?;
+    let close_brace = after_locked[open_brace..].find('}')?;
+    let locked_block = &after_locked[open_brace..open_brace + close_brace];
+    for line in locked_block.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("\"rev\":") {
+            let val = rest.trim().trim_end_matches(',').trim().trim_matches('"');
+            if val.len() == 40 && val.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_yaml_scalar(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(s) = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+    {
+        return s;
+    }
+    if let Some(s) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return s;
+    }
+    trimmed
+}
+
+fn extract_workflow_llama_refs(workflow_yaml: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = workflow_yaml.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        if trimmed == "with:" {
+            let with_indent = line.len() - line.trim_start().len();
+            let mut is_llama_repo = false;
+            let mut found_ref: Option<(usize, String)> = None;
+            let mut j = i + 1;
+            while j < lines.len() {
+                let child = lines[j];
+                let child_trimmed = child.trim();
+                if child_trimmed.is_empty() || child_trimmed.starts_with('#') {
+                    j += 1;
+                    continue;
+                }
+                let child_indent = child.len() - child.trim_start().len();
+                if child_indent <= with_indent {
+                    break;
+                }
+                if let Some(rest) = child_trimmed.strip_prefix("repository:") {
+                    if normalize_yaml_scalar(rest) == "ggml-org/llama.cpp" {
+                        is_llama_repo = true;
+                    }
+                } else if let Some(rest) = child_trimmed.strip_prefix("ref:") {
+                    let val = normalize_yaml_scalar(rest);
+                    found_ref = Some((j + 1, val.to_string()));
+                }
+                j += 1;
+            }
+            if is_llama_repo && let Some(entry) = found_ref {
+                out.push(entry);
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn check_llama_cpp_pins(root: &Path) -> Result<(), String> {
+    let flake_nix = fs::read_to_string(root.join("flake.nix"))
+        .map_err(|e| format!("failed to read flake.nix: {e}"))?;
+    let expected = extract_flake_llama_sha(&flake_nix)
+        .ok_or_else(|| "40-char ggml-org/llama.cpp SHA not found in flake.nix".to_string())?;
+
+    let flake_lock = fs::read_to_string(root.join("flake.lock"))
+        .map_err(|e| format!("failed to read flake.lock: {e}"))?;
+    let locked_rev = extract_flake_lock_llama_locked_rev(&flake_lock)
+        .ok_or_else(|| "llama-cpp-src locked.rev not found in flake.lock".to_string())?;
+    if locked_rev != expected {
+        return Err(format!(
+            "llama.cpp pin mismatch: flake.nix={expected} vs flake.lock llama-cpp-src.locked.rev={locked_rev}"
+        ));
+    }
+
+    let workflows_dir = root.join(".github/workflows");
+    let mut wf_paths: Vec<PathBuf> = fs::read_dir(&workflows_dir)
+        .map_err(|e| format!("failed to read .github/workflows: {e}"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext == "yml" || ext == "yaml")
+        })
+        .collect();
+    wf_paths.sort();
+
+    let mut checked_refs = 0usize;
+    for path in wf_paths {
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        for (line_no, found) in extract_workflow_llama_refs(&text) {
+            checked_refs += 1;
+            if found != expected {
+                return Err(format!(
+                    "llama.cpp pin mismatch: flake.nix={expected} vs {rel}:{line_no}={found}"
+                ));
+            }
+        }
+    }
+    if checked_refs == 0 {
+        return Err("no ggml-org/llama.cpp checkout refs found in .github/workflows".to_string());
+    }
+    println!(
+        "llama.cpp pin={expected} synced across flake.nix, flake.lock, and {checked_refs} workflow ref(s)"
+    );
+    Ok(())
+}
+
 fn cmd_check_versions(root: &Path) -> Result<(), String> {
     let cargo_ver = read_manifest_version(root, "Cargo.toml", false)?;
     let plugin_ver = read_manifest_version(root, "plugin.toml", false)?;
@@ -115,6 +257,7 @@ fn cmd_check_versions(root: &Path) -> Result<(), String> {
             ));
         }
     }
+    check_llama_cpp_pins(root)?;
     Ok(())
 }
 
@@ -565,5 +708,61 @@ mod tests {
         let root = repo_root();
         assert!(cmd_check_versions(&root).is_ok());
         assert!(cmd_check_loc(&root).is_ok());
+    }
+
+    #[test]
+    fn extracts_llama_cpp_sha_and_workflow_refs() {
+        let flake =
+            "url = \"github:ggml-org/llama.cpp/0123456789abcdef0123456789abcdef01234567\";\n";
+        assert_eq!(
+            extract_flake_llama_sha(flake).as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            extract_flake_llama_sha("github:ggml-org/llama.cpp/short"),
+            None
+        );
+
+        let wf = r#"
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 0123456789abcdef0123456789abcdef01234567
+        with:
+          repository: 'ggml-org/llama.cpp'
+          ref: 'fedcba9876543210fedcba9876543210fedcba98'
+        with:
+          ref: "1111111111111111111111111111111111111111"
+          path: third_party/llama.cpp
+          fetch-depth: 1
+          submodules: false
+          repository: "ggml-org/llama.cpp"
+"#;
+        let refs = extract_workflow_llama_refs(wf);
+        assert_eq!(
+            refs,
+            vec![
+                (4, "0123456789abcdef0123456789abcdef01234567".to_string()),
+                (7, "fedcba9876543210fedcba9876543210fedcba98".to_string()),
+                (9, "1111111111111111111111111111111111111111".to_string()),
+            ]
+        );
+
+        // locked.rev is extracted specifically, even when original.rev differs.
+        let lock = r#"{
+          "nodes": {
+            "llama-cpp-src": {
+              "locked": {
+                "rev": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "original": {
+                "rev": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+              }
+            }
+          }
+        }"#;
+        assert_eq!(
+            extract_flake_lock_llama_locked_rev(lock).as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 }
