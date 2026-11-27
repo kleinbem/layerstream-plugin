@@ -110,7 +110,7 @@ def main() -> None:
             api.create_repo(
                 repo_id=args.space_repo,
                 repo_type="space",
-                space_sdk="gradio",
+                space_sdk="static",
                 private=False,
                 exist_ok=True,
             )
@@ -118,7 +118,7 @@ def main() -> None:
                 folder_path=str(stage_sp),
                 repo_id=args.space_repo,
                 repo_type="space",
-                delete_patterns=["index.html"],
+                delete_patterns=["app.py", "requirements.txt"],
                 commit_message=args.message,
             )
             print(f"Synced Space -> https://huggingface.co/spaces/{args.space_repo}")
