@@ -61,7 +61,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
-          ref: 9c003a97ab34a69cc49243f9b02014038205ffae
+          ref: a07831a0081f00077b3cf676514c45e34167126c
           path: third_party/llama.cpp
 
       - name: Install Linux build dependencies
@@ -196,7 +196,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
-          ref: 9c003a97ab34a69cc49243f9b02014038205ffae
+          ref: a07831a0081f00077b3cf676514c45e34167126c
           path: third_party/llama.cpp
 
       - name: Install macOS build dependencies
@@ -308,7 +308,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
-          ref: 9c003a97ab34a69cc49243f9b02014038205ffae
+          ref: a07831a0081f00077b3cf676514c45e34167126c
           path: third_party/llama.cpp
 
       - name: Build layerstream-cuda13 ${{ matrix.wheel_plat }} wheel inside manylinux_2_34
@@ -386,7 +386,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ggml-org/llama.cpp
-          ref: 9c003a97ab34a69cc49243f9b02014038205ffae
+          ref: a07831a0081f00077b3cf676514c45e34167126c
           path: third_party/llama.cpp
 
       - name: Install Linux build dependencies

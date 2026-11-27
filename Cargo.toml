@@ -13,7 +13,7 @@ members = [
 exclude = ["bindings/python", "bindings/node"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -73,8 +73,8 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 io-uring = "0.7"
 libc = "0.2"
-mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "6d05e100b84f75a4c2fd1a9d6d7c9a2278b64a34" }
-parking_lot = "0.12"
+mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "7c83b40b66aea027a83c4550bd5276e407816e7d" }
+parking_lot = "0.13"
 quick_cache = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
