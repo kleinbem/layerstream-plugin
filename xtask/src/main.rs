@@ -96,21 +96,80 @@ fn extract_flake_llama_sha(flake_nix: &str) -> Option<String> {
     (sha.len() == 40).then_some(sha)
 }
 
+fn extract_flake_lock_llama_locked_rev(flake_lock: &str) -> Option<String> {
+    let node_idx = flake_lock.find("\"llama-cpp-src\"")?;
+    let after_node = &flake_lock[node_idx..];
+    let locked_idx = after_node.find("\"locked\"")?;
+    let after_locked = &after_node[locked_idx..];
+    let open_brace = after_locked.find('{')?;
+    let close_brace = after_locked[open_brace..].find('}')?;
+    let locked_block = &after_locked[open_brace..open_brace + close_brace];
+    for line in locked_block.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("\"rev\":") {
+            let val = rest.trim().trim_end_matches(',').trim().trim_matches('"');
+            if val.len() == 40 && val.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_yaml_scalar(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(s) = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+    {
+        return s;
+    }
+    if let Some(s) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return s;
+    }
+    trimmed
+}
+
 fn extract_workflow_llama_refs(workflow_yaml: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let lines: Vec<&str> = workflow_yaml.lines().collect();
-    for (idx, line) in lines.iter().enumerate() {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
         let trimmed = line.trim();
-        if trimmed == "repository: ggml-org/llama.cpp" {
-            for (offset, next) in lines[idx + 1..].iter().take(4).enumerate() {
-                let next_trimmed = next.trim();
-                if let Some(rest) = next_trimmed.strip_prefix("ref:") {
-                    let val = rest.trim().trim_matches('"').trim_matches('\'');
-                    out.push((idx + 2 + offset, val.to_string()));
+        if trimmed == "with:" {
+            let with_indent = line.len() - line.trim_start().len();
+            let mut is_llama_repo = false;
+            let mut found_ref: Option<(usize, String)> = None;
+            let mut j = i + 1;
+            while j < lines.len() {
+                let child = lines[j];
+                let child_trimmed = child.trim();
+                if child_trimmed.is_empty() || child_trimmed.starts_with('#') {
+                    j += 1;
+                    continue;
+                }
+                let child_indent = child.len() - child.trim_start().len();
+                if child_indent <= with_indent {
                     break;
                 }
+                if let Some(rest) = child_trimmed.strip_prefix("repository:") {
+                    if normalize_yaml_scalar(rest) == "ggml-org/llama.cpp" {
+                        is_llama_repo = true;
+                    }
+                } else if let Some(rest) = child_trimmed.strip_prefix("ref:") {
+                    let val = normalize_yaml_scalar(rest);
+                    found_ref = Some((j + 1, val.to_string()));
+                }
+                j += 1;
             }
+            if is_llama_repo && let Some(entry) = found_ref {
+                out.push(entry);
+            }
+            i = j;
+            continue;
         }
+        i += 1;
     }
     out
 }
@@ -123,10 +182,11 @@ fn check_llama_cpp_pins(root: &Path) -> Result<(), String> {
 
     let flake_lock = fs::read_to_string(root.join("flake.lock"))
         .map_err(|e| format!("failed to read flake.lock: {e}"))?;
-    let expected_rev_json = format!("\"rev\": \"{expected}\"");
-    if !flake_lock.contains(&expected_rev_json) {
+    let locked_rev = extract_flake_lock_llama_locked_rev(&flake_lock)
+        .ok_or_else(|| "llama-cpp-src locked.rev not found in flake.lock".to_string())?;
+    if locked_rev != expected {
         return Err(format!(
-            "llama.cpp pin mismatch: flake.lock does not contain {expected_rev_json} (flake.nix={expected})"
+            "llama.cpp pin mismatch: flake.nix={expected} vs flake.lock llama-cpp-src.locked.rev={locked_rev}"
         ));
     }
 
@@ -663,20 +723,46 @@ mod tests {
             None
         );
 
-        let wf = "\
-        with:\n\
-          repository: ggml-org/llama.cpp\n\
-          ref: 0123456789abcdef0123456789abcdef01234567\n\
-        with:\n\
-          repository: ggml-org/llama.cpp\n\
-          ref: 'fedcba9876543210fedcba9876543210fedcba98'\n";
+        let wf = r#"
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 0123456789abcdef0123456789abcdef01234567
+        with:
+          repository: 'ggml-org/llama.cpp'
+          ref: 'fedcba9876543210fedcba9876543210fedcba98'
+        with:
+          ref: "1111111111111111111111111111111111111111"
+          path: third_party/llama.cpp
+          fetch-depth: 1
+          submodules: false
+          repository: "ggml-org/llama.cpp"
+"#;
         let refs = extract_workflow_llama_refs(wf);
         assert_eq!(
             refs,
             vec![
-                (3, "0123456789abcdef0123456789abcdef01234567".to_string()),
-                (6, "fedcba9876543210fedcba9876543210fedcba98".to_string()),
+                (4, "0123456789abcdef0123456789abcdef01234567".to_string()),
+                (7, "fedcba9876543210fedcba9876543210fedcba98".to_string()),
+                (9, "1111111111111111111111111111111111111111".to_string()),
             ]
+        );
+
+        // locked.rev is extracted specifically, even when original.rev differs.
+        let lock = r#"{
+          "nodes": {
+            "llama-cpp-src": {
+              "locked": {
+                "rev": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "original": {
+                "rev": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+              }
+            }
+          }
+        }"#;
+        assert_eq!(
+            extract_flake_lock_llama_locked_rev(lock).as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 }
