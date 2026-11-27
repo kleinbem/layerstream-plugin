@@ -899,3 +899,133 @@ where
     );
     Ok(Some(resolved))
 }
+
+/// An item in a Hugging Face Hub Collection (`model`, `dataset`, `space`, or `paper`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HfCollectionItem {
+    /// Repository ID or paper ID (e.g. `Qwen/Qwen2.5-14B-Instruct`).
+    pub id: String,
+    /// Item type as reported by the Hub API (`model`, `dataset`, `space`, `paper`).
+    #[serde(rename = "type")]
+    pub item_type: String,
+    /// Optional curator note attached to the collection item.
+    #[serde(default)]
+    pub note: Option<HfCollectionNote>,
+}
+
+/// Optional curator note payload on a Hugging Face Collection item.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HfCollectionNote {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// Metadata and items of a Hugging Face Hub Collection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HfCollection {
+    pub slug: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub items: Vec<HfCollectionItem>,
+}
+
+impl HfCollection {
+    /// Returns all `model` repository IDs in the collection, preserving order.
+    pub fn model_ids(&self) -> Vec<&str> {
+        self.items
+            .iter()
+            .filter(|item| item.item_type == "model")
+            .map(|item| item.id.as_str())
+            .collect()
+    }
+}
+
+/// Normalizes a Hugging Face Collection reference (`owner/slug`,
+/// `https://huggingface.co/collections/owner/slug`, or `collections/owner/slug`)
+/// into `owner/slug`. Query strings and fragments on full URLs are stripped.
+pub fn parse_collection_slug(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    let without_frag = trimmed
+        .split_once('#')
+        .map_or(trimmed, |(before, _)| before);
+    let without_query = without_frag
+        .split_once('?')
+        .map_or(without_frag, |(before, _)| before);
+    let stripped = without_query
+        .strip_prefix("https://huggingface.co/collections/")
+        .or_else(|| without_query.strip_prefix("http://huggingface.co/collections/"))
+        .or_else(|| without_query.strip_prefix("collections/"))
+        .unwrap_or(without_query)
+        .trim_matches('/');
+    let mut parts = stripped.split('/');
+    let owner = parts.next().unwrap_or("");
+    let slug = parts.next().unwrap_or("");
+    if owner.is_empty()
+        || slug.is_empty()
+        || parts.next().is_some()
+        || owner.contains("..")
+        || slug.contains("..")
+    {
+        return Err(HfError::InvalidSpec(format!(
+            "invalid Hugging Face collection slug '{input}' (expected owner/slug)"
+        )));
+    }
+    Ok(format!("{owner}/{slug}"))
+}
+
+/// Fetches a Hugging Face Hub Collection (`/api/collections/{owner}/{slug}`).
+pub fn fetch_hf_collection(slug_or_url: &str) -> Result<HfCollection> {
+    let slug = parse_collection_slug(slug_or_url)?;
+    let endpoint = std::env::var("HF_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HF_ENDPOINT.to_string());
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    fetch_hf_collection_with_agent(&slug, &endpoint, &agent)
+}
+
+pub(crate) fn fetch_hf_collection_with_agent(
+    slug: &str,
+    endpoint: &str,
+    agent: &ureq::Agent,
+) -> Result<HfCollection> {
+    let url = format!("{}/api/collections/{slug}", endpoint.trim_end_matches('/'));
+    let mut req = agent.get(&url).header(
+        "User-Agent",
+        concat!("layerstream-hf/", env!("CARGO_PKG_VERSION")),
+    );
+    if url.starts_with("https://")
+        && let Some(tok) = load_hf_token()
+    {
+        req = req.header("Authorization", &format!("Bearer {tok}"));
+    }
+    let mut resp = req
+        .call()
+        .map_err(|e| HfError::Http(format!("HF collection request failed for {url}: {e}")))?;
+    let status = resp.status().as_u16();
+    if status == 404 {
+        return Err(HfError::NotFound(format!(
+            "Hugging Face collection '{slug}' not found (HTTP 404)"
+        )));
+    }
+    if !(200..300).contains(&status) {
+        return Err(HfError::Http(format!(
+            "HF collection API returned HTTP {status} for {url}"
+        )));
+    }
+    let body = resp
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| HfError::Http(format!("read HF collection response {url}: {e}")))?;
+    serde_json::from_slice::<HfCollection>(&body).map_err(|source| HfError::Json {
+        context: format!("parse HF collection JSON from {url}"),
+        source,
+    })
+}
