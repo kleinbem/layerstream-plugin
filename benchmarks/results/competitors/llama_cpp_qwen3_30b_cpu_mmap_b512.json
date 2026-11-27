@@ -1,0 +1,38 @@
+[
+  {
+    "engine": "llama.cpp",
+    "mode": "llama_cpp_qwen3_30b_cpu_mmap_b512",
+    "status": "ok",
+    "model": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "ngl": 0,
+    "kv_cache_type": "q8_0",
+    "extra_args": [
+      "-no-cnv",
+      "-dev",
+      "none",
+      "-b",
+      "512",
+      "-ub",
+      "512"
+    ],
+    "workload": "open_ended",
+    "load_time_s": 25.34,
+    "ttft_s": 17.367,
+    "decode_time_s": 18.113,
+    "total_time_s": 62.445,
+    "prompt_tokens": 31,
+    "completion_tokens": 23,
+    "decode_tok_per_s": 1.27,
+    "total_tok_per_s": 0.648,
+    "peak_rss_mib": 6070.9,
+    "mem_avail_before_mib": 6137.6,
+    "mem_avail_min_mib": 5895.6,
+    "page_cache_delta_mib": -100.1,
+    "swap_delta_mib": 247.9,
+    "idle_watts": 8.07,
+    "avg_watts": 9.89,
+    "joules_per_tok": 15.26,
+    "output_preview": "the problem is that the GPU is not able to read the data from the host memory as it is being written by the",
+    "stderr_tail": ""
+  }
+]
