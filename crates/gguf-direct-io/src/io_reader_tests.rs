@@ -469,9 +469,13 @@ mod tests {
                 .unwrap_err();
         assert_eq!(over_err.kind(), std::io::ErrorKind::InvalidInput);
 
-        // 6. Parallel sparse read error propagation (4 spans spaced 4 MiB apart so they do not coalesce).
+        // 6. Parallel sparse read error propagation from background worker (spans 0..1 are readable;
+        //    spans 2..3 are past EOF and executed by background worker 1; spaced 4 MiB apart so they
+        //    do not coalesce).
         let short_path = dir.path().join("short.bin");
-        std::fs::write(&short_path, [0u8; 4096]).unwrap();
+        let short_file = std::fs::File::create(&short_path).unwrap();
+        short_file.set_len(4 * 1024 * 1024 + 4096).unwrap();
+        drop(short_file);
         let mut short_tensors = HashMap::new();
         for i in 0..4u64 {
             short_tensors.insert(
@@ -479,7 +483,7 @@ mod tests {
                 crate::gguf_index::TensorLocation {
                     name: format!("blk.0.e{i}"),
                     shard_idx: 0,
-                    abs_offset: (i + 1) * 4 * 1024 * 1024, // spaced 4 MiB apart, past EOF
+                    abs_offset: i * 4 * 1024 * 1024, // 0 and 4 MiB readable; 8 MiB and 12 MiB past EOF
                     ggml_type: 0,
                     dims: vec![1024], // 4096 bytes
                 },
@@ -530,8 +534,9 @@ mod tests {
                 std::process::id()
             ));
             if std::fs::write(&shm_path, [0u8; 4096]).is_ok() {
-                let _ = LayerIoPool::new(make_index(&shm_path), true);
+                let opened = LayerIoPool::new(make_index(&shm_path), true);
                 let _ = std::fs::remove_file(&shm_path);
+                assert!(opened.is_ok());
             }
         }
 

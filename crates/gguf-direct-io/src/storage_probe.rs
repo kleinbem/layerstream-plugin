@@ -39,7 +39,9 @@ pub fn probe_storage_mib_per_s(
         match pread_exact_or_eof(df, slice, 0) {
             Ok(n) => n,
             Err(_) => {
-                // Some filesystems (e.g. FUSE/overlayfs) accept O_DIRECT on open() but fail on read().
+                // Per Linux open(2) O_DIRECT semantics, some filesystems (e.g. FUSE/overlayfs)
+                // permit O_DIRECT at open() time but reject direct reads with EINVAL; fall back
+                // to buffered pread so probing remains portable across filesystems.
                 direct_active = false;
                 t0 = std::time::Instant::now();
                 pread_exact_or_eof(&buffered, &mut slice[..probe_bytes], 0)?
@@ -122,4 +124,23 @@ pub fn probe_dir_storage_mib_per_s(dir: &std::path::Path) -> Option<f64> {
         .ok()
         .map(|(mib_s, _)| mib_s)
         .filter(|&bw| bw.is_finite() && bw > 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_existing_probe_file_discovers_nested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested_sub = dir.path().join("sub");
+        std::fs::create_dir_all(&nested_sub).unwrap();
+        let expected = nested_sub.join("big.bin");
+        let f = File::create(&expected).unwrap();
+        f.set_len(16 * 1024 * 1024).unwrap();
+        drop(f);
+
+        assert_eq!(find_existing_probe_file(dir.path(), 2), Some(expected));
+        assert_eq!(find_existing_probe_file(dir.path(), 0), None);
+    }
 }
