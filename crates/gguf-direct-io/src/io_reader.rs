@@ -242,8 +242,10 @@ impl ExpertSliceCache {
 
 /// Computes an adaptive TinyLFU hot-expert RAM cache budget from host total and
 /// available RAM:
-/// - **Edge (`<= 12 GiB` total):** reserves 1.5 GiB headroom and caps at 1 GiB
-///   (keeps 8 GB Jetson Orin Nano swap-free with lower peak RSS).
+/// - **Edge (`<= 12 GiB` total):** reserves 1.5 GiB headroom and uses 60% of the
+///   remaining available RAM up to 2 GiB (keeps tight MoE models like 30B-A3B
+///   swap-free while letting smaller MoEs like OLMoE-1B-7B reach ~100% cache hit
+///   rate when multi-GiB headroom is free).
 /// - **Standard (`12..48 GiB` total):** reserves 2 GiB headroom and caps at 4 GiB.
 /// - **High (`>= 48 GiB` total):** reserves 4 GiB headroom and caps at 32 GiB
 ///   (caches most/all hot experts on 64 GB unified-memory APUs & workstations).
@@ -251,7 +253,7 @@ pub fn auto_expert_cache_budget_for_meminfo(total_bytes: u64, avail_bytes: u64) 
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
     let (reserve, cap, num, den) = if total_bytes == 0 || total_bytes <= 12 * GIB {
-        (1536 * MIB, 1024 * MIB, 1, 2)
+        (1536 * MIB, 2048 * MIB, 3, 5)
     } else if total_bytes < 48 * GIB {
         (2048 * MIB, 4096 * MIB, 3, 5)
     } else {
@@ -1637,10 +1639,15 @@ mod adaptive_cache_tests {
     fn auto_expert_cache_budget_scales_by_memory_tier() {
         const GIB: u64 = 1024 * 1024 * 1024;
         const MIB: u64 = 1024 * 1024;
-        // 8 GiB edge host with 4 GiB available: reserve 1.5 GiB, 50% of 2.5 GiB = 1.25 GiB -> capped at 1 GiB
+        // 8 GiB edge host with 4 GiB available: reserve 1.5 GiB, 60% of 2.5 GiB = 1.5 GiB
         assert_eq!(
             auto_expert_cache_budget_for_meminfo(8 * GIB, 4 * GIB),
-            (1024 * MIB) as usize
+            (1536 * MIB) as usize
+        );
+        // 8 GiB edge host with 6 GiB available: reserve 1.5 GiB, 60% of 4.5 GiB = 2.7 GiB -> capped at 2 GiB
+        assert_eq!(
+            auto_expert_cache_budget_for_meminfo(8 * GIB, 6 * GIB),
+            (2048 * MIB) as usize
         );
         // Edge host with tight RAM (1 GiB available < 1.5 GiB reserve) -> 0
         assert_eq!(auto_expert_cache_budget_for_meminfo(8 * GIB, GIB), 0);

@@ -7,6 +7,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 
@@ -27,10 +28,33 @@ def resolve_llama_dir(pkg_root: Path) -> Path:
 def default_cuda_archs() -> str:
     arch = platform.machine().lower()
     if arch in ("aarch64", "arm64"):
-        # Ampere+ only: native Jetson Orin (sm_87) and DGX Spark GB10 (sm_121a) SASS plus Ampere/Hopper PTX.
-        return "80-virtual;87-real;90-virtual;121a-real"
+        # Native Jetson Orin (sm_87) and DGX Spark GB10 (sm_121a) SASS plus Hopper+ PTX (sm_90).
+        # Drops redundant sm_80 PTX so the aarch64 wheel stays comfortably below PyPI's 100 MiB cap.
+        return "87-real;90-virtual;121a-real"
     # Ampere+ only: native Ada (sm_89) and Blackwell FP4/MMA (sm_120a) SASS plus Ampere/Hopper PTX.
     return "80-virtual;89-real;90-virtual;120a-real"
+
+
+def recompress_wheel(wheel_path: Path) -> None:
+    """Re-pack wheel entries with maximum deflate compression (level 9)."""
+    tmp_path = wheel_path.with_suffix(".whl.repack")
+    with (
+        zipfile.ZipFile(wheel_path, "r") as src,
+        zipfile.ZipFile(
+            tmp_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as dst,
+    ):
+        for info in src.infolist():
+            dst.writestr(
+                info,
+                src.read(info.filename),
+                compress_type=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+            )
+    tmp_path.replace(wheel_path)
 
 
 def main() -> int:
@@ -133,6 +157,7 @@ def main() -> int:
     built = sorted(out_dir.glob("layerstream_cuda13-*.whl"))
     if not built:
         raise SystemExit(f"ERROR: no wheel built in {out_dir}")
+    recompress_wheel(built[0])
     print(f"Built CUDA plugin wheel: {built[0]}")
     return 0
 
