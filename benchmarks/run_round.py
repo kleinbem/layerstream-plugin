@@ -37,6 +37,26 @@ def read_mem_available_mib() -> float | None:
     return None
 
 
+def read_swap_used_mib() -> float | None:
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.is_file():
+        return None
+    swap_total_kb: int | None = None
+    swap_free_kb: int | None = None
+    for line in meminfo.read_text(encoding="utf-8").splitlines():
+        if line.startswith("SwapTotal:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                swap_total_kb = int(parts[1])
+        elif line.startswith("SwapFree:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                swap_free_kb = int(parts[1])
+    if swap_total_kb is None or swap_free_kb is None:
+        return None
+    return max(0, swap_total_kb - swap_free_kb) / 1024.0
+
+
 def run_case(
     bench_bin: Path,
     out_dir: Path,
@@ -80,6 +100,17 @@ def main() -> int:
     ap.add_argument(
         "--min-mem-mib", type=float, default=3800.0, help="Warn if MemAvailable is below this"
     )
+    ap.add_argument(
+        "--max-swap-mib",
+        type=float,
+        default=64.0,
+        help="Fail pre-flight if SwapUsed (including zram) exceeds this MiB threshold",
+    )
+    ap.add_argument(
+        "--allow-dirty-swap",
+        action="store_true",
+        help="Allow running benchmarks even when SwapUsed exceeds --max-swap-mib",
+    )
     args = ap.parse_args()
 
     mem_avail = read_mem_available_mib()
@@ -92,6 +123,22 @@ def main() -> int:
                 file=sys.stderr,
                 flush=True,
             )
+
+    swap_used = read_swap_used_mib()
+    if swap_used is not None:
+        print(f"Host SwapUsed: {swap_used:.0f} MiB", flush=True)
+        if swap_used > args.max_swap_mib:
+            msg = (
+                f"Host SwapUsed ({swap_used:.0f} MiB) > {args.max_swap_mib:.0f} MiB — "
+                "compressed zram or stale swap reduces available RAM and skews benchmarks. "
+                "Clear swap (e.g. `sudo swapoff /dev/zram0 && sudo swapon /dev/zram0`) or "
+                "pass --allow-dirty-swap to override."
+            )
+            if args.allow_dirty_swap:
+                print(f"WARNING: {msg}", file=sys.stderr, flush=True)
+            else:
+                print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+                return 2
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     m = args.models_dir

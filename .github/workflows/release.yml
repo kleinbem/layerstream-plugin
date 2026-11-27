@@ -5,12 +5,19 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      cuda_wheels_only:
+        description: "Dry-run only build-cuda-wheel (x86_64 + aarch64) and ELF/size audit"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.cuda_wheels_only) }}
     strategy:
       fail-fast: false
       matrix:
@@ -156,6 +163,7 @@ jobs:
             layerstream-*.zip.sha256
 
   build-wheels:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.cuda_wheels_only) }}
     strategy:
       fail-fast: false
       matrix:
@@ -361,6 +369,7 @@ jobs:
             bindings/python-cuda13/dist/*.whl.sha256
 
   build-node:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.cuda_wheels_only) }}
     strategy:
       fail-fast: false
       matrix:
