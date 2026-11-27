@@ -17,6 +17,9 @@ tags:
   - speculative-decoding
   - benchmark
   - power-efficiency
+  - gguf
+  - xet
+  - mcp
 configs:
   - config_name: default
     data_files:
@@ -24,13 +27,13 @@ configs:
         path: data/train-00000-of-00001.parquet
 ---
 
-# Out-of-Core NVMe Layer Streaming on an 8 GB Jetson Orin Nano: 4-Engine Hardware Benchmark Dataset
+# Out-of-Core NVMe Layer Streaming on an 8 GB Jetson Orin Nano: 5-Engine Hardware Benchmark Dataset
 
-**Source code & `v0.6.1` release:** [github.com/kleinbem/layerstream-plugin](https://github.com/kleinbem/layerstream-plugin) ([`v0.6.1` releases](https://github.com/kleinbem/layerstream-plugin/releases/tag/v0.6.1) · [engineering details](https://github.com/kleinbem/layerstream-plugin/blob/main/docs/DETAILS.md)) · **Interactive Explorer:** [kleinbem/layerstream-benchmarks Space](https://huggingface.co/spaces/kleinbem/layerstream-benchmarks)
+**Source code & `v0.6.3` release:** [github.com/kleinbem/layerstream-plugin](https://github.com/kleinbem/layerstream-plugin) ([`v0.6.3` releases](https://github.com/kleinbem/layerstream-plugin/releases/tag/v0.6.3) · [engineering details](https://github.com/kleinbem/layerstream-plugin/blob/main/docs/DETAILS.md)) · **Interactive Gradio + MCP Explorer:** [kleinbem/layerstream-benchmarks Space](https://huggingface.co/spaces/kleinbem/layerstream-benchmarks) · **Collection:** [LayerStream Edge LLM Collection](https://huggingface.co/collections/kleinbem/layerstream-edge-out-of-core-llm-benchmarks-6b00a3f994c2e1c552883a46)
 
-Reproducible bare-metal benchmark dataset (**170 normalized runs, 81 columns** in Parquet + JSON + JSONL, plus reproduction scripts in `scripts/`) comparing **five** inference approaches on an **8 GB NVIDIA Jetson Orin Nano** running oversized dense and sparse MoE models (**7B MoE, 14B at 8.37 GiB, 30B-A3B MoE at 17.3 GiB, and 32B at 18.49 GiB — 2.53× total system RAM**):
+Reproducible bare-metal benchmark dataset (**185 normalized runs, 81 columns** in Parquet + JSON + JSONL, plus reproduction scripts in `scripts/`) comparing **five** inference approaches on an **8 GB NVIDIA Jetson Orin Nano** running oversized dense and sparse MoE models (**7B MoE, 14B at 8.37 GiB, 30B-A3B MoE at 17.3 GiB, and 32B at 18.49 GiB — 2.53× total system RAM**):
 
-1. **`layerstream-plugin`** (`148` rows across iterative tuning rounds R2–R11: R2–R8 on `v0.1.0`, R9 on `v0.2.1`, R10–R11 on `v0.6.0`/`v0.6.1` built with **CUDA 13.4 + GCC 16.2 + C++23 + `llama.cpp 1.1.0`**; `v0.6.1` adds built-in **MTP (Multi-Token Prediction) self-speculation**, `n_rs_seq` recurrent-state rollback for hybrid SSM/DeltaNet models, and fixes `mparams.devices` so 100% of layers and KV cache stay on `CUDA0` with `splits = 1` — setting new records across `OLMoE-1B-7B` at **`15.092 tok/s`** (`1.02 J/tok`), `Qwen3-30B-A3B` at **`1.621 tok/s`** (`9.47 J/tok`), `Qwen2.5-14B` `code_edit` at **`4.657 tok/s`** (`3.54 J/tok`), and `Qwen2.5-32B` `code_edit` at **`1.665 tok/s`**, **`1.98×`** faster than R8) — Native Rust + stock unpatched `llama.cpp` (`9c003a97` / `1.1.0`) with page-aligned `O_DIRECT → cudaHostAlloc` async ping-pong GPU streaming, auto-sized hybrid partial-residency, sparse MoE active-expert streaming + scan-resistant TinyLFU hot-expert RAM cache, and speculative verification (n-gram, external draft, and built-in MTP).
+1. **`layerstream-plugin`** (`163` rows across iterative tuning rounds R2–R12: R2–R8 on `v0.1.0`, R9 on `v0.2.1`, R10–R11 on `v0.6.0`/`v0.6.1`, **R12 on `v0.6.3`** built with **CUDA 13.4 + GCC 16.2 + C++23 + `llama.cpp 1.1.0`**; `v0.6.3` restores the 2 GiB Edge MoE expert cache cap, adds a pure-Rust `cargo xtask bench-round` + `zram` physical-memory preflight guard, and shrinks the `aarch64` CUDA wheel to `73.13 MiB` — setting all-time clean-host records across `OLMoE-1B-7B` at **`15.077 tok/s`** (`1.04 J/tok`, `100%` cache hit, `0 MiB` swap), `Qwen2.5-14B b5400` at **`4.873 tok/s`** (`code_edit`, `3.49 J/tok`), **`1.702 tok/s`** (`open_ended`), and **`0.987 tok/s`** (`prompt_heavy`, `+100.6%`), `Qwen3-30B-A3B` at **`1.662 tok/s`** (`9.09 J/tok`, `0 MiB` swap), and `Qwen2.5-32B` at **`1.588 tok/s`** `code_edit` and **`0.381 tok/s`** `prompt_heavy` (`+24.5%`)) — Native Rust + stock unpatched `llama.cpp` with page-aligned `O_DIRECT → cudaHostAlloc` async ping-pong GPU streaming, auto-sized hybrid partial-residency, sparse MoE active-expert streaming + scan-resistant TinyLFU hot-expert RAM cache, and speculative verification (n-gram, external draft, and built-in MTP).
 2. **Stock `llama.cpp`** (`0693dbfb`, CUDA `sm_87`, `12` rows) — Standard `mmap` + `-ngl` / `-ot exps=CPU` partial offload (also representing the underlying GGUF runtime used by Ollama and LM Studio).
 3. **Hugging Face `accelerate`** (`transformers 5.23.0 + bitsandbytes 0.50.2`, `1` row) — `device_map="auto"` + `offload_folder` + 4-bit NF4 disk offloading.
 4. **`AirLLM 4.0.0`** (`torch 2.14.1+cu126`, `bitsandbytes 0.50.2`, `transformers 5.23.0`, `4` rows) — Python layer-by-layer sharded streaming (`4bit` & `BF16`).
@@ -129,18 +132,47 @@ Every row was measured directly on bare metal with `VmHWM` peak RSS, `/proc/memi
 - **`Qwen3-30B-A3B` Tegra NVMe stall (resolved in `v0.2.1`):** On `v0.1.0` (Round 8), stock `llama.cpp` CPU `mmap` (`1.270 tok/s`, `6,071 MiB` RSS, `+248 MiB` swap) beat `layerstream-plugin` (`0.317` / `0.113 tok/s`) because single-threaded small random `O_DIRECT` slices triggered 30-second Tegra PCIe/NVMe IRQ timeouts (`nvme1: I/O tag ... timeout, completion polled`) and the 25% full-layer threshold bypassed `expert_cache` on speculative sweeps. In `v0.2.1` (Round 9), switching Linux sparse MoE slices to parallel `POSIX_FADV_RANDOM` + immediate `POSIX_FADV_DONTNEED` reads (`6` threads, zero-copy single-slice `pread`, `-7.6 MiB` page-cache delta, `0` NVMe timeouts) and raising the full-layer threshold to 50% lifted `Qwen3-30B-A3B` to **`1.446 tok/s`** (`open_ended`, **4.56× faster**, beating stock `llama.cpp` CPU `mmap` with 2 GiB less RSS and 24% lower gross `J/tok`) and **`0.948 tok/s`** (`code_edit`, **8.39× faster**) — measured even with Frigate NVR active on `orin-nano`.
 - **Jetson CUDA `uma_zero_copy=false`:** Upstream `llama.cpp` currently disables `CUDA_Host` unified memory on Jetson (`upstream: ggml-org/llama.cpp#15034`). All Jetson CUDA rows in this dataset therefore have `uma_zero_copy: false` and `is_unified_memory: true`, using pinned `cudaHostAlloc` + `cudaMemcpyAsync` instead of host-mapped device memory.
 - **Post-eviction CUDA driver context (resolved in `v0.2.0`):** In `v0.1.0` (and `v0.2.0 --in-process`), after serving and idle eviction all model/KV/slot buffers were freed while CUDA's primary runtime context retained `~230–325 MiB` (`524 MiB` total process RSS on Jetson Orin Nano). In `v0.2.0`, GPU inference runs by default inside an on-demand `layerstream _worker` subprocess that is reaped on idle timeout or `POST /v1/unload`, reclaiming **100% of VRAM/UMA and CUDA driver contexts** (verified on bare-metal Orin Nano CUDA `14B + 0.5B`: **`524 MiB` → `33.1 MiB` VmRSS / `24.5 MiB` `RssAnon`, `0` children** after eviction).
-- **Host `dm-crypt` bandwidth variance:** On `orin-nano`, LUKS2 `dm-crypt` sequential `pread` measured `2,794–2,961 MiB/s` under clean memory conditions and dropped to `1,025–1,338 MiB/s` under `zram` pressure (`r8_14b_*_temp07`, `r8_32b_*`); every Round 8 row records exact `pread_mib_s` alongside throughput so bandwidth effects are never hidden.
+- **Host `dm-crypt` bandwidth variance & workqueue tuning:** On `orin-nano` (6-core Cortex-A78AE), keeping default `dm-crypt` `kcryptd` workqueues ON spreads AES-XTS decryption across all 6 cores (`2,794–2,987 MiB/s` under clean memory conditions), whereas enabling `no-read-workqueue` bottlenecks decryption onto 1–2 NVMe IRQ/softirq cores (`1,535–2,076 MiB/s`, **`-33%`** slower). Under `zram` pressure (`r8_14b_*_temp07`, `r8_32b_*`), throughput drops to `1,025–1,338 MiB/s`; every Round 8+ row records exact `pread_mib_s` alongside throughput so bandwidth effects are never hidden.
 - **Single-sweep latency floor on dense `R=0`:** Without hybrid residency or speculation, dense NVMe streaming is strictly bounded by `model_size / nvme_bw` (`~0.17–0.19 tok/s` on 14B, `~0.094 tok/s` on 32B).
 
 ---
 
-## 5. Dataset Schema (76 Columns) & Reproduction
+## 5. Dataset Schema (81 Columns), Data Studio SQL & Reproduction
 
-Each of the **170 rows** in `data/train-00000-of-00001.parquet` (`benchmarks.json`, `benchmarks.jsonl`) includes:
-`round`, `source_file`, `hardware`, `hardware_id`, `engine`, `engine_version`, `git_rev`, `mode`, `status`, `model`, `draft_model`, `workload`, `chat_template_applied`, `warmup`, `reps`, `temperature`, `seed`, `threads`, `kv_cache_type`, `vram_budget_auto`, `vram_budget_mb`, `prompt_tokens`, `completion_tokens`, `load_time_s`, `ttft_s`, `ttft_s_min`, `ttft_s_max`, `decode_time_s`, `total_time_s`, `decode_tok_per_s`, `decode_tok_per_s_min`, `decode_tok_per_s_max`, `total_tok_per_s`, `total_tok_per_s_min`, `total_tok_per_s_max`, `sweeps`, `drafted_tokens`, `accepted_tokens`, `resident_layers`, `streamed_layers`, `n_layers`, `resident_mib`, `slot_mib`, `expert_slot_mib`, `io_mib_read`, `pread_mib_s`, `effective_io_mib_s`, `expert_cache_hits`, `expert_cache_misses`, `expert_cache_hit_rate`, `expert_cache_mib_saved`, `moe_layers`, `moe_active_streaming`, `uma_zero_copy`, `is_unified_memory`, `direct_io_active`, `peak_rss_mib`, `current_rss_mib`, `mem_avail_before_mib`, `mem_avail_after_mib`, `swap_delta_mib`, `cuda_max_allocated_mib`, `page_cache_delta_mib`, `page_cache_delta_since_start_mib`, `idle_watts`, `avg_watts`, `net_watts`, `joules_per_tok`, `net_joules_per_tok`, `turn1_prompt_tokens`, `turn1_ttft_s`, `turn2_prompt_tokens`, `turn2_ttft_s`, `ttft_speedup_x`, `notes`, `output_preview`.
+Each of the **185 rows** in `data/train-00000-of-00001.parquet` (`benchmarks.json`, `benchmarks.jsonl`) includes:
+`round`, `source_file`, `hardware`, `hardware_id`, `engine`, `engine_version`, `git_rev`, `backend_name`, `mode`, `status`, `model`, `draft_model`, `workload`, `chat_template_applied`, `warmup`, `reps`, `temperature`, `seed`, `threads`, `kv_cache_type`, `vram_budget_auto`, `vram_budget_mb`, `prompt_tokens`, `completion_tokens`, `load_time_s`, `ttft_s`, `ttft_s_min`, `ttft_s_max`, `decode_time_s`, `total_time_s`, `decode_tok_per_s`, `decode_tok_per_s_min`, `decode_tok_per_s_max`, `total_tok_per_s`, `total_tok_per_s_min`, `total_tok_per_s_max`, `sweeps`, `drafted_tokens`, `accepted_tokens`, `draft_acceptance_rate`, `tokens_per_sweep`, `mtp_layers`, `rs_rollback_max`, `resident_layers`, `streamed_layers`, `n_layers`, `resident_mib`, `slot_mib`, `expert_slot_mib`, `io_mib_read`, `pread_mib_s`, `effective_io_mib_s`, `expert_cache_hits`, `expert_cache_misses`, `expert_cache_hit_rate`, `expert_cache_mib_saved`, `moe_layers`, `moe_active_streaming`, `uma_zero_copy`, `is_unified_memory`, `direct_io_active`, `peak_rss_mib`, `current_rss_mib`, `mem_avail_before_mib`, `mem_avail_after_mib`, `swap_delta_mib`, `cuda_max_allocated_mib`, `page_cache_delta_mib`, `page_cache_delta_since_start_mib`, `idle_watts`, `avg_watts`, `net_watts`, `joules_per_tok`, `net_joules_per_tok`, `turn1_prompt_tokens`, `turn1_ttft_s`, `turn2_prompt_tokens`, `turn2_ttft_s`, `ttft_speedup_x`, `notes`, `output_preview`.
+
+### Instant Query via Hugging Face Data Studio / DuckDB / Polars
+
+```sql
+-- Paste directly into Hugging Face Data Studio or DuckDB CLI:
+SELECT round, engine, model, workload,
+       ROUND(decode_tok_per_s, 3) AS tok_s,
+       ROUND(peak_rss_mib, 0) AS rss_mib,
+       ROUND(joules_per_tok, 2) AS j_per_tok
+FROM 'hf://datasets/kleinbem/layerstream-orin-nano-benchmarks/data/train-00000-of-00001.parquet'
+WHERE round = 'round12_v063'
+ORDER BY decode_tok_per_s DESC;
+```
+
+```python
+import polars as pl
+
+df = pl.read_parquet(
+    "hf://datasets/kleinbem/layerstream-orin-nano-benchmarks/data/train-00000-of-00001.parquet"
+)
+print(
+    df.filter(pl.col("round") == "round12_v063").select(
+        "model", "workload", "decode_tok_per_s", "joules_per_tok"
+    )
+)
+```
+
+### Bare-Metal Reproduction
 
 ```bash
-# Reproduce layerstream-plugin (CUDA sm_87)
+# Reproduce full clean-host Round 12 suite with pure-Rust xtask (includes physical zram guard)
+cargo xtask bench-round --bin target/release/examples/bench --models-dir /mnt/models --out-dir benchmarks/results/round12_v063 --round r12
 cargo run --release -p layerstream-core --example bench --features cuda -- \
   --model Qwen2.5-14B-Instruct-Q4_K_M.gguf \
   --draft-model qwen2.5-0.5b-instruct-q4_k_m.gguf \
