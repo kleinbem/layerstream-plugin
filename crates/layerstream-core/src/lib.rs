@@ -1,3 +1,9 @@
+/// Active opt-in upstream patch set compiled into this binary (`"none"` for stock upstream builds).
+pub const ACTIVE_PATCHES: &str = match option_env!("LAYERSTREAM_ACTIVE_PATCHES") {
+    Some(v) => v,
+    None => "none",
+};
+
 pub mod chat_parse;
 pub mod engine;
 pub mod ffi;

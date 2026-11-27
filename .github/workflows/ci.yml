@@ -63,6 +63,15 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Verify opt-in llama.cpp patches apply cleanly
+        run: |
+          shopt -s nullglob
+          patches=(patches/llama.cpp/*.patch)
+          if [ "${#patches[@]}" -gt 0 ]; then
+            git -C third_party/llama.cpp apply --check "${patches[@]/#/$PWD/}"
+            echo "Verified ${#patches[@]} opt-in llama.cpp patch(es) apply cleanly."
+          fi
+
       - name: Clippy
         env:
           LLAMA_CPP_DIR: ${{ github.workspace }}/third_party/llama.cpp
