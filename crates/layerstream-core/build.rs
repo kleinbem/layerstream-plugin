@@ -1,6 +1,115 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+fn should_patch_component(spec: &str, component: &str) -> bool {
+    let mut enabled = false;
+    for raw in spec.split(',') {
+        let tok = raw.trim().to_ascii_lowercase();
+        if tok.is_empty() || tok == "none" {
+            enabled = false;
+        } else if tok == "all" || tok == component {
+            enabled = true;
+        } else if let Some(neg) = tok.strip_prefix('-')
+            && (neg == "all" || neg == component)
+        {
+            enabled = false;
+        }
+    }
+    enabled
+}
+
+fn copy_tree_skip_git(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap_or_else(|e| {
+        panic!("failed to create patched dir {}: {e}", dst.display());
+    });
+    let entries = std::fs::read_dir(src).unwrap_or_else(|e| {
+        panic!("failed to read source dir {}: {e}", src.display());
+    });
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == ".git" || name == "build" {
+            continue;
+        }
+        let s = entry.path();
+        let d = dst.join(&name);
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            copy_tree_skip_git(&s, &d);
+        } else if ft.is_file() {
+            let need_copy = match (std::fs::metadata(&s), std::fs::metadata(&d)) {
+                (Ok(sm), Ok(dm)) => {
+                    sm.len() != dm.len() || std::fs::read(&s).ok() != std::fs::read(&d).ok()
+                }
+                _ => true,
+            };
+            if need_copy {
+                std::fs::copy(&s, &d).unwrap_or_else(|e| {
+                    panic!("failed to copy {} -> {}: {e}", s.display(), d.display());
+                });
+            }
+        }
+    }
+}
+
+fn prepare_llama_source(llama_dir: &Path) -> (PathBuf, String) {
+    println!("cargo:rerun-if-env-changed=LAYERSTREAM_PATCHES");
+    let manifest_dir = PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo"),
+    );
+    let patches_dir = manifest_dir.join("../../patches/llama.cpp");
+    if patches_dir.is_dir() {
+        println!("cargo:rerun-if-changed={}", patches_dir.display());
+    }
+
+    let spec = env::var("LAYERSTREAM_PATCHES").unwrap_or_default();
+    if !should_patch_component(&spec, "llama") || !patches_dir.is_dir() {
+        return (llama_dir.to_path_buf(), "none".to_string());
+    }
+
+    let mut patch_files: Vec<PathBuf> = std::fs::read_dir(&patches_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("patch"))
+        .collect();
+    patch_files.sort();
+    if patch_files.is_empty() {
+        return (llama_dir.to_path_buf(), "none".to_string());
+    }
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set by Cargo"));
+    let patched_dir = out_dir.join("llama-cpp-patched");
+    // Reset any previously patched files by syncing from clean upstream before re-applying.
+    copy_tree_skip_git(llama_dir, &patched_dir);
+
+    let mut applied = Vec::with_capacity(patch_files.len());
+    for patch in &patch_files {
+        println!("cargo:rerun-if-changed={}", patch.display());
+        let status = std::process::Command::new("git")
+            .arg("apply")
+            .arg("--whitespace=nowarn")
+            .arg(patch)
+            .current_dir(&patched_dir)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run `git apply` for {}: {e}", patch.display()));
+        assert!(
+            status.success(),
+            "opt-in llama.cpp patch {} failed to apply cleanly (LAYERSTREAM_PATCHES={spec})",
+            patch.display()
+        );
+        if let Some(stem) = patch.file_stem().and_then(|s| s.to_str()) {
+            applied.push(format!("llama:{stem}"));
+        }
+    }
+    let summary = applied.join(",");
+    println!("cargo:warning=layerstream-core built with opt-in patches: {summary}");
+    (patched_dir, summary)
+}
+
 fn resolve_llama_cpp_dir() -> PathBuf {
     if let Ok(dir) = env::var("LLAMA_CPP_DIR") {
         let path = PathBuf::from(dir);
@@ -212,7 +321,9 @@ fn main() {
         println!("cargo:rerun-if-changed={cpp_file}");
     }
 
-    let llama_dir = resolve_llama_cpp_dir();
+    let raw_llama_dir = resolve_llama_cpp_dir();
+    let (llama_dir, active_patches) = prepare_llama_source(&raw_llama_dir);
+    println!("cargo:rustc-env=LAYERSTREAM_ACTIVE_PATCHES={active_patches}");
     let use_vulkan = env::var("CARGO_FEATURE_VULKAN").is_ok();
     let use_cuda = env::var("CARGO_FEATURE_CUDA").is_ok();
     let use_metal = env::var("CARGO_FEATURE_METAL").is_ok();
