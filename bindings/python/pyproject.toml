@@ -1,0 +1,109 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "layerstream"
+version = "0.6.3"
+description = "Out-of-core GGUF layer-streaming LLM inference engine with O_DIRECT GPU streaming"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.15"
+keywords = [
+    "llm",
+    "gguf",
+    "llama-cpp",
+    "streaming",
+    "inference",
+    "out-of-core",
+    "moe",
+    "airllm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "layerstream-cuda13==0.6.3; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+]
+cuda13 = [
+    "layerstream-cuda13==0.6.3; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "pytest-timeout>=2.3",
+    "hypothesis>=6.112",
+    "ruff>=0.11.8",
+    "pyright>=1.1.390",
+]
+
+[project.scripts]
+layerstream = "layerstream.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/kleinbem/layerstream-plugin"
+Repository = "https://github.com/kleinbem/layerstream-plugin"
+Issues = "https://github.com/kleinbem/layerstream-plugin/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "layerstream._layerstream"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+timeout = 120
+addopts = "--strict-markers"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["layerstream"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = [
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@overload",
+    "\\.\\.\\.",
+]
+
+[tool.ruff]
+target-version = "py315"
+line-length = 100
+src = ["python", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "S", "ASYNC", "BLE", "DTZ", "PTH", "PERF", "FURB", "C4", "PIE", "RET"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S310", "S603"]
+"**/scripts/**" = ["S108", "S603", "S607"]
+
+[tool.pyright]
+pythonVersion = "3.15"
+extraPaths = ["python"]
+include = ["python/layerstream", "tests"]
+strict = ["python/layerstream"]
+typeCheckingMode = "standard"
+reportMissingModuleSource = "none"
+reportUnusedImport = "error"
+reportUnusedVariable = "error"
+reportUnnecessaryCast = "error"
+reportMatchNotExhaustive = "error"

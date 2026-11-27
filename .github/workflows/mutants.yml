@@ -1,0 +1,54 @@
+name: Mutation Testing
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly Sunday 04:00 UTC mutation audit on core pure-Rust crates.
+    - cron: "0 4 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - gguf-direct-io
+          - json-schema-gbnf
+          - hf-gguf
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-mutants
+
+      - name: Run cargo-mutants on ${{ matrix.crate }}
+        run: |
+          set +e
+          cargo mutants --locked -p ${{ matrix.crate }} --timeout 60 --output mutants.out
+          rc=$?
+          {
+            echo "### Mutation Testing: \`${{ matrix.crate }}\`"
+            if [ -f mutants.out/outcomes.json ]; then
+              python3 - <<'PY'
+          import json
+          data = json.load(open("mutants.out/outcomes.json"))
+          counts = {}
+          for o in data.get("outcomes", []):
+              s = o.get("summary", "Unknown")
+              counts[s] = counts.get(s, 0) + 1
+          for k, v in sorted(counts.items()):
+              print(f"- **{k}**: {v}")
+          PY
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Report findings in summary without failing scheduled runs on surviving non-critical mutants.
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+            exit "$rc"
+          fi
