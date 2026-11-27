@@ -63,7 +63,6 @@ def normalize_record(
     default_hw_id: str = DEFAULT_HARDWARE_ID,
 ) -> dict[str, Any]:
     engine = rec.get("engine")
-    default_ver = "0.1.0" if engine == "layerstream-plugin" else None
     draft_acceptance_rate = rec.get("draft_acceptance_rate")
     if draft_acceptance_rate is None:
         draft_acceptance_rate = _derive_rate(rec.get("accepted_tokens"), rec.get("drafted_tokens"))
@@ -76,7 +75,7 @@ def normalize_record(
         "hardware": rec.get("hardware") or default_hw,
         "hardware_id": rec.get("hardware_id") or default_hw_id,
         "engine": engine,
-        "engine_version": rec.get("engine_version", default_ver),
+        "engine_version": rec.get("engine_version"),
         "git_rev": rec.get("git_rev"),
         "backend_name": rec.get("backend_name"),
         "mode": rec.get("mode"),
